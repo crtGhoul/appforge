@@ -1,0 +1,15 @@
+# Frontend
+node_modules/
+dist/
+*.local
+
+# Rust build output
+src-tauri/target/
+**/*.rs.bk
+
+# Tauri generated schema/config
+src-tauri/gen/
+
+# OS noise
+.DS_Store
+Thumbs.db

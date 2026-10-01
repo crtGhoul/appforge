@@ -1,0 +1,20 @@
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+tauri = { features = [], version = "2" }
+
+[features]
+# Tauri's default desktop mode uses the OS webview (WebView2 on Windows,
+# WebKitGTK on Linux) — no bundled Chromium, which keeps RAM and disk use low.
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
+
+[package]
+authors = ["AppForge"]
+description = "Turn any website into a desktop web app"
+edition = "2021"
+name = "appforge"
+version = "0.1.0"

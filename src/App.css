@@ -1,0 +1,212 @@
+/* One accent color: indigo. Everything else stays quiet gray. */
+
+.shell {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 32px 20px 48px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: #5b5e66;
+}
+
+.panel {
+  background: #ffffff;
+  border: 1px solid #e3e5e9;
+  border-radius: 12px;
+  padding: 20px;
+  margin-top: 20px;
+}
+
+.panel h2 {
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.muted {
+  color: #5b5e66;
+  margin: 0;
+}
+
+.banner {
+  margin-top: 16px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.banner-error {
+  background: #fdecec;
+  border: 1px solid #f3c1c1;
+  color: #8f1d1d;
+}
+
+.add-form {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.add-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: #5b5e66;
+  flex: 1 1 200px;
+}
+
+.add-form input {
+  font: inherit;
+  padding: 9px 12px;
+  border: 1px solid #d4d7dc;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+}
+
+.add-form input:focus {
+  outline: 2px solid #4f46e5;
+  outline-offset: -1px;
+  border-color: #4f46e5;
+}
+
+button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 550;
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid #d4d7dc;
+  background: #fff;
+  color: #1a1b1e;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #f0f1f4;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.add-form button[type="submit"] {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #fff;
+  flex: 0 0 auto;
+}
+
+.add-form button[type="submit"]:hover:not(:disabled) {
+  background: #4338ca;
+}
+
+.form-error {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: #8f1d1d;
+}
+
+.app-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.app-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #e3e5e9;
+  border-radius: 10px;
+  padding: 12px;
+  background: #fbfbfc;
+}
+
+.app-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid #e9ebee;
+}
+
+.app-icon-fallback {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #e8eaf6;
+  color: #4f46e5;
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.app-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.app-name {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-url {
+  font-size: 12px;
+  color: #5b5e66;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.app-actions button {
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.app-actions .danger {
+  color: #8f1d1d;
+  border-color: #eec9c9;
+}
+
+.app-actions .danger:hover {
+  background: #fdecec;
+}
+
+.footer {
+  margin-top: 28px;
+  font-size: 12px;
+  text-align: center;
+}
