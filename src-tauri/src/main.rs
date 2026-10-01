@@ -4,12 +4,14 @@ mod adblock;
 mod launcher;
 mod launcher_settings;
 mod page_title;
+mod preview;
 mod store;
 mod windows;
 
 use adblock::AdblockState;
 use launcher::{LauncherState, NativeProgram};
 use launcher_settings::LauncherSettings;
+use preview::PreviewState;
 use serde::Serialize;
 use std::sync::Mutex;
 use store::{Account, AppSettings, AppStore, WebApp};
@@ -173,6 +175,40 @@ fn fetch_page_title(url: String) -> Result<String, String> {
     page_title::fetch_page_title(&url)
 }
 
+// ---------------------------------------------------------------------------
+// Preview sign-in commands
+// ---------------------------------------------------------------------------
+
+/// Open a preview window for `url`: the real site in a throwaway session so
+/// the user can sign in, then adopt it via `preview_add`.
+#[tauri::command]
+fn preview_start(
+    app: AppHandle,
+    adblock: State<'_, AdblockState>,
+    url: String,
+) -> Result<preview::PreviewStart, String> {
+    preview::start_preview(&app, &adblock, &url)
+}
+
+/// Abandon a preview: close its window and delete the throwaway session.
+#[tauri::command]
+fn preview_discard(app: AppHandle, preview_id: String) -> Result<(), String> {
+    preview::discard_preview(&app, &preview_id)
+}
+
+/// Turn a preview into a real app: the signed-in throwaway session becomes
+/// the new app's first account. The frontend sends `label` for the account
+/// (empty = "Default"). Tauri exposes `preview_id` as `previewId` to JS.
+#[tauri::command]
+fn preview_add(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    preview_id: String,
+    label: Option<String>,
+) -> Result<store::WebApp, String> {
+    preview::add_preview_as_app(&app, &store, &preview_id, label)
+}
+
 /// Show the main window in library (management) view and tell the frontend
 /// to switch to it.
 fn show_library_view(app: &AppHandle) -> Result<(), String> {
@@ -318,6 +354,10 @@ fn main() {
 
             app.manage(store);
             app.manage(WindowState::default());
+            app.manage(PreviewState::default());
+            // Sweep preview temp dirs left behind by a crash or a window
+            // closed by hand before "Add as app" / "Discard" ran.
+            preview::cleanup_stale_previews(app.handle());
 
             // Filter lists download + engine compile happen on a background
             // thread so startup never waits on the network.
@@ -374,6 +414,13 @@ fn main() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
+            } else if window.label().starts_with("preview-") {
+                // A preview closed by hand (X button): drop its session and
+                // delete the temp dir. preview_add/preview_discard already
+                // removed their entries, so those paths no-op here.
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    preview::window_closed(window.app_handle(), window.label());
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -393,6 +440,9 @@ fn main() {
             hide_library,
             show_library,
             fetch_page_title,
+            preview_start,
+            preview_discard,
+            preview_add,
             get_launcher_settings,
             set_hotkey,
             set_autostart,

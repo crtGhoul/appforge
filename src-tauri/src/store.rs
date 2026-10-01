@@ -123,8 +123,9 @@ fn new_id(prefix: &str) -> String {
 }
 
 /// Backend URL check. The frontend normalizes first; this is a second gate so
-/// a bad value can never be persisted even if invoked directly.
-fn is_valid_url(url: &str) -> bool {
+/// a bad value can never be persisted even if invoked directly. Shared with
+/// the preview flow.
+pub(crate) fn is_valid_url(url: &str) -> bool {
     let url = url.trim();
     let rest = if let Some(r) = url.strip_prefix("https://") {
         r
@@ -310,8 +311,67 @@ impl AppStore {
         Ok(app)
     }
 
-    pub fn update_app(
+    /// Create the app *and* its first account from a preview session: the
+    /// temp dir the user signed in to becomes the account's session dir, so
+    /// the sign-in carries over. The caller closes the preview window first
+    /// (WebView2 locks the dir while the webview lives); the move retries
+    /// briefly and falls back to a fresh dir rather than failing the add.
+    pub fn add_app_with_session(
         &self,
+        name: String,
+        url: String,
+        label: String,
+        temp_dir: &Path,
+    ) -> Result<WebApp, String> {
+        let name = name.trim().to_string();
+        let url = url.trim().to_string();
+        let label = label.trim().to_string();
+        if name.is_empty() {
+            return Err("Name is required.".to_string());
+        }
+        if !is_valid_url(&url) {
+            return Err("URL must start with http:// or https://.".to_string());
+        }
+        let now = unix_secs();
+        let app_id = new_id("app");
+        let account_id = new_id("acct");
+        let session_dir = self.sessions_root().join(&app_id).join(&account_id);
+        crate::preview::move_session_dir(temp_dir, &session_dir)?;
+
+        let app = WebApp {
+            id: app_id.clone(),
+            name,
+            url,
+            icon: None,
+            color: DEFAULT_COLOR.to_string(),
+            settings: AppSettings::default(),
+            accounts: vec![Account {
+                id: account_id,
+                app_id,
+                label: if label.is_empty() {
+                    "Default".to_string()
+                } else {
+                    label
+                },
+                color: DEFAULT_COLOR.to_string(),
+                session_dir: session_dir.to_string_lossy().into_owned(),
+                last_opened: 0,
+                created_at: now,
+            }],
+            created_at: now,
+        };
+        {
+            let mut apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            apps.push(app.clone());
+        }
+        self.save()?;
+        Ok(app)
+    }
+
+    pub fn update_app(        &self,
         id: &str,
         name: String,
         url: String,

@@ -214,15 +214,43 @@ pub fn attach_network_blocking(
     state: &AdblockState,
     enabled: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let state = state.clone();
+    let _ = window.with_webview(move |platform| {
+        hook_platform(platform, &state, enabled);
+    });
+}
+
+/// Same hookup for a bare webview (the preview flow builds its site view as a
+/// child webview of a plain window, not a WebviewWindow).
+#[cfg(windows)]
+pub fn attach_network_blocking_to_webview(
+    webview: &tauri::Webview,
+    state: &AdblockState,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let state = state.clone();
+    let _ = webview.with_webview(move |platform| {
+        hook_platform(platform, &state, enabled);
+    });
+}
+
+/// The COM hookup itself, shared by both entry points above.
+#[cfg(windows)]
+fn hook_platform(
+    platform: tauri::webview::PlatformWebview,
+    state: &AdblockState,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+) {
     use webview2_com::Microsoft::Web::WebView2::Win32::*;
     use webview2_com::WebResourceRequestedEventHandler;
     use windows_core::w;
 
+    // The COM handler closure must be 'static, so it gets an owned clone.
     let state = state.clone();
-    let _ = window.with_webview(move |platform| {
-        // Fail-open: if any step of the hookup errors, the window simply gets
-        // no network blocking instead of a broken webview.
-        let hooked: windows_core::Result<()> = (|| {
+
+    // Fail-open: if any step of the hookup errors, the window simply gets
+    // no network blocking instead of a broken webview.
+    let hooked: windows_core::Result<()> = (|| {
             let core = unsafe { platform.controller().CoreWebView2() }?;
             let environment = platform.environment();
             unsafe {
@@ -249,8 +277,7 @@ pub fn attach_network_blocking(
             unsafe { core.add_WebResourceRequested(&handler, &mut token) }?;
             Ok(())
         })();
-        let _ = hooked;
-    });
+    let _ = hooked;
 }
 
 /// Decide whether a single resource request should be blocked. Pure

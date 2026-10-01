@@ -148,7 +148,8 @@ pub fn open_account(
 
 /// Wrap engine-generated hide CSS in a JSON-escaped <style> injection that
 /// runs before the page's own scripts (initialization script timing).
-fn cosmetic_init_script(css: &str) -> String {
+/// Shared with the preview flow.
+pub(crate) fn cosmetic_init_script(css: &str) -> String {
     // serde_json escaping keeps arbitrary selector text (quotes, backslashes)
     // from breaking out of the JS string literal.
     let json_css = serde_json::to_string(css).unwrap_or_else(|_| "\"\"".to_string());
@@ -169,15 +170,17 @@ static OAUTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Everything the popup handler needs, captured by value (the handler is
 /// `Fn`, so it can't borrow from the stack frame that creates the window).
-struct PopupContext {
-    app: AppHandle,
-    app_id: String,
-    account_id: String,
-    app_name: String,
-    app_url: String,
-    session_dir: PathBuf,
-    popup_policy: String,
-    popup_allowlist: Vec<String>,
+/// Shared with the preview flow (`preview.rs`), which passes placeholder
+/// ids since the app doesn't exist yet.
+pub(crate) struct PopupContext {
+    pub(crate) app: AppHandle,
+    pub(crate) app_id: String,
+    pub(crate) account_id: String,
+    pub(crate) app_name: String,
+    pub(crate) app_url: String,
+    pub(crate) session_dir: PathBuf,
+    pub(crate) popup_policy: String,
+    pub(crate) popup_allowlist: Vec<String>,
 }
 
 /// Build the `on_new_window` handler for an account window.
@@ -186,7 +189,9 @@ struct PopupContext {
 /// decision is made synchronously and any window creation is bounced to the
 /// main thread via `run_on_main_thread`. The original request is always
 /// denied — allowed popups are re-created as contained modals instead.
-fn make_popup_handler(
+///
+/// Also used by the preview flow with placeholder ids.
+pub(crate) fn make_popup_handler(
     ctx: PopupContext,
 ) -> impl Fn(url::Url, tauri::webview::NewWindowFeatures) -> tauri::webview::NewWindowResponse<tauri::Wry>
        + Send

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>AppForge Preview</title>
+<style>
+  /* Quiet header strip for the preview sign-in window. One accent (indigo),
+     everything else gray — matches the library UI. The backend injects
+     window.__APPFORGE_PREVIEW_ID__ / __APPFORGE_PREVIEW_URL__ before load. */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 13px;
+    color: #1f2329;
+    background: #f4f5f7;
+    border-bottom: 1px solid #e3e5e9;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 14px;
+    user-select: none;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .badge {
+    font-weight: 650;
+    flex: none;
+  }
+  .url {
+    color: #5b5e66;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 300px;
+    flex: none;
+  }
+  .hint { color: #5b5e66; flex: none; }
+  input[type="text"] {
+    font: inherit;
+    padding: 6px 10px;
+    border: 1px solid #d4d7dc;
+    border-radius: 8px;
+    background: #fff;
+    color: #1f2329;
+    width: 170px;
+    flex: none;
+  }
+  input[type="text"]::placeholder { color: #9aa0a8; }
+  .spacer { flex: 1 1 auto; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    flex: none;
+  }
+  button:disabled { opacity: 0.55; cursor: default; }
+  .primary { background: #6366f1; color: #fff; }
+  .primary:hover:not(:disabled) { background: #5457e3; }
+  .ghost { background: transparent; color: #5b5e66; border-color: #d4d7dc; }
+  .ghost:hover:not(:disabled) { background: #eceef1; }
+  .error { color: #b3261e; font-size: 12px; flex: none; }
+</style>
+</head>
+<body>
+  <span class="badge">Preview</span>
+  <span class="url" id="url"></span>
+  <span class="hint">Sign in on the real site below, then:</span>
+  <input id="label" type="text" placeholder="Account label (optional)" maxlength="60" autocomplete="off" />
+  <span class="spacer"></span>
+  <span class="error" id="msg" role="alert"></span>
+  <button id="add" class="primary">Add as app</button>
+  <button id="discard" class="ghost">Discard</button>
+<script>
+(function () {
+  "use strict";
+  var id = window.__APPFORGE_PREVIEW_ID__;
+  var url = window.__APPFORGE_PREVIEW_URL__ || "";
+  var msg = document.getElementById("msg");
+  var addBtn = document.getElementById("add");
+  var discardBtn = document.getElementById("discard");
+  document.getElementById("url").textContent = url;
+
+  function setBusy(busy) {
+    addBtn.disabled = busy;
+    discardBtn.disabled = busy;
+  }
+  function fail(text) {
+    msg.textContent = text || "Something went wrong.";
+    setBusy(false);
+  }
+  function getInvoke() {
+    // Tauri exposes Rust snake_case params as camelCase to JS.
+    if (!id || !window.__TAURI__ || !window.__TAURI__.core || !window.__TAURI__.core.invoke) {
+      fail("Preview bridge unavailable — close this window and try again.");
+      return null;
+    }
+    return window.__TAURI__.core.invoke;
+  }
+
+  addBtn.addEventListener("click", function () {
+    var invoke = getInvoke();
+    if (!invoke) return;
+    setBusy(true);
+    msg.textContent = "";
+    var label = document.getElementById("label").value.trim();
+    // The backend closes this window on success, so this promise may never
+    // resolve — that is the happy path, not an error.
+    invoke("preview_add", { previewId: id, label: label || null }).catch(fail);
+  });
+
+  discardBtn.addEventListener("click", function () {
+    var invoke = getInvoke();
+    if (!invoke) return;
+    setBusy(true);
+    invoke("preview_discard", { previewId: id }).catch(fail);
+  });
+})();
+</script>
+</body>
+</html>
