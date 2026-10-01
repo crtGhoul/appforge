@@ -3,22 +3,49 @@
 Turn any website into a desktop web app. Add a site by name + URL, and it
 opens in its own dedicated window — no browser tabs, no address bar clutter.
 
-**Status: v0 shell.** The library, persistence, and per-app windows work.
-Multi-account isolation, popup blocking, and ad blocking are not in this
-build yet (see "What's next").
+**Status: launcher build.** Multi-account isolation, popup blocking,
+network-level ad blocking, and auto-suspend are in. This build adds launcher
+mode: press **Alt+Space** anywhere to summon AppForge, type to fuzzy-search
+your web apps, accounts, and installed programs, and hit Enter.
 
 ## What exists
 
+- **Launcher mode** — a global hotkey (Alt+Space by default, changeable)
+  shows or hides the library from anywhere; the search box is focused on
+  summon. Type to fuzzy-search web apps, their accounts, and installed
+  native programs in one ranked list. ↑/↓ to move, Enter to open/launch,
+  Esc clears, then hides the window again.
+- **Native programs** — on Windows, AppForge scans the Start Menu shortcuts
+  (all-users + per-user), resolves each `.lnk` to its target `.exe`,
+  de-dupes, and extracts the exe's icon to PNG (best-effort; a letter glyph
+  otherwise). On Linux it reads `.desktop` files. Programs launch through
+  the OS (`ShellExecuteW` / `gio`), never by raw path from the frontend —
+  launching is by id with a server-side lookup. Microsoft Store (UWP) apps
+  aren't listed yet.
+- **Tray icon** — left-click toggles the library; the menu offers Show,
+  Rescan programs, and Quit. Closing the main window hides it to the tray
+  instead of quitting (Quit lives in the tray menu).
+- **Run at startup** — optional; toggled in the Launcher settings panel.
 - **Library window** — lists your web apps with name, URL, and icon. Icons
   are fetched from the site's own `/favicon.ico`; when that fails a generic
   letter glyph is shown. Empty state is honest: "No apps yet."
+- **Isolated accounts** — multiple signed-in accounts per site, each in its
+  own storage partition (per-webview data directories on Windows/WebView2),
+  so Account A and Account B never share cookies.
+- **Popup blocking** — new-window requests are blocked by default, with a
+  per-site allowlist for legitimate flows (e.g. OAuth sign-in opens in a
+  contained modal).
+- **Network-level ad blocking** — requests are matched against EasyList and
+  EasyPrivacy before they download (Windows network hook; cosmetic rules
+  on all platforms).
+- **Auto-suspend** — idle account windows are suspended to save RAM.
 - **Add / remove / open** — add an app with name + URL (URLs are validated
   and normalized; `example.com` becomes `https://example.com/`), remove with
   a confirmation, open an app in its own window.
-- **Dedicated app windows** — each app opens in its own Tauri `WebviewWindow`
-  pointed at the site URL: no URL bar, just the site content, with the native
-  OS window frame and the app name as the title. Re-opening focuses the
-  existing window instead of duplicating it.
+- **Dedicated app windows** — each account opens in its own Tauri
+  `WebviewWindow` pointed at the site URL: no URL bar, just the site content,
+  with the native OS window frame and the app name as the title.
+  Re-opening focuses the existing window instead of duplicating it.
 - **Persistence** — the app list is stored as JSON (`apps.json`) in the Tauri
   app-data directory via Rust commands (`list_apps`, `add_app`,
   `remove_app`). Writes go through a temp file + rename so a crash can't
@@ -34,8 +61,12 @@ build yet (see "What's next").
 appforge/
   src/                 React + TypeScript frontend (Vite)
     App.tsx            Library UI: add form, app grid, open/remove
+    Launcher.tsx       Search, results list, launcher settings panel
+    types.ts           Shared frontend types (backend contract)
   src-tauri/
-    src/main.rs        Tauri entry: commands list_apps / add_app / remove_app
+    src/main.rs        Tauri entry: commands, tray, hotkey, window events
+    src/launcher.rs    Native program scan + icon extraction + launching
+    src/launcher_settings.rs  Summon hotkey + autostart (launcher.json)
     src/store.rs       JSON persistence, corrupt-file backup, URL validation
     tauri.conf.json    App config (main window + bundle settings)
     capabilities/      Frontend permissions (incl. creating app windows)
@@ -54,20 +85,23 @@ Checks:
 ```sh
 npx tsc --noEmit          # frontend typecheck
 npm run build             # vite production build (tsc && vite build)
-cd src-tauri && cargo check   # rust backend check
+cd src-tauri && cargo check        # rust backend check
+cd src-tauri && cargo clippy -- -D warnings   # zero warnings required
+# Windows cross-typecheck (needs the two env shims; see AGENTS.md):
+cd src-tauri && AR_x86_64_pc_windows_msvc="$PWD/../msvc-ar-wrapper.sh" RC=x86_64-w64-mingw32-windres \
+  cargo check --target x86_64-pc-windows-msvc
 ```
 
 ## What's next (not yet implemented)
 
-1. **Isolated accounts** — multiple signed-in accounts per site, each in its
-   own storage partition (per-webview data directories on Windows/WebView2),
-   so Account A and Account B never share cookies.
-2. **Popup blocking** — intercept new-window requests; block by default, with
-   a per-site allow for legitimate popups (e.g. OAuth sign-in flows).
-3. **Network-level ad blocking** — match requests against uBlock-style filter
-   lists before they download, plus cosmetic rules for leftover placeholders.
-4. **Auto-suspend** — idle app windows get their webviews discarded and
-   restored on focus, keeping RAM near one-tab-per-open-app.
+1. **Microsoft Store apps** — the program scan covers classic Win32 `.exe`
+   programs; UWP/Store apps (e.g. installed via the Microsoft Store) aren't
+   listed yet.
+2. **Windows installer via CI** — a private GitHub repo with a Windows CI
+   job producing a downloadable installer (decided; repo + workflow land
+   after this build).
+3. **Auto-update** — checking for and installing new versions.
+4. **Custom themes** — currently one quiet theme with an indigo accent.
 
 ## Notes
 

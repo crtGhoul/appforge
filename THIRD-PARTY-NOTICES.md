@@ -16,3 +16,35 @@ The MPL-2.0 is a file-level copyleft license: it applies to the `adblock`
 crate's own files only. AppForge uses it as an unmodified dependency, so
 AppForge's own code remains MIT-licensed. The full MPL-2.0 text is available
 at https://www.mozilla.org/en-US/MPL/2.0/ and in the crate's repository.
+
+## png
+
+- Crate: `png` (v0.17.x) — https://crates.io/crates/png
+- Source: https://github.com/image-rs/image-png
+- License: **MIT OR Apache-2.0**
+- Used for: encoding extracted native program icons as PNG files on Windows
+  (pure Rust, no system libraries).
+
+## windows
+
+- Crate: `windows` (v0.62.x) — https://crates.io/crates/windows
+- Source: https://github.com/microsoft/windows-rs
+- License: **MIT OR Apache-2.0**
+- Used for: Windows-only launcher calls — resolving Start Menu `.lnk`
+  shortcuts via `IShellLinkW`, extracting exe icons via `ExtractIconExW` +
+  GDI, and launching programs via `ShellExecuteW`.
+
+## tauri-plugin-global-shortcut
+
+- Crate: `tauri-plugin-global-shortcut` (v2.x) — https://crates.io/crates/tauri-plugin-global-shortcut
+- Source: https://github.com/tauri-apps/plugins-workspace
+- License: **MIT OR Apache-2.0**
+- Used for: the summon hotkey (default Alt+Space) that shows/hides the
+  AppForge window from anywhere.
+
+## tauri-plugin-autostart
+
+- Crate: `tauri-plugin-autostart` (v2.x) — https://crates.io/crates/tauri-plugin-autostart
+- Source: https://github.com/tauri-apps/plugins-workspace
+- License: **MIT OR Apache-2.0**
+- Used for: the optional "run when I sign in" setting.
