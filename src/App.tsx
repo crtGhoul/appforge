@@ -18,6 +18,7 @@ import type {
   LauncherSettings,
   NativeProgram,
   PlatformInfo,
+  PreviewStart,
   WebApp,
 } from "./types";
 
@@ -152,6 +153,85 @@ function QuickAddForm({
         </p>
       )}
     </form>
+  );
+}
+
+/**
+ * Preview & sign in: for sites that need a login, open the real site in a
+ * throwaway preview window. The user signs in there directly (we never touch
+ * credentials), then clicks "Add as app" in the preview's header — the app
+ * is created with its first account already signed in. "Discard" (or closing
+ * the preview window) throws the session away.
+ */
+function PreviewSignInForm({ onError }: { onError: (msg: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  async function handleOpenPreview(e: React.FormEvent) {
+    e.preventDefault();
+    setFormError(null);
+    const cleanUrl = normalizeUrl(url);
+    if (!cleanUrl) {
+      setFormError("Enter a valid URL, e.g. https://example.com");
+      return;
+    }
+    setBusy(true);
+    try {
+      // Tauri exposes Rust snake_case params as camelCase to JS.
+      await invoke<PreviewStart>("preview_start", { url: cleanUrl });
+      setPreviewOpen(true);
+      setUrl("");
+    } catch (err) {
+      const msg = errMsg(err);
+      setFormError(msg);
+      onError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <button className="text-button" onClick={() => setOpen(true)}>
+        Preview &amp; sign in instead
+      </button>
+    );
+  }
+
+  return (
+    <div className="preview-signin">
+      <form className="quick-add-form" onSubmit={(e) => void handleOpenPreview(e)}>
+        <input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="Paste a website URL to preview & sign in"
+          inputMode="url"
+          autoComplete="off"
+          aria-label="Website URL to preview"
+        />
+        <button type="submit" disabled={busy}>
+          {busy ? "Opening…" : "Open preview"}
+        </button>
+        {formError && (
+          <p className="form-error" role="alert">
+            {formError}
+          </p>
+        )}
+      </form>
+      {previewOpen && (
+        <p className="muted small">
+          Preview opened — sign in on the real site, then click “Add as app” in
+          its header. Nothing is kept until you do.
+        </p>
+      )}
+      <p className="muted small">
+        Best for sites that need a login. For sites that don’t, the quick add
+        above is faster.
+      </p>
+    </div>
   );
 }
 
@@ -563,6 +643,32 @@ export default function App() {
     };
   }, []);
 
+  // A preview that was added as an app: pick it up in the library and open
+  // its first account, which carries the session the user signed in to.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    listen<WebApp>("appforge:preview-added", (event) => {
+      const created = {
+        ...event.payload,
+        accounts: event.payload.accounts ?? [],
+        settings: event.payload.settings ?? DEFAULT_SETTINGS,
+      };
+      setApps((prev) => [...prev, created]);
+      const first = created.accounts[0];
+      if (first) {
+        setError(null);
+        invoke("open_account", { appId: created.id, accountId: first.id }).catch(
+          (err) => setError(`Could not open "${created.name}". ${errMsg(err)}`)
+        );
+      }
+    })
+      .then((unlisten) => {
+        off = unlisten;
+      })
+      .catch(() => {});
+    return () => off?.();
+  }, []);
+
   // Window chrome per view: the launcher is a small frameless spotlight
   // overlay; the library is a full window. Best-effort — if the window
   // manager refuses, the window still works.
@@ -862,6 +968,7 @@ export default function App() {
       <section className="panel">
         <h2>Add a web app</h2>
         <QuickAddForm onAdded={addCreatedApp} onError={setError} />
+        <PreviewSignInForm onError={setError} />
         <details className="manual-add">
           <summary>Add manually instead</summary>
           <form className="add-form" onSubmit={(e) => void handleAdd(e)}>

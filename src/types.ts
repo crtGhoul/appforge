@@ -61,3 +61,9 @@ export interface LauncherSettings {
   hotkey: string;
   autostart: boolean;
 }
+
+/** Result of the preview_start command: a signed-in-later throwaway session. */
+export interface PreviewStart {
+  id: string;
+  url: string;
+}

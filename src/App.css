@@ -494,6 +494,14 @@ input[type="color"] {
   margin-top: 12px;
 }
 
+.preview-signin {
+  margin-top: 12px;
+}
+
+.preview-signin .muted {
+  margin: 8px 0 0;
+}
+
 .manual-add summary {
   cursor: pointer;
   color: #4f46e5;
