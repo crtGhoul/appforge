@@ -317,7 +317,7 @@ export function LauncherSettingsPanel({
         </button>
         <span className="help">
           {programsCount} installed {programsCount === 1 ? "program" : "programs"} indexed from
-          the Start Menu. Microsoft Store apps aren't listed yet.
+          the Start Menu and Desktop. Microsoft Store apps aren't listed yet.
         </span>
       </div>
 

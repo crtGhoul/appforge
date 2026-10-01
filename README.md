@@ -10,24 +10,28 @@ your web apps, accounts, and installed programs, and hit Enter.
 
 ## What exists
 
-- **Launcher mode** — a global hotkey (Alt+Space by default, changeable)
-  shows or hides the library from anywhere; the search box is focused on
-  summon. Type to fuzzy-search web apps, their accounts, and installed
-  native programs in one ranked list. ↑/↓ to move, Enter to open/launch,
-  Esc clears, then hides the window again.
+- **Launcher mode** — press **Alt+Space** anywhere (changeable) to summon a
+  small spotlight overlay: one search field, one ranked list of your web
+  apps, their accounts, and installed native programs. ↑/↓ to move, Enter
+  to open/launch, Esc clears, then hides the window again. Management lives
+  one click away: a "Manage apps" button in the overlay and "Show library"
+  in the tray menu open the full library window.
+- **Library window** — add/remove web apps, add/remove accounts per app,
+  per-app settings (popups, ad blocking, auto-suspend), and launcher
+  settings (hotkey, run at startup, program rescan). Opened from the tray
+  menu or the overlay; the hotkey always returns to the spotlight view.
 - **Native programs** — on Windows, AppForge scans the Start Menu shortcuts
-  (all-users + per-user), resolves each `.lnk` to its target `.exe`,
+  (all-users + per-user) and Desktop shortcuts (per-user + public), resolves each `.lnk` to its target `.exe`,
   de-dupes, and extracts the exe's icon to PNG (best-effort; a letter glyph
   otherwise). On Linux it reads `.desktop` files. Programs launch through
   the OS (`ShellExecuteW` / `gio`), never by raw path from the frontend —
   launching is by id with a server-side lookup. Microsoft Store (UWP) apps
   aren't listed yet.
-- **Tray icon** — left-click toggles the library; the menu offers Show,
-  Rescan programs, and Quit. Closing the main window hides it to the tray
+- **Tray icon** — left-click toggles the launcher overlay; the menu offers
+  Show library, Rescan programs, and Quit. Closing the main window hides it to the tray
   instead of quitting (Quit lives in the tray menu).
 - **Run at startup** — optional; toggled in the Launcher settings panel.
-- **Library window** — lists your web apps with name, URL, and icon. Icons
-  are fetched from the site's own `/favicon.ico`; when that fails a generic
+- **Web app icons** — taken from the site's own `/favicon.ico`; when that fails a generic
   letter glyph is shown. Empty state is honest: "No apps yet."
 - **Isolated accounts** — multiple signed-in accounts per site, each in its
   own storage partition (per-webview data directories on Windows/WebView2),
@@ -39,9 +43,11 @@ your web apps, accounts, and installed programs, and hit Enter.
   EasyPrivacy before they download (Windows network hook; cosmetic rules
   on all platforms).
 - **Auto-suspend** — idle account windows are suspended to save RAM.
-- **Add / remove / open** — add an app with name + URL (URLs are validated
-  and normalized; `example.com` becomes `https://example.com/`), remove with
-  a confirmation, open an app in its own window.
+- **Add / remove / open** — add an app by pasting its URL (the name is taken
+  from the page title, falling back to a prettified domain) or manually with
+  name + URL (URLs are validated and normalized; `example.com` becomes
+  `https://example.com/`), remove with a confirmation, open an app in its
+  own window.
 - **Dedicated app windows** — each account opens in its own Tauri
   `WebviewWindow` pointed at the site URL: no URL bar, just the site content,
   with the native OS window frame and the app name as the title.
@@ -60,13 +66,14 @@ your web apps, accounts, and installed programs, and hit Enter.
 ```
 appforge/
   src/                 React + TypeScript frontend (Vite)
-    App.tsx            Library UI: add form, app grid, open/remove
+    App.tsx            Spotlight overlay + library UI (views, quick-add, app grid)
     Launcher.tsx       Search, results list, launcher settings panel
     types.ts           Shared frontend types (backend contract)
   src-tauri/
     src/main.rs        Tauri entry: commands, tray, hotkey, window events
     src/launcher.rs    Native program scan + icon extraction + launching
     src/launcher_settings.rs  Summon hotkey + autostart (launcher.json)
+    src/page_title.rs  Best-effort page-title fetch for quick-add
     src/store.rs       JSON persistence, corrupt-file backup, URL validation
     tauri.conf.json    App config (main window + bundle settings)
     capabilities/      Frontend permissions (incl. creating app windows)

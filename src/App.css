@@ -412,6 +412,100 @@ input[type="color"] {
   text-align: center;
 }
 
+/* --- Spotlight launcher overlay --- */
+
+.launcher-shell {
+  padding: 14px 16px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+
+.launcher-shell .search-wrap {
+  margin-top: 0;
+}
+
+.launcher-results {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.launcher-hint {
+  padding: 28px 12px;
+  text-align: center;
+}
+
+.launcher-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 8px;
+  border-top: 1px solid #e3e5e9;
+}
+
+/* --- Library view --- */
+
+.library-back {
+  margin-bottom: 4px;
+  align-self: flex-start;
+}
+
+.quick-add-form {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quick-add-form input {
+  font: inherit;
+  flex: 1 1 240px;
+  padding: 9px 12px;
+  border: 1px solid #d4d7dc;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+}
+
+.quick-add-form input:focus {
+  outline: 2px solid #4f46e5;
+  outline-offset: -1px;
+  border-color: #4f46e5;
+}
+
+.quick-add-form button[type="submit"] {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #fff;
+  flex: 0 0 auto;
+}
+
+.quick-add-form button[type="submit"]:hover:not(:disabled) {
+  background: #4338ca;
+}
+
+.quick-add-form .form-error {
+  flex: 1 1 100%;
+  margin: 0;
+}
+
+.manual-add {
+  margin-top: 12px;
+}
+
+.manual-add summary {
+  cursor: pointer;
+  color: #4f46e5;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 4px 0;
+}
+
+.manual-add .add-form {
+  margin-top: 10px;
+}
+
 /* --- Launcher: search, results, settings --- */
 
 .search-wrap {

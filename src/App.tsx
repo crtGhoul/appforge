@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 import {
@@ -74,6 +76,83 @@ function hostOf(appUrl: string): string {
 
 function errMsg(err: unknown): string {
   return typeof err === "string" ? err : "Something went wrong.";
+}
+
+/**
+ * Quick-add: paste a URL, the app is named from the page title (best-effort;
+ * falls back to a prettified domain when the title can't be fetched). The
+ * manual name+URL form stays available as a secondary path in the library.
+ */
+function QuickAddForm({
+  onAdded,
+  onError,
+}: {
+  onAdded: (app: WebApp) => void;
+  onError: (msg: string) => void;
+}) {
+  const [quickUrl, setQuickUrl] = useState("");
+  const [quickAdding, setQuickAdding] = useState(false);
+  const [quickError, setQuickError] = useState<string | null>(null);
+
+  function prettifiedDomain(rawUrl: string): string {
+    try {
+      const host = new URL(rawUrl).hostname.replace(/^www\./, "");
+      if (!host) return rawUrl;
+      return host.charAt(0).toUpperCase() + host.slice(1);
+    } catch {
+      return rawUrl;
+    }
+  }
+
+  async function handleQuickAdd(e: React.FormEvent) {
+    e.preventDefault();
+    setQuickError(null);
+    const cleanUrl = normalizeUrl(quickUrl);
+    if (!cleanUrl) {
+      setQuickError("Enter a valid URL, e.g. https://example.com");
+      return;
+    }
+    setQuickAdding(true);
+    try {
+      let name: string;
+      try {
+        const title = await invoke<string>("fetch_page_title", { url: cleanUrl });
+        name = title.trim() || prettifiedDomain(cleanUrl);
+      } catch {
+        name = prettifiedDomain(cleanUrl);
+      }
+      const created = await invoke<WebApp>("add_app", { name, url: cleanUrl });
+      onAdded(created);
+      setQuickUrl("");
+    } catch (err) {
+      const msg = errMsg(err);
+      setQuickError(msg);
+      onError(msg);
+    } finally {
+      setQuickAdding(false);
+    }
+  }
+
+  return (
+    <form className="quick-add-form" onSubmit={(e) => void handleQuickAdd(e)}>
+      <input
+        value={quickUrl}
+        onChange={(e) => setQuickUrl(e.target.value)}
+        placeholder="Paste a website URL, e.g. https://mail.google.com"
+        inputMode="url"
+        autoComplete="off"
+        aria-label="Website URL"
+      />
+      <button type="submit" disabled={quickAdding}>
+        {quickAdding ? "Adding…" : "Add app"}
+      </button>
+      {quickError && (
+        <p className="form-error" role="alert">
+          {quickError}
+        </p>
+      )}
+    </form>
+  );
 }
 
 /** "opened 5 minutes ago" / "opened 2 days ago" / "never opened" for last_opened (0 = never). */
@@ -398,6 +477,11 @@ export default function App() {
   const [activeIndex, setActiveIndex] = useState(0);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
+  // Two views: the hotkey-summoned spotlight overlay ("launcher") and the
+  // full management window ("library"). The hotkey always lands on the
+  // launcher; the tray menu and the in-overlay button open the library.
+  const [view, setView] = useState<"launcher" | "library">("launcher");
+
   // Add-app form
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
@@ -457,6 +541,48 @@ export default function App() {
       .catch(() => {});
     return () => unlisten?.();
   }, []);
+
+  // View-switch events from the backend: tray "Show library" and the hotkey
+  // summon (which always resets to the spotlight view).
+  useEffect(() => {
+    let offLibrary: (() => void) | undefined;
+    let offLauncher: (() => void) | undefined;
+    listen("appforge:show-library", () => setView("library"))
+      .then((off) => {
+        offLibrary = off;
+      })
+      .catch(() => {});
+    listen("appforge:show-launcher", () => setView("launcher"))
+      .then((off) => {
+        offLauncher = off;
+      })
+      .catch(() => {});
+    return () => {
+      offLibrary?.();
+      offLauncher?.();
+    };
+  }, []);
+
+  // Window chrome per view: the launcher is a small frameless spotlight
+  // overlay; the library is a full window. Best-effort — if the window
+  // manager refuses, the window still works.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    void (async () => {
+      try {
+        if (view === "launcher") {
+          await win.setSize(new LogicalSize(680, 480));
+          await win.setDecorations(false);
+        } else {
+          await win.setSize(new LogicalSize(1020, 720));
+          await win.setDecorations(true);
+        }
+        await win.center();
+      } catch {
+        /* non-fatal */
+      }
+    })();
+  }, [view]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -537,7 +663,7 @@ export default function App() {
     }
   }
 
-  async function handleOpenAccount(app: WebApp, account: Account) {
+  async function handleOpenAccount(app: WebApp, account: Account): Promise<boolean> {
     setError(null);
     try {
       await invoke("open_account", { appId: app.id, accountId: account.id });
@@ -555,8 +681,10 @@ export default function App() {
             : a
         )
       );
+      return true;
     } catch (err) {
       setError(`Could not open "${account.label}". ${errMsg(err)}`);
+      return false;
     }
   }
 
@@ -609,19 +737,19 @@ export default function App() {
     try {
       if (r.kind === "program") {
         await invoke("launch_program", { id: r.program.id });
-        setQuery("");
-        await invoke("hide_library");
       } else if (r.kind === "account") {
-        await handleOpenAccount(r.app, r.account);
-        setQuery("");
+        const ok = await handleOpenAccount(r.app, r.account);
+        if (!ok) return;
       } else {
         // Web app row: open the most recently used account.
         const acct = mostRecentAccount(r.app) ?? r.app.accounts[0];
-        if (acct) {
-          await handleOpenAccount(r.app, acct);
-          setQuery("");
-        }
+        if (!acct) return;
+        const ok = await handleOpenAccount(r.app, acct);
+        if (!ok) return;
       }
+      // Spotlight behavior: a successful activation dismisses the overlay.
+      setQuery("");
+      await invoke("hide_library");
     } catch (err) {
       setError(errMsg(err));
     }
@@ -651,26 +779,13 @@ export default function App() {
     return <AppIcon app={r.app} />;
   }
 
-  return (
-    <div className="shell">
-      <header className="header">
-        <h1>AppForge</h1>
-        <p className="subtitle">Your web apps, each with its own isolated accounts.</p>
-      </header>
-
-      <SearchBar
-        query={query}
-        onQuery={setQuery}
-        onKeyDown={onSearchKeyDown}
-        inputRef={searchRef}
-      />
-
+  const banners = (
+    <>
       {error && (
         <div className="banner banner-error" role="alert">
           {error}
         </div>
       )}
-
       {platform && !platform.network_adblock && (
         <div className="banner banner-info" role="status">
           Network-level ad blocking is Windows-only in this build. On this device you still
@@ -682,61 +797,118 @@ export default function App() {
           Ad filter lists are still downloading — blocking starts automatically when ready.
         </div>
       )}
+    </>
+  );
+
+  const addCreatedApp = (created: WebApp) =>
+    setApps((prev) => [
+      ...prev,
+      { ...created, accounts: created.accounts ?? [], settings: created.settings ?? DEFAULT_SETTINGS },
+    ]);
+
+  // Spotlight overlay: search field + ranked list only. Management lives one
+  // click away in the library view.
+  if (view === "launcher") {
+    return (
+      <div className="launcher-shell">
+        <SearchBar
+          query={query}
+          onQuery={setQuery}
+          onKeyDown={onSearchKeyDown}
+          inputRef={searchRef}
+        />
+        {banners}
+        <div className="launcher-results">
+          {query ? (
+            <SearchResults
+              results={results}
+              activeIndex={activeIndex}
+              onHover={setActiveIndex}
+              onActivate={(r) => void activateResult(r)}
+              renderIcon={renderResultIcon}
+            />
+          ) : loading ? (
+            <p className="muted launcher-hint">Loading…</p>
+          ) : (
+            <p className="muted launcher-hint">
+              Type to search your web apps, accounts, and programs.
+            </p>
+          )}
+        </div>
+        <footer className="launcher-foot">
+          <button className="text-button" onClick={() => setView("library")}>
+            Manage apps →
+          </button>
+          <span className="muted small">
+            {apps.length} web apps · {programs.length} programs
+          </span>
+        </footer>
+      </div>
+    );
+  }
+
+  return (
+    <div className="shell">
+      <button className="text-button library-back" onClick={() => setView("launcher")}>
+        ← Launcher
+      </button>
+      <header className="header">
+        <h1>AppForge</h1>
+        <p className="subtitle">Your web apps, each with its own isolated accounts.</p>
+      </header>
+
+      {banners}
 
       <section className="panel">
         <h2>Add a web app</h2>
-        <form className="add-form" onSubmit={(e) => void handleAdd(e)}>
-          <label>
-            <span>Name</span>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Gmail"
-              maxLength={80}
-              autoComplete="off"
-            />
-          </label>
-          <label>
-            <span>URL</span>
-            <input
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://mail.google.com"
-              inputMode="url"
-              autoComplete="off"
-            />
-          </label>
-          <label className="color-label">
-            <span>Color</span>
-            <input
-              type="color"
-              value={safeColor(color)}
-              onChange={(e) => setColor(e.target.value)}
-              aria-label="App color"
-            />
-          </label>
-          <button type="submit" disabled={adding}>
-            {adding ? "Adding…" : "Add app"}
-          </button>
-        </form>
-        {formError && (
-          <p className="form-error" role="alert">
-            {formError}
-          </p>
-        )}
+        <QuickAddForm onAdded={addCreatedApp} onError={setError} />
+        <details className="manual-add">
+          <summary>Add manually instead</summary>
+          <form className="add-form" onSubmit={(e) => void handleAdd(e)}>
+            <label>
+              <span>Name</span>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. Gmail"
+                maxLength={80}
+                autoComplete="off"
+              />
+            </label>
+            <label>
+              <span>URL</span>
+              <input
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://mail.google.com"
+                inputMode="url"
+                autoComplete="off"
+              />
+            </label>
+            <label className="color-label">
+              <span>Color</span>
+              <input
+                type="color"
+                value={safeColor(color)}
+                onChange={(e) => setColor(e.target.value)}
+                aria-label="App color"
+              />
+            </label>
+            <button type="submit" disabled={adding}>
+              {adding ? "Adding…" : "Add app"}
+            </button>
+          </form>
+          {formError && (
+            <p className="form-error" role="alert">
+              {formError}
+            </p>
+          )}
+        </details>
       </section>
 
       <section className="panel">
         <h2>Library</h2>
-        {query ? (
-          <SearchResults
-            results={results}
-            activeIndex={activeIndex}
-            onHover={setActiveIndex}
-            onActivate={(r) => void activateResult(r)}
-            renderIcon={renderResultIcon}
-          />
-        ) : loading ? (
+        {loading ? (
           <p className="muted">Loading…</p>
         ) : apps.length === 0 ? (
           <p className="muted">No apps yet. Add your first web app above.</p>
