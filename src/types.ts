@@ -2,7 +2,15 @@
  * Shared types for the AppForge library window.
  *
  * Backend contract (implemented by the Rust side — do not extend).
- * All commands are invoked by their exact names with snake_case args.
+ *
+ * IMPORTANT — invoke argument naming: Tauri converts Rust `snake_case`
+ * command parameters to `camelCase` for JavaScript. So a command declared as
+ * `fn add_account(app_id: String, ...)` MUST be invoked as
+ * `invoke("add_account", { appId: ... })` — passing `app_id` fails at
+ * RUNTIME with "missing required key appId", and TypeScript cannot catch it
+ * (invoke args are not type-checked against the Rust signature). Struct
+ * fields (e.g. Account.app_id) are different: they follow serde and stay
+ * snake_case in JSON.
  */
 
 export interface AppSettings {

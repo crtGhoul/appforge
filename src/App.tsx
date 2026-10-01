@@ -172,7 +172,8 @@ function AddAccountForm({
     setAdding(true);
     try {
       const account = await invoke<Account>("add_account", {
-        app_id: app.id,
+        // Tauri exposes Rust snake_case params as camelCase to JS.
+        appId: app.id,
         label: clean,
         color: isValidHexColor(color) ? color : null,
       });
@@ -539,7 +540,7 @@ export default function App() {
   async function handleOpenAccount(app: WebApp, account: Account) {
     setError(null);
     try {
-      await invoke("open_account", { app_id: app.id, account_id: account.id });
+      await invoke("open_account", { appId: app.id, accountId: account.id });
       // Refresh last_opened display.
       const now = Math.floor(Date.now() / 1000);
       setApps((prev) =>
@@ -562,7 +563,7 @@ export default function App() {
   async function handleSuspendAccount(app: WebApp, account: Account) {
     setError(null);
     try {
-      await invoke("suspend_account", { app_id: app.id, account_id: account.id });
+      await invoke("suspend_account", { appId: app.id, accountId: account.id });
     } catch (err) {
       setError(`Could not suspend "${account.label}". ${errMsg(err)}`);
     }
@@ -578,7 +579,7 @@ export default function App() {
     }
     setError(null);
     try {
-      await invoke("remove_account", { app_id: app.id, account_id: account.id });
+      await invoke("remove_account", { appId: app.id, accountId: account.id });
       setApps((prev) =>
         prev.map((a) =>
           a.id === app.id

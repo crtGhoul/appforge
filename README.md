@@ -105,6 +105,14 @@ cd src-tauri && AR_x86_64_pc_windows_msvc="$PWD/../msvc-ar-wrapper.sh" RC=x86_64
 
 ## Notes
 
+- **Invoke arg naming (bug class, fixed 2026-10-01):** Tauri converts Rust
+  `snake_case` command parameters to `camelCase` for JavaScript. Invoke
+  `add_account` as `{ appId: ... }`, not `{ app_id: ... }` — the mismatch
+  fails at *runtime* ("missing required key appId") and TypeScript cannot
+  catch it. This shipped broken once (add/open/suspend/remove account all
+  used `app_id`/`account_id`) before a full audit fixed every call. Rule:
+  camelCase keys in every `invoke()` args object; the convention is also
+  documented at the top of `src/types.ts`.
 - Tauri 2 uses the OS webview (WebView2 on Windows, WebKitGTK on Linux) —
   no bundled Chromium, which is the main structural RAM/disk saving versus
   Electron-based wrappers.
