@@ -2,9 +2,26 @@
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Brave's adblock-rust: EasyList/EasyPrivacy syntax, network + cosmetic filtering.
+# default-features off drops "single-thread" so Engine is Send+Sync and can be
+# shared behind Arc across webviews; embedded-domain-resolver avoids a runtime
+# PSL download. MPL-2.0 — see THIRD-PARTY-NOTICES.md.
+adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 serde = { features = ["derive"], version = "1" }
 serde_json = "1"
 tauri = { features = [], version = "2" }
+# Filter-list downloads. rustls ("tls") only; no native-tls dependency.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+url = "2"
+
+# Pinned to the exact webview2-com that wry 0.57.0 uses (verified via cargo
+# tree) so the COM bindings are a single crate instance — a mismatch would be
+# two different ICoreWebView2 types and fail to compile.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "=0.39.1"
+# Same windows-core instance webview2-com 0.39.1 uses (0.62.x): needed for
+# PWSTR/HSTRING/w! in the WebResourceRequested hook.
+windows-core = "0.62"
 
 [features]
 # Tauri's default desktop mode uses the OS webview (WebView2 on Windows,
