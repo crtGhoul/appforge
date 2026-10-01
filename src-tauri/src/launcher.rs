@@ -1,10 +1,11 @@
 //! Launcher: native installed programs listed next to web apps.
 //!
 //! Windows: enumerate Start Menu `.lnk` shortcuts (all-users and per-user
-//! Programs folders), resolve each one through `IShellLinkW` to its target,
-//! keep the ones pointing at a `.exe`, de-dupe by target path, and extract
-//! the exe's icon to PNG best-effort (the UI falls back to a generic glyph
-//! when extraction fails). Microsoft Store (UWP) apps are out of scope.
+//! Programs folders) plus Desktop shortcuts (per-user and public), resolve
+//! each one through `IShellLinkW` to its target, keep the ones pointing at a
+//! `.exe`, de-dupe by target path, and extract the exe's icon to PNG
+//! best-effort (the UI falls back to a generic glyph when extraction fails).
+//! Microsoft Store (UWP) apps are out of scope.
 //!
 //! Linux: parse `.desktop` files from the system and user applications dirs
 //! (name + exec only, no icon extraction) and launch via `gio`/`gtk-launch`.
@@ -119,6 +120,13 @@ fn scan_all(icons_dir: &Path) -> Vec<NativeProgram> {
     }
     if let Ok(ad) = std::env::var("APPDATA") {
         roots.push(PathBuf::from(ad).join("Microsoft\\Windows\\Start Menu\\Programs"));
+    }
+    // Desktop shortcuts too — many installers drop their only shortcut here.
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        roots.push(PathBuf::from(up).join("Desktop"));
+    }
+    if let Ok(pd) = std::env::var("PUBLIC") {
+        roots.push(PathBuf::from(pd).join("Desktop"));
     }
 
     // IShellLinkW needs COM on this thread.

@@ -3,6 +3,7 @@
 mod adblock;
 mod launcher;
 mod launcher_settings;
+mod page_title;
 mod store;
 mod windows;
 
@@ -12,7 +13,7 @@ use launcher_settings::LauncherSettings;
 use serde::Serialize;
 use std::sync::Mutex;
 use store::{Account, AppSettings, AppStore, WebApp};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 use windows::WindowState;
 
@@ -148,7 +149,7 @@ fn launch_program(id: String, state: State<'_, LauncherState>) -> Result<(), Str
     state.launch(&id)
 }
 
-/// Hide the library window (Escape with an empty search box).
+/// Hide the main window without quitting (Escape with an empty search box).
 #[tauri::command]
 fn hide_library(app: AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
@@ -156,6 +157,32 @@ fn hide_library(app: AppHandle) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Show the main window in library (management) view. The frontend listens
+/// for the `appforge:show-library` event and switches views accordingly.
+#[tauri::command]
+fn show_library(app: AppHandle) -> Result<(), String> {
+    show_library_view(&app)
+}
+
+/// Best-effort page title for the quick-add flow. The frontend falls back to
+/// a prettified domain name when this errors.
+#[tauri::command]
+fn fetch_page_title(url: String) -> Result<String, String> {
+    page_title::fetch_page_title(&url)
+}
+
+/// Show the main window in library (management) view and tell the frontend
+/// to switch to it.
+fn show_library_view(app: &AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("main") {
+        w.show().map_err(|e| e.to_string())?;
+        w.set_focus().map_err(|e| e.to_string())?;
+        app.emit("appforge:show-library", ())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -184,27 +211,32 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     launcher_settings::set_autostart(&app, &mut settings, enabled)
 }
 
-/// Alt+Space (or the user's chosen key) toggles the library window.
+/// Alt+Space (or the user's chosen key) toggles the window. Showing always
+/// lands on the launcher (spotlight) view — the frontend resets via the
+/// `appforge:show-launcher` event. Hiding is just hiding.
 fn toggle_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let visible = w.is_visible().unwrap_or(false);
         if visible {
             let _ = w.hide();
         } else {
+            let _ = w.center();
             let _ = w.show();
             let _ = w.set_focus();
+            let _ = app.emit("appforge:show-launcher", ());
         }
     }
 }
 
-/// Build the tray icon: left-click toggles the library, the menu offers
-/// Show / Rescan programs / Quit. Missing entirely on Linux desktops without
-/// a tray (Wayland GNOME) — the app still works, just without the icon.
+/// Build the tray icon: left-click toggles the launcher overlay, the menu
+/// offers Show library / Rescan programs / Quit. Missing entirely on Linux
+/// desktops without a tray (Wayland GNOME) — the app still works, just
+/// without the icon.
 fn build_tray(app: &mut tauri::App) -> Result<(), String> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-    let show = MenuItem::with_id(app.handle(), "tray-show", "Show AppForge", true, None::<&str>)
+    let show = MenuItem::with_id(app.handle(), "tray-show", "Show library", true, None::<&str>)
         .map_err(|e| e.to_string())?;
     let rescan = MenuItem::with_id(
         app.handle(),
@@ -225,7 +257,9 @@ fn build_tray(app: &mut tauri::App) -> Result<(), String> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "tray-show" => toggle_main_window(app),
+            "tray-show" => {
+                let _ = show_library_view(app);
+            }
             "tray-rescan" => {
                 let handle = app.clone();
                 std::thread::Builder::new()
@@ -357,6 +391,8 @@ fn main() {
             rescan_programs,
             launch_program,
             hide_library,
+            show_library,
+            fetch_page_title,
             get_launcher_settings,
             set_hotkey,
             set_autostart,
