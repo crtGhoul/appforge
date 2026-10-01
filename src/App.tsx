@@ -1,45 +1,23 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
-
-/**
- * Backend contract (implemented by the Rust side — do not extend).
- * All commands are invoked by their exact names with snake_case args.
- */
-interface AppSettings {
-  popup_policy: "block" | "allow";
-  popup_allowlist: string[];
-  adblock_enabled: boolean;
-  auto_suspend_minutes: number;
-}
-
-interface Account {
-  id: string;
-  app_id: string;
-  label: string;
-  color: string;
-  session_dir: string;
-  last_opened: number;
-  created_at: number;
-}
-
-interface WebApp {
-  id: string;
-  name: string;
-  url: string;
-  icon: string | null;
-  color: string;
-  settings: AppSettings;
-  accounts: Account[];
-  created_at: number;
-}
-
-interface PlatformInfo {
-  os: string;
-  network_adblock: boolean;
-  filter_lists_loaded: boolean;
-  filter_lists_updated_at: number | null;
-}
+import {
+  LauncherSettingsPanel,
+  ProgramIcon,
+  SearchBar,
+  SearchResults,
+  buildResults,
+} from "./Launcher";
+import type { SearchResult } from "./Launcher";
+import type {
+  Account,
+  AppSettings,
+  LauncherSettings,
+  NativeProgram,
+  PlatformInfo,
+  WebApp,
+} from "./types";
 
 const DEFAULT_SETTINGS: AppSettings = {
   popup_policy: "block",
@@ -411,6 +389,14 @@ export default function App() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [settingsOpen, setSettingsOpen] = useState<Set<string>>(new Set());
 
+  // Launcher: hotkey-summoned search over apps, accounts, and programs.
+  const [programs, setPrograms] = useState<NativeProgram[]>([]);
+  const [launcherSettings, setLauncherSettings] = useState<LauncherSettings | null>(null);
+  const [launcherPanelOpen, setLauncherPanelOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+
   // Add-app form
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
@@ -422,12 +408,16 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const [list, info] = await Promise.all([
+      const [list, info, progList, launchSettings] = await Promise.all([
         invoke<WebApp[]>("list_apps"),
         invoke<PlatformInfo>("platform_info"),
+        invoke<NativeProgram[]>("list_programs"),
+        invoke<LauncherSettings>("get_launcher_settings"),
       ]);
       setApps(list.map((a) => ({ ...a, accounts: a.accounts ?? [], settings: a.settings ?? DEFAULT_SETTINGS })));
       setPlatform(info);
+      setPrograms(progList);
+      setLauncherSettings(launchSettings);
     } catch (err) {
       setError(errMsg(err) === "Something went wrong." ? "Could not load your apps." : errMsg(err));
     } finally {
@@ -438,6 +428,34 @@ export default function App() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // The program scan runs in the background at startup; pick up its results
+  // a few seconds later so search finds everything.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      invoke<NativeProgram[]>("list_programs")
+        .then(setPrograms)
+        .catch(() => {});
+    }, 8000);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Focus the search box every time the window is summoned.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (focused) {
+          searchRef.current?.focus();
+          searchRef.current?.select();
+        }
+      })
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => {});
+    return () => unlisten?.();
+  }, []);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -573,12 +591,78 @@ export default function App() {
     }
   }
 
+  // --- launcher search -------------------------------------------------
+
+  const results = useMemo(() => buildResults(query, apps, programs), [query, apps, programs]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query]);
+
+  function mostRecentAccount(app: WebApp): Account | undefined {
+    return [...app.accounts].sort((a, b) => b.last_opened - a.last_opened)[0];
+  }
+
+  async function activateResult(r: SearchResult) {
+    setError(null);
+    try {
+      if (r.kind === "program") {
+        await invoke("launch_program", { id: r.program.id });
+        setQuery("");
+        await invoke("hide_library");
+      } else if (r.kind === "account") {
+        await handleOpenAccount(r.app, r.account);
+        setQuery("");
+      } else {
+        // Web app row: open the most recently used account.
+        const acct = mostRecentAccount(r.app) ?? r.app.accounts[0];
+        if (acct) {
+          await handleOpenAccount(r.app, acct);
+          setQuery("");
+        }
+      }
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
+
+  function onSearchKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.min(i + 1, results.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      const r = results[activeIndex];
+      if (r) void activateResult(r);
+    } else if (e.key === "Escape") {
+      if (query) {
+        setQuery("");
+      } else {
+        void invoke("hide_library").catch(() => {});
+      }
+    }
+  }
+
+  function renderResultIcon(r: SearchResult): React.ReactNode {
+    if (r.kind === "program") return <ProgramIcon program={r.program} />;
+    return <AppIcon app={r.app} />;
+  }
+
   return (
     <div className="shell">
       <header className="header">
         <h1>AppForge</h1>
         <p className="subtitle">Your web apps, each with its own isolated accounts.</p>
       </header>
+
+      <SearchBar
+        query={query}
+        onQuery={setQuery}
+        onKeyDown={onSearchKeyDown}
+        inputRef={searchRef}
+      />
 
       {error && (
         <div className="banner banner-error" role="alert">
@@ -643,7 +727,15 @@ export default function App() {
 
       <section className="panel">
         <h2>Library</h2>
-        {loading ? (
+        {query ? (
+          <SearchResults
+            results={results}
+            activeIndex={activeIndex}
+            onHover={setActiveIndex}
+            onActivate={(r) => void activateResult(r)}
+            renderIcon={renderResultIcon}
+          />
+        ) : loading ? (
           <p className="muted">Loading…</p>
         ) : apps.length === 0 ? (
           <p className="muted">No apps yet. Add your first web app above.</p>
@@ -737,6 +829,31 @@ export default function App() {
             })}
           </ul>
         )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Launcher</h2>
+          <button
+            className="text-button"
+            onClick={() => setLauncherPanelOpen((v) => !v)}
+            aria-expanded={launcherPanelOpen}
+          >
+            {launcherPanelOpen ? "Hide" : "Show"}
+          </button>
+        </div>
+        {launcherPanelOpen &&
+          (launcherSettings ? (
+            <LauncherSettingsPanel
+              settings={launcherSettings}
+              onSaved={setLauncherSettings}
+              programsCount={programs.length}
+              onProgramsRefreshed={setPrograms}
+              onError={setError}
+            />
+          ) : (
+            <p className="muted">Loading…</p>
+          ))}
       </section>
 
       <footer className="footer muted">
