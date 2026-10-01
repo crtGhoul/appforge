@@ -1,13 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adblock;
+mod launcher;
+mod launcher_settings;
 mod store;
 mod windows;
 
 use adblock::AdblockState;
+use launcher::{LauncherState, NativeProgram};
+use launcher_settings::LauncherSettings;
 use serde::Serialize;
+use std::sync::Mutex;
 use store::{Account, AppSettings, AppStore, WebApp};
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 use windows::WindowState;
 
 #[tauri::command]
@@ -119,8 +125,157 @@ fn platform_info(adblock: State<'_, AdblockState>) -> Result<PlatformInfo, Strin
     })
 }
 
+// ---------------------------------------------------------------------------
+// Launcher commands
+// ---------------------------------------------------------------------------
+
+/// Programs found by the last scan (the startup scan runs in the background).
+#[tauri::command]
+fn list_programs(state: State<'_, LauncherState>) -> Vec<NativeProgram> {
+    state.list()
+}
+
+/// Full rescan now; blocks a worker thread, not the UI. Returns the count.
+#[tauri::command]
+fn rescan_programs(state: State<'_, LauncherState>) -> usize {
+    state.rescan()
+}
+
+/// Launch a program by id. The lookup is server-side, so the frontend can
+/// never ask the backend to run an arbitrary path.
+#[tauri::command]
+fn launch_program(id: String, state: State<'_, LauncherState>) -> Result<(), String> {
+    state.launch(&id)
+}
+
+/// Hide the library window (Escape with an empty search box).
+#[tauri::command]
+fn hide_library(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("main") {
+        w.hide().map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn get_launcher_settings(app: AppHandle) -> LauncherSettings {
+    app.state::<Mutex<LauncherSettings>>()
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn set_hotkey(app: AppHandle, hotkey: String) -> Result<(), String> {
+    let state = app.state::<Mutex<LauncherSettings>>();
+    let mut settings = state
+        .lock()
+        .map_err(|e| format!("settings state poisoned: {e}"))?;
+    launcher_settings::set_hotkey(&app, &mut settings, &hotkey)
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let state = app.state::<Mutex<LauncherSettings>>();
+    let mut settings = state
+        .lock()
+        .map_err(|e| format!("settings state poisoned: {e}"))?;
+    launcher_settings::set_autostart(&app, &mut settings, enabled)
+}
+
+/// Alt+Space (or the user's chosen key) toggles the library window.
+fn toggle_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let visible = w.is_visible().unwrap_or(false);
+        if visible {
+            let _ = w.hide();
+        } else {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    }
+}
+
+/// Build the tray icon: left-click toggles the library, the menu offers
+/// Show / Rescan programs / Quit. Missing entirely on Linux desktops without
+/// a tray (Wayland GNOME) — the app still works, just without the icon.
+fn build_tray(app: &mut tauri::App) -> Result<(), String> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItem::with_id(app.handle(), "tray-show", "Show AppForge", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let rescan = MenuItem::with_id(
+        app.handle(),
+        "tray-rescan",
+        "Rescan programs",
+        true,
+        None::<&str>,
+    )
+    .map_err(|e| e.to_string())?;
+    let quit =
+        MenuItem::with_id(app.handle(), "tray-quit", "Quit", true, None::<&str>)
+            .map_err(|e| e.to_string())?;
+    let menu = Menu::with_items(app.handle(), &[&show, &rescan, &quit])
+        .map_err(|e| e.to_string())?;
+
+    let mut builder = TrayIconBuilder::with_id("appforge")
+        .tooltip("AppForge")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show" => toggle_main_window(app),
+            "tray-rescan" => {
+                let handle = app.clone();
+                std::thread::Builder::new()
+                    .name("appforge-tray-rescan".to_string())
+                    .spawn(move || {
+                        if let Some(state) = handle.try_state::<LauncherState>() {
+                            state.rescan();
+                        }
+                    })
+                    .ok();
+            }
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                toggle_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state
+                        == tauri_plugin_global_shortcut::ShortcutState::Pressed
+                    {
+                        toggle_main_window(app);
+                    }
+                })
+                .build(),
+        )
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let store =
                 AppStore::load(app.handle()).map_err(std::io::Error::other)?;
@@ -139,8 +294,53 @@ fn main() {
                 .spawn(move || adblock_bg.refresh_loop())
                 .map_err(std::io::Error::other)?;
 
+            // --- launcher ---
+            let launcher_state =
+                LauncherState::new(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(launcher_state);
+            let settings = launcher_settings::load(app.handle());
+            if let Err(e) =
+                launcher_settings::register_hotkey(app.handle(), &settings.hotkey)
+            {
+                eprintln!("launcher hotkey: {e}");
+            }
+            if settings.autostart {
+                if let Err(e) = app.handle().autolaunch().enable() {
+                    eprintln!("launcher autostart: {e}");
+                }
+            }
+            app.manage(Mutex::new(settings));
+            // First program scan runs in the background; results land in the
+            // cache and are picked up by list_programs.
+            {
+                let handle = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("appforge-program-scan".to_string())
+                    .spawn(move || {
+                        if let Some(state) = handle.try_state::<LauncherState>() {
+                            state.rescan();
+                        }
+                    })
+                    .map_err(std::io::Error::other)?;
+            }
+
+            // Tray icon. Missing on tray-less Linux desktops; that is fine.
+            if let Err(e) = build_tray(app) {
+                eprintln!("tray: {e}");
+            }
+
             windows::start_suspend_watcher(app.handle().clone());
             Ok(())
+        })
+        // Closing the main window hides it to the tray; Quit is via the
+        // tray menu. The launcher is always one hotkey away.
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_apps,
@@ -153,6 +353,13 @@ fn main() {
             open_account,
             suspend_account,
             platform_info,
+            list_programs,
+            rescan_programs,
+            launch_program,
+            hide_library,
+            get_launcher_settings,
+            set_hotkey,
+            set_autostart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -9,7 +9,9 @@ tauri-build = { version = "2", features = [] }
 adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 serde = { features = ["derive"], version = "1" }
 serde_json = "1"
-tauri = { features = [], version = "2" }
+tauri = { features = ["tray-icon"], version = "2" }
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
 # Filter-list downloads. rustls ("tls") only; no native-tls dependency.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 url = "2"
@@ -18,7 +20,19 @@ url = "2"
 # tree) so the COM bindings are a single crate instance — a mismatch would be
 # two different ICoreWebView2 types and fail to compile.
 [target.'cfg(windows)'.dependencies]
+# PNG encoding for extracted program icons (pure Rust, no system libs).
+png = "0.17"
 webview2-com = "=0.39.1"
+# Win32 APIs for the launcher: IShellLinkW (.lnk resolution), ExtractIconExW +
+# GDI (exe icon extraction), ShellExecuteW (launching programs).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 # Same windows-core instance webview2-com 0.39.1 uses (0.62.x): needed for
 # PWSTR/HSTRING/w! in the WebResourceRequested hook.
 windows-core = "0.62"
