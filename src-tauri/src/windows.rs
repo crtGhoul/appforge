@@ -71,6 +71,11 @@ pub fn open_account(
 
     let label = account_window_label(app_id, account_id);
     if let Some(window) = app.get_webview_window(&label) {
+        // A bare set_focus() is not enough on Windows: it cannot restore a
+        // minimized window, so the user would see "nothing opens". Unminimize
+        // and show first, then focus.
+        let _ = window.unminimize();
+        let _ = window.show();
         let _ = window.set_focus();
         return Ok(());
     }
