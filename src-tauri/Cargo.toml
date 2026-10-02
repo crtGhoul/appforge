@@ -53,4 +53,4 @@ authors = ["AppForge"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
 name = "appforge"
-version = "0.5.1"
+version = "0.5.2"
