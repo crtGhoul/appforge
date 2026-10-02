@@ -39,7 +39,7 @@
     "targets": "all",
     "createUpdaterArtifacts": true
   },
-  "identifier": "com.appmaka.app",
+  "identifier": "com.appforge.app",
   "productName": "AppMaka",
   "version": "0.6.0",
   "plugins": {
