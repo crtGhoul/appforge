@@ -26,15 +26,22 @@ pub const DEFAULT_COLOR: &str = "#6366f1";
 pub struct AppSettings {
     /// "block" = deny new-window requests except allowlisted hosts;
     /// "allow" = open every new-window request as a contained popup.
+    /// Old records without it migrate to "block".
+    #[serde(default = "default_popup_policy")]
     pub popup_policy: String,
     /// Hostnames (e.g. "accounts.google.com") allowed to open popups when the
     /// policy is "block" — the OAuth / "sign in with" escape hatch.
+    /// Old records without it migrate to an empty list.
+    #[serde(default)]
     pub popup_allowlist: Vec<String>,
     /// Network-level ad/tracker blocking for this app's windows. Windows-only
     /// at the network layer; cosmetic filtering works everywhere.
+    /// Old records without it migrate to on.
+    #[serde(default = "default_true")]
     pub adblock_enabled: bool,
     /// Idle minutes after which an unfocused account window is suspended.
-    /// 0 = never.
+    /// 0 = never. Old records without it migrate to 30.
+    #[serde(default = "default_auto_suspend_minutes")]
     pub auto_suspend_minutes: u64,
     /// Idle minutes after which an unfocused account window is closed outright
     /// (the session dir survives, so reopening restores the login). 0 = never.
@@ -44,6 +51,18 @@ pub struct AppSettings {
 }
 
 fn default_auto_close_minutes() -> u32 {
+    30
+}
+
+fn default_popup_policy() -> String {
+    "block".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auto_suspend_minutes() -> u64 {
     30
 }
 
@@ -95,7 +114,10 @@ pub struct Account {
     /// without it migrate via the serde default.
     #[serde(default)]
     pub popup_policy: Option<String>,
+    /// Old records without it migrate to 0 (treated as "long ago").
+    #[serde(default)]
     pub last_opened: u64,
+    #[serde(default)]
     pub created_at: u64,
 }
 
@@ -106,8 +128,11 @@ pub struct WebApp {
     pub url: String,
     pub icon: Option<String>,
     pub color: String,
+    /// Old records without it migrate to the current default settings.
+    #[serde(default)]
     pub settings: AppSettings,
     pub accounts: Vec<Account>,
+    #[serde(default)]
     pub created_at: u64,
 }
 
@@ -847,6 +872,24 @@ impl AppStore {
         self.save()
     }
 
+    /// Wipe an account's session directory and recreate it empty — a full
+    /// sign-out. The account record, its app, and every other account are
+    /// untouched. The caller closes the account's window first: Windows
+    /// locks session files while the webview is alive, so a live window
+    /// would leave stale files behind.
+    /// (Interim allow: called by the `forget_login` command, which the
+    /// coordinator registers in main.rs.)
+    #[allow(dead_code)]
+    pub fn forget_account_session(&self, app_id: &str, account_id: &str) -> Result<(), String> {
+        // The stored absolute path is the source of truth, so only this
+        // account's directory is ever touched.
+        let session_dir = self.session_dir_for(app_id, account_id)?;
+        let _ = fs::remove_dir_all(&session_dir);
+        fs::create_dir_all(&session_dir)
+            .map_err(|e| format!("could not recreate session dir: {e}"))?;
+        Ok(())
+    }
+
     /// Record that an account's window was opened/focused (MRU ordering).
     /// Best-effort: a failed write must not break opening the window.
     pub fn touch_account(&self, app_id: &str, account_id: &str) {
@@ -879,5 +922,53 @@ impl AppStore {
             .and_then(|a| a.accounts.iter().find(|ac| ac.id == account_id))
             .map(|ac| PathBuf::from(&ac.session_dir))
             .ok_or_else(|| "Account not found.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_settings_migrates_missing_fields() {
+        // A hand-edited apps.json missing newer settings fields still parses.
+        let s: AppSettings = serde_json::from_str(r#"{"popup_policy":"allow"}"#).unwrap();
+        assert_eq!(s.popup_policy, "allow");
+        assert!(s.popup_allowlist.is_empty());
+        assert!(s.adblock_enabled);
+        assert_eq!(s.auto_suspend_minutes, 30);
+        assert_eq!(s.auto_close_minutes, 30);
+    }
+
+    #[test]
+    fn webapp_migrates_missing_settings_and_timestamps() {
+        let json = r##"{
+            "id": "app-1", "name": "Test", "url": "https://example.com",
+            "icon": null, "color": "#ffffff", "accounts": []
+        }"##;
+        let app: WebApp = serde_json::from_str(json).unwrap();
+        assert_eq!(app.settings.popup_policy, "block");
+        assert_eq!(app.created_at, 0);
+    }
+
+    #[test]
+    fn account_migrates_missing_optional_fields() {
+        let json = r##"{
+            "id": "acct-1", "app_id": "app-1", "label": "Main",
+            "color": "#ffffff", "session_dir": "/tmp/sess"
+        }"##;
+        let acct: Account = serde_json::from_str(json).unwrap();
+        assert!(acct.thumbnail.is_none());
+        assert!(acct.popup_policy.is_none());
+        assert_eq!(acct.last_opened, 0);
+        assert_eq!(acct.created_at, 0);
+    }
+
+    #[test]
+    fn partial_launcher_style_partial_apps_json_parses() {
+        // Missing core identity fields still fail loudly (the corrupt-backup
+        // path), rather than silently becoming a broken record.
+        let bad: Result<WebApp, _> = serde_json::from_str(r#"{"name":"No id"}"#);
+        assert!(bad.is_err());
     }
 }

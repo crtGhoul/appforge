@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
 use crate::adblock::AdblockState;
 use crate::store::AppStore;
@@ -34,8 +34,150 @@ pub fn account_window_label(app_id: &str, account_id: &str) -> String {
     format!("acct-{app_id}-{account_id}")
 }
 
+/// Window label for an account's floating back/forward toolbar.
+fn nav_toolbar_label(app_id: &str, account_id: &str) -> String {
+    format!("nav-{app_id}-{account_id}")
+}
+
+/// Offset of the toolbar pill from the account window's webview area
+/// (physical px). It floats over the page's top-left corner — clearly
+/// AppMaka chrome, out of the way of most site layouts.
+const NAV_TOOLBAR_OFFSET: (i32, i32) = (12, 12);
+
+/// Open the floating back/forward toolbar for an account window.
+///
+/// Account windows are bare webviews with no browser chrome; this tiny
+/// first-party window is the visible navigation. It is `focusable(false)`
+/// so clicks never steal keyboard focus from the page, `always_on_top` so
+/// it stays with its window, and `skip_taskbar` so it never clutters the
+/// taskbar. Its frontend is the same bundle with `?toolbar=1` (see
+/// `NavToolbar`); it talks to the backend through the normal invoke API,
+/// which is fine because this window is ours — site windows never get IPC.
+fn open_nav_toolbar(
+    app: &AppHandle,
+    app_id: &str,
+    account_id: &str,
+    anchor: &WebviewWindow,
+) {
+    let nav_label = nav_toolbar_label(app_id, account_id);
+    if app.get_webview_window(&nav_label).is_some() {
+        return;
+    }
+    // IDs are backend-generated (`prefix-<millis>-<n>`), so they are
+    // URL-safe without encoding.
+    let url = format!("index.html?toolbar=1&appId={app_id}&accountId={account_id}");
+    let built = WebviewWindowBuilder::new(app, &nav_label, WebviewUrl::App(url.into()))
+        .title("Navigation")
+        .inner_size(112.0, 48.0)
+        // NOTE: no `.resizable(false)` here on purpose. Marking the window
+        // non-resizable makes the toolkit pin min/max size to whatever size
+        // the window happens to have when the hint is processed — which was
+        // the 200x200 fallback, permanently clamping every later set_size.
+        // The pill is undecorated; there is nothing to grab anyway.
+        .maximizable(false)
+        .minimizable(false)
+        .decorations(false)
+        .transparent(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focusable(false)
+        .build();
+    match built {
+        Ok(toolbar) => {
+            // Enforce the pill size explicitly: the inner_size hint alone
+            // is not honored on all platforms (seen: 200x200 on Linux
+            // without a window manager). This must run after the window is
+            // mapped — a synchronous set_size right here is silently
+            // dropped — so it goes on a short-lived thread. 112x48 is a
+            // small always-on-top pill, not a real window.
+            let size_toolbar = toolbar.clone();
+            std::thread::Builder::new()
+                .name("appmaka-nav-size".to_string())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    let _ = size_toolbar.set_size(tauri::Size::Logical(tauri::LogicalSize {
+                        width: 112.0,
+                        height: 48.0,
+                    }));
+                })
+                .ok();
+            // Anchor to the webview area (not the outer frame): no guessing
+            // at title-bar heights on either platform.
+            if let Ok(pos) = anchor.inner_position() {
+                let _ = toolbar.set_position(tauri::Position::Physical(
+                    tauri::PhysicalPosition {
+                        x: pos.x + NAV_TOOLBAR_OFFSET.0,
+                        y: pos.y + NAV_TOOLBAR_OFFSET.1,
+                    },
+                ));
+            }
+        }
+        Err(e) => {
+            // The toolbar is a convenience; the account window and its
+            // Alt+Left/Right keys work fine without it.
+            eprintln!("[appmaka] nav toolbar: could not open: {e}");
+        }
+    }
+}
+
+/// Re-anchor the toolbar after its account window moved or resized.
+fn reposition_nav_toolbar(app: &AppHandle, app_id: &str, account_id: &str) {
+    let (Some(anchor), Some(toolbar)) = (
+        app.get_webview_window(&account_window_label(app_id, account_id)),
+        app.get_webview_window(&nav_toolbar_label(app_id, account_id)),
+    ) else {
+        return;
+    };
+    if let Ok(pos) = anchor.inner_position() {
+        let _ = toolbar.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+            x: pos.x + NAV_TOOLBAR_OFFSET.0,
+            y: pos.y + NAV_TOOLBAR_OFFSET.1,
+        }));
+    }
+}
+
+/// Close an account's toolbar. Called from every account-window close path.
+fn close_nav_toolbar(app: &AppHandle, app_id: &str, account_id: &str) {
+    if let Some(toolbar) = app.get_webview_window(&nav_toolbar_label(app_id, account_id)) {
+        let _ = toolbar.close();
+    }
+}
+
+/// Navigate an open account window back/forward in its history.
+///
+/// Called from the floating nav toolbar (a first-party window, so IPC is
+/// fine — site windows never get this). Async on purpose: never block an
+/// IPC thread on webview work (same Windows deadlock rule as window
+/// creation). JS: `invoke("account_nav", { appId, accountId, direction })`
+/// where direction is `"back"` or `"forward"`.
+#[tauri::command]
+pub async fn account_nav(
+    app: AppHandle,
+    app_id: String,
+    account_id: String,
+    direction: String,
+) -> Result<(), String> {
+    let js = match direction.as_str() {
+        "back" => "history.back();",
+        "forward" => "history.forward();",
+        _ => return Err("Unknown direction.".to_string()),
+    };
+    let label = account_window_label(&app_id, &account_id);
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| "That account window is not open.".to_string())?;
+    window
+        .eval(js)
+        .map_err(|e| format!("Could not navigate: {e}"))?;
+    Ok(())
+}
+
 struct TrackedWindow {
     app_id: String,
+    // Read by list_open_account_windows; the allow goes away once the
+    // coordinator registers that command in main.rs.
+    #[allow(dead_code)]
+    account_id: String,
     last_active: u64,
     /// Flipped live by update_app_settings so open windows follow the toggle
     /// without a rebuild.
@@ -110,6 +252,8 @@ pub fn open_account(
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        // Self-healing: if the toolbar died without its window, bring it back.
+        open_nav_toolbar(app, app_id, account_id, &window);
         return Ok(());
     }
 
@@ -146,9 +290,18 @@ pub fn open_account(
             session_dir: session_dir.clone(),
             popup_policy,
             popup_allowlist: web_app.settings.popup_allowlist.clone(),
-        }));
+        }))
+        // In-app download manager (v0.7.0): downloads stay in the account
+        // window's own session instead of kicking out to the system browser.
+        .on_download(crate::downloads::make_download_handler(app.clone()));
     // Cosmetic filtering: engine-generated hide selectors injected before
     // first paint. Skipped entirely when no engine is loaded (fail open).
+    // The target=_blank shim is always injected: without it WebKitGTK drops
+    // target=_blank link clicks before they ever reach on_new_window.
+    builder = builder.initialization_script(TARGET_BLANK_SHIM_JS);
+    // Back/forward keyboard nav (v0.7.0): bare webviews have no chrome, so
+    // Alt+Left / Alt+Right get them here.
+    builder = builder.initialization_script(NAV_KEYS_JS);
     let css = adblock.cosmetic_css_for(&web_app.url);
     if !css.is_empty() {
         builder = builder.initialization_script(cosmetic_init_script(&css));
@@ -167,6 +320,7 @@ pub fn open_account(
             label.clone(),
             TrackedWindow {
                 app_id: app_id.to_string(),
+                account_id: account_id.to_string(),
                 last_active: unix_secs(),
                 adblock_enabled: adblock_flag.clone(),
                 #[cfg(windows)]
@@ -177,14 +331,29 @@ pub fn open_account(
     }
 
     // Focus in/out feeds the suspend watcher; focus also resumes a suspended
-    // webview on Windows.
+    // webview on Windows. The floating nav toolbar follows its account
+    // window on move/resize and dies with it.
     let track_app = app.clone();
     let track_label = label.clone();
+    let nav_app_id = app_id.to_string();
+    let nav_account_id = account_id.to_string();
+    let follow_app = app.clone();
     window.on_window_event(move |event| {
-        if let WindowEvent::Focused(focused) = event {
-            touch_window(&track_app, &track_label, *focused);
+        match event {
+            WindowEvent::Focused(focused) => touch_window(&track_app, &track_label, *focused),
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                reposition_nav_toolbar(&follow_app, &nav_app_id, &nav_account_id);
+            }
+            WindowEvent::CloseRequested { .. } => {
+                close_nav_toolbar(&follow_app, &nav_app_id, &nav_account_id);
+            }
+            _ => {}
         }
     });
+
+    // Floating back/forward toolbar (v0.7.0): bare webviews have no browser
+    // chrome. Best-effort — the window and Alt+Left/Right work without it.
+    open_nav_toolbar(app, app_id, account_id, &window);
 
     #[cfg(windows)]
     crate::adblock::attach_network_blocking(&window, adblock, adblock_flag);
@@ -215,6 +384,46 @@ pub(crate) fn cosmetic_init_script(css: &str) -> String {
 
 static OAUTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Initialization script injected into every account window so plain
+/// left-clicks on `target="_blank"` links reach the popup policy handler.
+///
+/// Why this exists: on WebKitGTK (wry 0.57, WebKitGTK 2.52) a
+/// `target="_blank"` link click never emits the `create` signal that backs
+/// `on_new_window` — verified by click test: the click lands (page JS runs)
+/// but no new-window request is produced, so the link is silently dropped
+/// even with policy Allow. `window.open()` does emit `create` and works.
+/// The shim re-routes qualifying link clicks through `window.open`, which
+/// goes through `make_popup_handler` and gets the same policy/allowlist
+/// treatment. Modified clicks (Ctrl/Cmd/Shift/Alt, middle button) are left
+/// alone. Runs in the page's main world but touches no page state and
+/// exposes no IPC; `withGlobalTauri` stays false.
+const TARGET_BLANK_SHIM_JS: &str = r#"(function () {
+  document.addEventListener('click', function (e) {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    var t = e.target;
+    var a = (t && t.closest) ? t.closest('a[target="_blank"]') : null;
+    if (!a || !a.href) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.open(a.href, '_blank');
+  }, true);
+})();"#;
+
+/// Back/forward keyboard navigation for account windows. They are bare
+/// webviews with no browser chrome, so Alt+Left / Alt+Right would otherwise
+/// do nothing — every browser reserves them for history navigation, and
+/// users replacing their browser expect them to work. Capture phase +
+/// preventDefault matches browser behavior (the browser consumes the keys
+/// before the page even when focus is in a text field). Pure page JS: no
+/// page state touched, no IPC, `withGlobalTauri` stays false.
+const NAV_KEYS_JS: &str = r#"(function () {
+  document.addEventListener('keydown', function (e) {
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopPropagation(); history.back(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); e.stopPropagation(); history.forward(); }
+  }, true);
+})();"#;
+
 /// Everything the popup handler needs, captured by value (the handler is
 /// `Fn`, so it can't borrow from the stack frame that creates the window).
 /// Shared with the preview flow (`preview.rs`), which passes placeholder
@@ -236,9 +445,20 @@ pub(crate) struct PopupContext {
 /// decision is made synchronously and any window creation is bounced to a
 /// dedicated spawned thread (never the calling thread, never the main
 /// thread — see `spawn_oauth_modal`). The original request is always
-/// denied — allowed popups are re-created as contained modals instead.
+/// denied — allowed popups are re-created as contained windows instead.
+///
+/// Policy "allow": every new-window request (window.open, target=_blank)
+/// becomes a plain contained popup sharing the account's session directory,
+/// so logins carry over. Policy "block": only allowlisted hosts get the
+/// OAuth modal (with its auto-close script); everything else is denied
+/// silently, with no intrusive UI.
 ///
 /// Also used by the preview flow with placeholder ids.
+///
+/// NOTE: the policy is captured when the account window is built. Changing
+/// the per-account or app-level popup policy while the window is open has
+/// no effect until the window is closed and reopened — the edit dialogs
+/// must say so (frontend copy, coordinator-owned).
 pub(crate) fn make_popup_handler(
     ctx: PopupContext,
 ) -> impl Fn(url::Url, tauri::webview::NewWindowFeatures) -> tauri::webview::NewWindowResponse<tauri::Wry>
@@ -247,25 +467,26 @@ pub(crate) fn make_popup_handler(
     // Origin used by the OAuth modal's best-effort auto-close.
     let home_origin = app_origin(&ctx.app_url);
     move |url: url::Url, _features| {
-        let allowed = if ctx.popup_policy == "allow" {
-            true
+        if ctx.popup_policy == "allow" {
+            spawn_popup_window(&ctx.app, &url, &ctx.app_name, &ctx.session_dir);
         } else {
             // "block": only allowlisted hosts get a contained popup.
             let host = url.host_str().unwrap_or("").to_lowercase();
-            ctx.popup_allowlist
+            if ctx
+                .popup_allowlist
                 .iter()
                 .any(|h| h.eq_ignore_ascii_case(&host))
-        };
-        if allowed {
-            spawn_oauth_modal(
-                &ctx.app,
-                &url,
-                &ctx.app_id,
-                &ctx.account_id,
-                &ctx.app_name,
-                &home_origin,
-                &ctx.session_dir,
-            );
+            {
+                spawn_oauth_modal(
+                    &ctx.app,
+                    &url,
+                    &ctx.app_id,
+                    &ctx.account_id,
+                    &ctx.app_name,
+                    &home_origin,
+                    &ctx.session_dir,
+                );
+            }
         }
         tauri::webview::NewWindowResponse::Deny
     }
@@ -285,6 +506,17 @@ fn app_origin(app_url: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Open a general popup as a plain contained window bound to the SAME
+/// session directory, so logins carry over. Unlike the OAuth modal there is
+/// no auto-close script: a general popup is user content that stays open
+/// until the user closes it. (The old code routed "allow" popups through
+/// the OAuth modal, whose auto-close script killed same-origin popups
+/// within ~1.5 s — the "popups don't open even on Allow" bug.)
+fn spawn_popup_window(app: &AppHandle, url: &url::Url, app_name: &str, session_dir: &Path) {
+    let title = format!("{app_name} — popup");
+    spawn_contained_window(app, "popup", url, &title, session_dir, None, "popup");
+}
+
 /// Open an allowlisted popup as a small modal bound to the SAME session
 /// directory, so an OAuth login lands in the right account's cookie jar.
 /// The modal self-closes (best-effort) when navigation returns to the app's
@@ -298,38 +530,58 @@ fn spawn_oauth_modal(
     home_origin: &str,
     session_dir: &Path,
 ) {
+    let json_home = serde_json::to_string(home_origin).unwrap_or_else(|_| "\"\"".to_string());
+    let autoclose = format!(
+        "(function(){{var home={json_home};\
+        var t=setInterval(function(){{try{{\
+        if(window.location.origin===home){{window.close();clearInterval(t);}}\
+        }}catch(e){{}}}},1500);}})();"
+    );
+    let title = format!("{app_name} — sign-in");
+    let log_ctx = format!("{app_id}/{account_id}");
+    spawn_contained_window(app, "oauth", url, &title, session_dir, Some(autoclose), &log_ctx);
+}
+
+/// Shared contained-window builder for popups and OAuth modals.
+///
+/// SECURITY POSTURE: these windows load external site URLs only, never our
+/// frontend bundle, and `withGlobalTauri` is false crate-wide, so no Tauri
+/// IPC (`window.__TAURI__`) is ever injected into them — they cannot invoke
+/// backend commands. The only script ever injected is the static,
+/// JSON-escaped OAuth auto-close snippet (or none). Nested popups inside a
+/// contained window are denied outright, preventing popup loops.
+fn spawn_contained_window(
+    app: &AppHandle,
+    label_prefix: &str,
+    url: &url::Url,
+    title: &str,
+    session_dir: &Path,
+    initialization_script: Option<String>,
+    log_ctx: &str,
+) {
     let n = OAUTH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("oauth-{n}");
+    let label = format!("{label_prefix}-{n}");
     // The window MUST be built on a dedicated thread, never on the calling
     // (WebView2 popup) thread and never via run_on_main_thread: on Windows,
     // WebviewWindowBuilder::build() deadlocks in a synchronous context
     // (wry#583) — and building it *on* the main thread self-deadlocks, since
     // build() waits for the event loop that is busy running the closure.
     // A plain spawned thread just blocks on the create-window round-trip
-    // while the main thread and all WebView2 threads stay free.
-    // Everything the thread touches is cloned up front ('static).
-    let modal_app = app.clone();
-    let app_id = app_id.to_string();
-    let account_id = account_id.to_string();
+    // while the main thread and all WebView2 threads stay free. On Linux
+    // the same pattern works: build() marshals creation onto the GTK main
+    // loop from any thread. Everything the thread touches is cloned up
+    // front ('static).
+    let window_app = app.clone();
     let url = url.clone();
     let session_dir = session_dir.to_path_buf();
-    let home_origin = home_origin.to_string();
-    let title = format!("{app_name} — sign-in");
+    let title = title.to_string();
+    let log_ctx = log_ctx.to_string();
+    let label_prefix = label_prefix.to_string();
     let _ = std::thread::Builder::new()
-        .name(format!("appmaka-oauth-{n}"))
+        .name(format!("appmaka-{label_prefix}-{n}"))
         .spawn(move || {
-            let json_home =
-                serde_json::to_string(&home_origin).unwrap_or_else(|_| "\"\"".to_string());
-            let autoclose = format!(
-                "(function(){{var home={json_home};\
-                var t=setInterval(function(){{try{{\
-                if(window.location.origin===home){{window.close();clearInterval(t);}}\
-                }}catch(e){{}}}},1500);}})();"
-            );
-            // Nested popups inside the modal are denied outright: an OAuth flow
-            // that needs a second popup is rare, and this prevents modal loops.
-            let _ = WebviewWindowBuilder::new(
-                &modal_app,
+            let mut builder = WebviewWindowBuilder::new(
+                &window_app,
                 &label,
                 WebviewUrl::External(url.clone()),
             )
@@ -337,12 +589,16 @@ fn spawn_oauth_modal(
             .title(&title)
             .inner_size(640.0, 720.0)
             .center()
-            .initialization_script(autoclose)
-            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-            .build()
-            .map_err(|e| {
-                eprintln!("[appmaka] oauth modal failed for {app_id}/{account_id}: {e}")
-            });
+            // Nested popups inside the contained window are denied outright:
+            // an OAuth flow that needs a second popup is rare, and this
+            // prevents modal loops.
+            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
+            if let Some(script) = initialization_script {
+                builder = builder.initialization_script(script);
+            }
+            if let Err(e) = builder.build() {
+                eprintln!("[appmaka] {label_prefix} window failed for {log_ctx}: {e}");
+            }
         });
 }
 
@@ -596,10 +852,128 @@ fn close_tracked_window(app: &AppHandle, label: &str) {
     if let Some(window) = app.get_webview_window(label) {
         let _ = window.close();
     }
+    // The floating nav toolbar dies with its account window.
+    if let Some(rest) = label.strip_prefix("acct-") {
+        let nav_label = format!("nav-{rest}");
+        if let Some(toolbar) = app.get_webview_window(&nav_label) {
+            let _ = toolbar.close();
+        }
+    }
     if let Some(winstate) = app.try_state::<WindowState>() {
         if let Ok(mut tracked) = winstate.inner.lock() {
             tracked.remove(label);
         }
+    }
+    // Windows needs no reaper here: WebView2 tears down a webview's renderer
+    // processes when its controller is destroyed, and closing the window
+    // destroys the controller (it owns the CoreWebView2), so the OS reclaims
+    // the processes with the window close above. On Linux the renderers exit
+    // but each account's WebKitNetworkProcess lingers — measured 2026-10-02
+    // at ~12 MB each for 7+ minutes after the webviews were gone — hence the
+    // reaper below. It stands down entirely while any account window (or a
+    // popup child of one) is still open, since attribution would be unsafe.
+    #[cfg(target_os = "linux")]
+    if label.starts_with("acct-") || label.starts_with("popup-") || label.starts_with("oauth-")
+    {
+        schedule_network_process_reap(app.clone());
+    }
+}
+
+/// Grace period before checking for orphaned network processes: WebKitGTK
+/// usually exits them on its own within seconds, so only kill stragglers.
+#[cfg(target_os = "linux")]
+const NETWORK_PROCESS_REAP_GRACE: Duration = Duration::from_secs(90);
+
+// kill(2) without the libc crate (which would need a Cargo.toml change):
+// libc is always linked into a Rust binary, so a direct extern declaration
+// is enough. Linux-only.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+#[cfg(target_os = "linux")]
+const SIGTERM: i32 = 15;
+
+/// Spawn the orphan-network-process reaper: sleep the grace period, then
+/// SIGTERM our own lingering WebKitNetworkProcess children — but ONLY when
+/// zero tracked account windows remain open AND no other non-main window
+/// (popup child, preview) is still alive. With any webview alive, a network
+/// process could still belong to it, so the reaper does nothing
+/// (fail closed).
+#[cfg(target_os = "linux")]
+fn schedule_network_process_reap(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("appmaka-netproc-reap".to_string())
+        .spawn(move || {
+            std::thread::sleep(NETWORK_PROCESS_REAP_GRACE);
+            let tracked_open = match app.try_state::<WindowState>() {
+                Some(winstate) => match winstate.inner.lock() {
+                    Ok(tracked) => tracked.keys().any(|l| l.starts_with("acct-")),
+                    // Lock poisoned: fail closed, do nothing.
+                    Err(_) => true,
+                },
+                None => true,
+            };
+            // Popups are not tracked in WindowState, so also check live
+            // windows directly: a still-open popup may own the lingering
+            // network process.
+            let any_window_open = app
+                .webview_windows()
+                .keys()
+                .any(|l| l != "main");
+            if tracked_open || any_window_open {
+                return;
+            }
+            reap_orphan_network_processes();
+        });
+}
+
+/// SIGTERM direct children of our own PID whose cmdline contains
+/// "WebKitNetworkProcess". Each account window gets an isolated website
+/// data dir, which spawns its own network process; once the last account
+/// window is gone these are provably orphaned (their webviews are
+/// destroyed) and safe to kill. Scoped strictly to our own children — never
+/// a sibling process or the user's own.
+#[cfg(target_os = "linux")]
+fn reap_orphan_network_processes() {
+    let self_pid = std::process::id();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut killed = 0u32;
+    for entry in proc.filter_map(|e| e.ok()) {
+        let pid: i32 = match entry.file_name().to_string_lossy().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if !cmdline
+            .windows(b"WebKitNetworkProcess".len())
+            .any(|w| w == b"WebKitNetworkProcess")
+        {
+            continue;
+        }
+        // Direct child of our own PID only.
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let is_child = status.lines().any(|l| {
+            l.strip_prefix("PPid:")
+                .map(|v| v.trim() == self_pid.to_string())
+                .unwrap_or(false)
+        });
+        if !is_child {
+            continue;
+        }
+        // SAFETY: kill(2) with a PID verified above as our own direct child
+        // and SIGTERM; libc is always linked.
+        if unsafe { kill(pid, SIGTERM) } == 0 {
+            killed += 1;
+            eprintln!("[appmaka] reaped orphan WebKitNetworkProcess pid={pid}");
+        } else {
+            eprintln!("[appmaka] could not reap WebKitNetworkProcess pid={pid}");
+        }
+    }
+    if killed > 0 {
+        eprintln!("[appmaka] reaped {killed} orphan WebKitNetworkProcess(es)");
     }
 }
 
@@ -631,4 +1005,212 @@ pub fn set_app_adblock_enabled(app: &AppHandle, app_id: &str, enabled: bool) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0 commands: RAM dashboard support
+// ---------------------------------------------------------------------------
+
+/// One open account window, for the RAM dashboard.
+// Interim: the coordinator registers the v0.7.0 commands in main.rs; until
+// then the dead_code allows keep `-D warnings` green. They are inert once
+// the commands are referenced.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct OpenAccountInfo {
+    pub label: String,
+    pub app_id: String,
+    pub account_id: String,
+    pub app_name: String,
+    pub account_label: String,
+    pub focused: bool,
+}
+
+/// Close every open account window. Returns how many were closed. Sessions
+/// stay on disk, so reopening an account restores its login. Transient
+/// popup children ("popup-*"/"oauth-*") are closed too but not counted —
+/// leaving them open would defeat the RAM dashboard's "close all". Sync is
+/// fine: closing windows never deadlocks; only *creating* them is
+/// restricted.
+#[tauri::command]
+#[allow(dead_code)]
+pub fn close_all_account_windows(app: AppHandle) -> Result<usize, String> {
+    let labels: Vec<String> = match app.try_state::<WindowState>() {
+        Some(winstate) => match winstate.inner.lock() {
+            Ok(tracked) => tracked
+                .keys()
+                .filter(|l| l.starts_with("acct-"))
+                .cloned()
+                .collect(),
+            Err(e) => return Err(format!("window state lock poisoned: {e}")),
+        },
+        None => Vec::new(),
+    };
+    let count = labels.len();
+    for label in &labels {
+        close_tracked_window(&app, label);
+    }
+    // Popups are not tracked in WindowState; sweep them by live-window
+    // label so no account-related webview survives a close-all.
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("popup-") || label.starts_with("oauth-") {
+            let _ = window.close();
+        }
+    }
+    Ok(count)
+}
+
+/// List every open account window with its app/account names and focus
+/// state, for the RAM dashboard.
+#[tauri::command]
+#[allow(dead_code)]
+pub fn list_open_account_windows(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+) -> Vec<OpenAccountInfo> {
+    let tracked: Vec<(String, String, String)> = match app.try_state::<WindowState>() {
+        Some(winstate) => match winstate.inner.lock() {
+            Ok(map) => map
+                .iter()
+                .filter(|(l, _)| l.starts_with("acct-"))
+                .map(|(l, t)| (l.clone(), t.app_id.clone(), t.account_id.clone()))
+                .collect(),
+            Err(_) => return Vec::new(),
+        },
+        None => return Vec::new(),
+    };
+    tracked
+        .into_iter()
+        .map(|(label, app_id, account_id)| {
+            let (app_name, account_label) = store
+                .get(&app_id)
+                .ok()
+                .and_then(|a| {
+                    a.accounts
+                        .into_iter()
+                        .find(|ac| ac.id == account_id)
+                        .map(|ac| (a.name, ac.label))
+                })
+                .unwrap_or_else(|| {
+                    ("Unknown app".to_string(), "Unknown account".to_string())
+                });
+            let focused = app
+                .get_webview_window(&label)
+                .and_then(|w| w.is_focused().ok())
+                .unwrap_or(false);
+            OpenAccountInfo {
+                label,
+                app_id,
+                account_id,
+                app_name,
+                account_label,
+                focused,
+            }
+        })
+        .collect()
+}
+
+/// One descendant process in the memory snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ChildMemory {
+    pub name: String,
+    pub rss_kb: u64,
+}
+
+/// Process-group memory snapshot: the main process plus all descendants
+/// (WebKit/WebView2 helper processes), via the cross-platform sysinfo
+/// crate. Sync is fine: a single process-list scan, no window ops.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct MemorySnapshot {
+    /// RSS of the whole group (self + all descendants), KiB.
+    pub total_rss_kb: u64,
+    /// RSS of the main appmaka process alone, KiB.
+    pub main_rss_kb: u64,
+    /// Top 12 descendant processes by RSS.
+    pub top_children: Vec<ChildMemory>,
+    /// False when sysinfo could not read our own process (unexpected on the
+    /// supported Linux/Windows targets).
+    pub supported: bool,
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+pub fn memory_snapshot() -> Result<MemorySnapshot, String> {
+    use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+
+    let empty = MemorySnapshot {
+        total_rss_kb: 0,
+        main_rss_kb: 0,
+        top_children: Vec::new(),
+        supported: false,
+    };
+    // Processes only, never tasks: sysinfo's default (`System::new_all()`)
+    // enumerates every *thread* as a separate entry, and threads share
+    // their process's whole address space — summing them multi-counts the
+    // same RSS once per thread and the total explodes past physical RAM
+    // (seen: 23 GB on an 8 GB box). `without_tasks()` keeps one entry per
+    // real process.
+    let sys = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_processes(ProcessRefreshKind::everything().without_tasks()),
+    );
+    let self_pid = Pid::from_u32(std::process::id());
+    let Some(self_proc) = sys.process(self_pid) else {
+        return Ok(empty);
+    };
+    // Descendants: every process whose ancestry reaches our own PID.
+    let mut children: Vec<ChildMemory> = Vec::new();
+    for (pid, proc_) in sys.processes() {
+        if *pid == self_pid {
+            continue;
+        }
+        let mut ancestor = proc_.parent();
+        let mut is_descendant = false;
+        while let Some(p) = ancestor {
+            if p == self_pid {
+                is_descendant = true;
+                break;
+            }
+            ancestor = sys.process(p).and_then(|pp| pp.parent());
+        }
+        if is_descendant {
+            children.push(ChildMemory {
+                name: proc_.name().to_string_lossy().into_owned(),
+                rss_kb: proc_.memory() / 1024,
+            });
+        }
+    }
+    let main_rss_kb = self_proc.memory() / 1024;
+    let total_rss_kb = main_rss_kb + children.iter().map(|c| c.rss_kb).sum::<u64>();
+    children.sort_by_key(|c| std::cmp::Reverse(c.rss_kb));
+    children.truncate(12);
+    Ok(MemorySnapshot {
+        total_rss_kb,
+        main_rss_kb,
+        top_children: children,
+        supported: true,
+    })
+}
+
+/// Sign an account out everywhere: close its window first (Windows locks
+/// the session files while a webview is alive), then wipe its session
+/// directory and recreate it empty. The account record, its app, and every
+/// other account are untouched — reopening the account starts a fresh
+/// login. Tauri exposes the snake_case params as camelCase to JS:
+/// `invoke("forget_login", { appId, accountId })`.
+#[tauri::command]
+#[allow(dead_code)]
+pub fn forget_login(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    app_id: String,
+    account_id: String,
+) -> Result<(), String> {
+    close_account_window(&app, &app_id, &account_id);
+    store.forget_account_session(&app_id, &account_id)
 }

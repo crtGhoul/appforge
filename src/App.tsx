@@ -3,9 +3,17 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { isAppHidden } from "./visibility";
+import { RamDashboard } from "./RamDashboard";
+import { ForgetLoginDialog, forgetLogin } from "./ForgetLoginDialog";
+import LinkPicker from "./LinkPicker";
+import type { LinkPickerAccount } from "./LinkPicker";
+import LinkRules from "./LinkRules";
+import { DownloadsList } from "./DownloadsList";
 import "./App.css";
 import {
   AddProgramButton,
@@ -13,6 +21,7 @@ import {
   EDIT_APP_EVENT,
   GRID_COLUMNS,
   IconGrid,
+  LauncherCommandRows,
   LauncherSettingsPanel,
   NoMatchesHint,
   ProgramIcon,
@@ -20,11 +29,12 @@ import {
   SearchBar,
   browseAll,
   buildResults,
+  matchLauncherCommand,
   recordLaunch,
   useProgramsScannedRefresh,
   useTileMenu,
 } from "./Launcher";
-import type { SearchResult } from "./Launcher";
+import type { LauncherCommandRowsHandle, SearchResult } from "./Launcher";
 import type {
   Account,
   AddAppOutcome,
@@ -423,6 +433,7 @@ function AccountRow({
   onRemove,
   onRename,
   onEdit,
+  onForgetLogin,
 }: {
   account: Account;
   app: WebApp;
@@ -431,6 +442,7 @@ function AccountRow({
   onRemove: () => void;
   onRename: (label: string) => void;
   onEdit: () => void;
+  onForgetLogin: () => void;
 }) {
   return (
     <li className="account-row">
@@ -457,6 +469,13 @@ function AccountRow({
         <button onClick={onSuspend}>Suspend</button>
         <button className="text-button" onClick={onEdit}>
           Edit
+        </button>
+        <button
+          className="text-button danger"
+          onClick={onForgetLogin}
+          title="Sign this account out by wiping its session. Other accounts are untouched."
+        >
+          Forget login
         </button>
         <button className="danger" onClick={onRemove}>
           Remove
@@ -597,6 +616,9 @@ function EditAccountDialog({
               />
               <span>Block popups</span>
             </label>
+            <span className="help">
+              Close and reopen the account window for this change to take effect.
+            </span>
           </fieldset>
           {formError && (
             <p className="form-error" role="alert">
@@ -806,6 +828,9 @@ function AppSettingsForm({
           <option value="block">Block all popups</option>
           <option value="allow">Allow popups as contained windows</option>
         </select>
+        <span className="help">
+          Close and reopen the account window for this change to take effect.
+        </span>
       </label>
       <label>
         <span>Popup allowlist</span>
@@ -1264,6 +1289,10 @@ function IntroOverlay({ onGotIt }: { onGotIt: () => void }) {
       title: "Tidy the launcher",
       body: "Right-click any tile to pin it to the top, hide it, or edit it. Unhide hidden programs in the Launcher settings below.",
     },
+    {
+      title: "Launcher shortcuts",
+      body: "Type =2+2 to calculate, >lock to lock your PC (destructive commands ask first), ?cats for a web search. Paste any URL to add it as an app.",
+    },
   ];
   return (
     <div
@@ -1305,16 +1334,65 @@ type UpdateStatus =
   | { kind: "ready"; version: string };
 
 /**
- * Self-update UI. Manual "Check for updates" → download with progress →
- * "Restart to finish" (never force-restarted). The release feed 404s while
- * the repo is private, and the updater may not be wired up yet — any throw
- * is a neutral "No updates found", never an error popup.
+ * "AppMaka vX.Y.Z", read from the running binary at runtime — never
+ * hardcoded. Falls back to just "AppMaka" when the read fails.
  */
-function UpdaterSection() {
+function VersionLine() {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => setVersion(null));
+  }, []);
+
+  return (
+    <p className="muted small">{version ? `AppMaka v${version}` : "AppMaka"}</p>
+  );
+}
+
+/**
+ * Self-update UI. Manual "Check for updates" → download with progress →
+ * "Restart to finish" (never force-restarted). Any manual-check throw is a
+ * neutral "No updates found", never an error popup.
+ *
+ * The automatic check also lives here: once on mount when `autoCheck` is
+ * on, then every 24h (skipped while the window is hidden). A found update
+ * lands in the same "available" state as a manual check — nothing is
+ * silently swallowed. Auto-check failures show nothing at all.
+ */
+function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
   const [status, setStatus] = useState<UpdateStatus>({ kind: "idle" });
   const pending = useRef<Update | null>(null);
   const downloadedBytes = useRef(0);
   const totalBytes = useRef<number | null>(null);
+  const autoRan = useRef(false);
+
+  async function adoptFoundUpdate() {
+    try {
+      const update = await check();
+      if (update) {
+        pending.current = update;
+        setStatus({ kind: "available", version: update.version });
+      }
+    } catch {
+      /* auto-check failures stay silent */
+    }
+  }
+
+  useEffect(() => {
+    if (!autoCheck) return;
+    // Once per session: StrictMode double-mounts in dev, so guard with a ref.
+    if (!autoRan.current) {
+      autoRan.current = true;
+      void adoptFoundUpdate();
+    }
+    const id = window.setInterval(() => {
+      if (isAppHidden()) return;
+      void adoptFoundUpdate();
+    }, 24 * 60 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [autoCheck]);
 
   async function handleCheck() {
     setStatus({ kind: "checking" });
@@ -1439,6 +1517,16 @@ export default function App() {
     app: WebApp;
     account: Account;
   } | null>(null);
+  // v0.7.0: "Forget this login" confirm dialog target (tile menu / account row).
+  const [forgetLoginTarget, setForgetLoginTarget] = useState<{
+    app: WebApp;
+    account: Account;
+  } | null>(null);
+  // v0.7.0: link-dispatcher picker target (URL with no matching rule).
+  const [linkPickerUrl, setLinkPickerUrl] = useState<string | null>(null);
+  // v0.7.0: RAM dashboard + Downloads list visibility.
+  const [ramOpen, setRamOpen] = useState(false);
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
 
   // Launcher: hotkey-summoned search over apps, accounts, and programs.
   const [programs, setPrograms] = useState<NativeProgram[]>([]);
@@ -1486,17 +1574,8 @@ export default function App() {
     setIntroOpen(false);
   }
 
-  // Silent automatic update check when enabled: on mount and every 24h.
-  // Any failure — including the private release feed 404ing — is swallowed
-  // on purpose. The manual "Check for updates" button is the honest surface.
-  useEffect(() => {
-    if (!launcherSettings?.auto_update_check) return;
-    check().catch(() => {});
-    const id = window.setInterval(() => {
-      check().catch(() => {});
-    }, 24 * 60 * 60 * 1000);
-    return () => window.clearInterval(id);
-  }, [launcherSettings?.auto_update_check]);
+  // The automatic update check lives inside UpdaterSection now (single place,
+  // no silent double-check).
 
   // Two views: the hotkey-summoned spotlight overlay ("launcher") and the
   // full management window ("library"). The hotkey always lands on the
@@ -1609,6 +1688,20 @@ export default function App() {
       offLibrary?.();
       offLauncher?.();
     };
+  }, []);
+
+  // Link dispatcher (v0.7.0): an incoming https URL with no matching
+  // domain→account rule opens the small picker instead of going nowhere.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    listen<{ url: string }>("appmaka:link-no-rule", (event) => {
+      setLinkPickerUrl(event.payload.url);
+    })
+      .then((u) => {
+        off = u;
+      })
+      .catch(() => {});
+    return () => off?.();
   }, []);
 
   // A preview that was added as an app: pick it up in the library and open
@@ -1830,6 +1923,53 @@ export default function App() {
     }
   }
 
+  /** v0.7.0: "Forget this login" confirm dialog's Confirm button. */
+  async function handleForgetLoginConfirm() {
+    const target = forgetLoginTarget;
+    setForgetLoginTarget(null);
+    if (!target) return;
+    setError(null);
+    try {
+      await forgetLogin(target.app.id, target.account.id);
+      setNotice(
+        `Signed out "${target.account.label}". Open it again to sign back in.`
+      );
+    } catch (err) {
+      setError(`Could not forget "${target.account.label}". ${errMsg(err)}`);
+    }
+  }
+
+  /** v0.7.0: link-dispatcher picker choice. Optionally saves a domain rule. */
+  async function handleLinkPick(appId: string, accountId: string, remember: boolean) {
+    const url = linkPickerUrl;
+    setLinkPickerUrl(null);
+    if (!url) return;
+    setError(null);
+    try {
+      if (remember) {
+        const domain = new URL(url).hostname;
+        await invoke("add_link_rule", { domain, appId, accountId });
+      }
+      await invoke("open_link_in_account", { appId, accountId, url });
+    } catch (err) {
+      setError(`Could not open the link. ${errMsg(err)}`);
+    }
+  }
+
+  /** v0.7.0: flattened account list for the link picker. */
+  const pickerAccounts: LinkPickerAccount[] = useMemo(
+    () =>
+      apps.flatMap((a) =>
+        a.accounts.map((acct) => ({
+          appId: a.id,
+          appName: a.name,
+          accountId: acct.id,
+          accountLabel: acct.label,
+        }))
+      ),
+    [apps]
+  );
+
   async function handleRemoveAccount(app: WebApp, account: Account) {
     if (
       !window.confirm(
@@ -1928,6 +2068,15 @@ export default function App() {
     [query, apps, programs, sortOpts]
   );
 
+  // v0.7.0: built-in launcher commands (=calc, >system, ?web-search,
+  // URL quick-add). Prefix commands take precedence over app/program
+  // matches; quick-add only appears when nothing else matched.
+  const command = useMemo(
+    () => matchLauncherCommand(query, query.trim() !== "" && items.length === 0),
+    [query, items]
+  );
+  const cmdRef = useRef<LauncherCommandRowsHandle>(null);
+
   // Right-click tile menu (Open / Pin / Hide / Edit / Remove).
   const { tileMenuNode, openTileMenu } = useTileMenu({
     isPinned: (id) => launcherSettings?.pinned?.includes(id) ?? false,
@@ -1952,6 +2101,7 @@ export default function App() {
         if (found) setEditingApp(found);
       },
       onRemoveApp: (app) => void handleRemoveApp(app),
+      onForgetLogin: (app, account) => setForgetLoginTarget({ app, account }),
       onHideProgram: async (programId) => {
         try {
           const updated = await invoke<LauncherSettings>("set_program_hidden", {
@@ -2037,8 +2187,13 @@ export default function App() {
       e.preventDefault();
       setActiveIndex((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
-      const r = items[activeIndex];
-      if (r) void activateResult(r);
+      // A shown command row owns Enter; otherwise activate the tile.
+      if (command) {
+        cmdRef.current?.activate();
+      } else {
+        const r = items[activeIndex];
+        if (r) void activateResult(r);
+      }
     } else if (e.key === "Escape") {
       if (query) {
         setQuery("");
@@ -2115,6 +2270,19 @@ export default function App() {
           />
           {banners}
           <div className="folder-grid-wrap">
+            {command && (
+              <LauncherCommandRows
+                ref={cmdRef}
+                command={command}
+                onDone={() => {
+                  setQuery("");
+                  void invoke("hide_library").catch((err) =>
+                    setError(errMsg(err))
+                  );
+                }}
+                onError={setError}
+              />
+            )}
             {loading ? (
               <p className="muted folder-hint">Loading…</p>
             ) : items.length === 0 && query.trim() ? (
@@ -2309,6 +2477,7 @@ export default function App() {
                               onRemove={() => void handleRemoveAccount(app, account)}
                               onRename={(label) => void handleRenameAccount(app, account, label)}
                               onEdit={() => setEditingAccount({ app, account })}
+                              onForgetLogin={() => setForgetLoginTarget({ app, account })}
                             />
                           ))}
                         </ul>
@@ -2353,6 +2522,45 @@ export default function App() {
 
       <section className="panel">
         <div className="panel-head">
+          <h2>Memory</h2>
+          <button
+            className="text-button"
+            onClick={() => setRamOpen(true)}
+          >
+            Open memory dashboard
+          </button>
+        </div>
+        <p className="muted small">
+          See how much memory each open account window uses (approximate),
+          and close them all at once.
+        </p>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Downloads</h2>
+          <button
+            className="text-button"
+            onClick={() => setDownloadsOpen(true)}
+          >
+            Open downloads
+          </button>
+        </div>
+        <p className="muted small">
+          Files you downloaded from inside AppMaka, with progress while they
+          download.
+        </p>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Link handling</h2>
+        </div>
+        <LinkRules />
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
           <h2>Launcher</h2>
           <button
             className="text-button"
@@ -2389,7 +2597,8 @@ export default function App() {
         <div className="panel-head">
           <h2>Updates</h2>
         </div>
-        <UpdaterSection />
+        <VersionLine />
+        <UpdaterSection autoCheck={launcherSettings?.auto_update_check ?? false} />
       </section>
 
       <footer className="footer muted">
@@ -2422,6 +2631,37 @@ export default function App() {
             replaceApp(updated);
             setEditingAccount(null);
           }}
+        />
+      )}
+
+      {forgetLoginTarget && (
+        <ForgetLoginDialog
+          appName={forgetLoginTarget.app.name}
+          accountLabel={forgetLoginTarget.account.label}
+          onConfirm={() => void handleForgetLoginConfirm()}
+          onCancel={() => setForgetLoginTarget(null)}
+        />
+      )}
+
+      {linkPickerUrl && (
+        <LinkPicker
+          url={linkPickerUrl}
+          accounts={pickerAccounts}
+          onPick={(appId, accountId, remember) =>
+            void handleLinkPick(appId, accountId, remember)
+          }
+          onClose={() => setLinkPickerUrl(null)}
+        />
+      )}
+
+      {ramOpen && (
+        <RamDashboard open={ramOpen} onClose={() => setRamOpen(false)} />
+      )}
+
+      {downloadsOpen && (
+        <DownloadsList
+          open={downloadsOpen}
+          onClose={() => setDownloadsOpen(false)}
         />
       )}
     </div>

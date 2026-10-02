@@ -14,7 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::favicon_parse::{choose_icon, parse_icon_candidates, parse_og_image};
 
@@ -120,6 +120,7 @@ pub(crate) fn download_icon(page_url: &url::Url, favicons_dir: &Path) -> Option<
     if !dest.exists() {
         std::fs::write(&dest, &bytes).ok()?;
     }
+    enforce_cache_cap(favicons_dir);
     Some(dest)
 }
 
@@ -145,5 +146,122 @@ pub(crate) fn fetch_og_image(page_url: &url::Url, favicons_dir: &Path) -> Option
     if !dest.exists() {
         std::fs::write(&dest, &bytes).ok()?;
     }
+    enforce_cache_cap(favicons_dir);
     Some(dest)
+}
+
+/// Cap for the `<app-data>/favicons` cache: icons and thumbnails share the
+/// directory, so both are counted together.
+const MAX_CACHE_FILES: usize = 200;
+const MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Enforce the favicons cache cap: at most 200 files / 50 MiB total, with
+/// the least-recently-modified files evicted first. Called after every
+/// successful icon download, og:image fetch, and custom logo save.
+/// Best-effort: any I/O failure is swallowed — the cache must never break
+/// an icon fetch.
+pub(crate) fn enforce_cache_cap(dir: &Path) {
+    let entries: Vec<(PathBuf, u64, SystemTime)> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                Some((e.path(), meta.len(), meta.modified().ok()?))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    let total_bytes: u64 = entries.iter().map(|(_, len, _)| len).sum();
+    if entries.len() <= MAX_CACHE_FILES && total_bytes <= MAX_CACHE_BYTES {
+        return;
+    }
+    // Oldest first: evict the least-recently-modified files.
+    let mut entries = entries;
+    entries.sort_by_key(|(_, _, mtime)| *mtime);
+    let mut count = entries.len();
+    let mut bytes = total_bytes;
+    for (path, len, _) in &entries {
+        if count <= MAX_CACHE_FILES && bytes <= MAX_CACHE_BYTES {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            count -= 1;
+            bytes = bytes.saturating_sub(*len);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    fn tmp_cache(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("appmaka-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cache_stats(dir: &Path) -> (usize, u64) {
+        let mut count = 0;
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let m = e.metadata().unwrap();
+            if m.is_file() {
+                count += 1;
+                bytes += m.len();
+            }
+        }
+        (count, bytes)
+    }
+
+    #[test]
+    fn evicts_oldest_files_when_over_count_cap() {
+        let dir = tmp_cache("cap-count");
+        // 205 small files; the cap is 200.
+        for i in 0..205 {
+            std::fs::write(dir.join(format!("icon-{i:03}.png")), b"fake").unwrap();
+        }
+        enforce_cache_cap(&dir);
+        let (count, bytes) = cache_stats(&dir);
+        assert_eq!(count, 200);
+        assert!(bytes <= MAX_CACHE_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evicts_oldest_files_when_over_size_cap() {
+        let dir = tmp_cache("cap-size");
+        // Sparse files: logical size counts toward the cap, no real I/O.
+        for i in 0..3 {
+            let f = File::create(dir.join(format!("big-{i}.png"))).unwrap();
+            f.set_len(20 * 1024 * 1024).unwrap();
+        }
+        enforce_cache_cap(&dir);
+        let (count, bytes) = cache_stats(&dir);
+        assert!(bytes <= MAX_CACHE_BYTES, "bytes={bytes}");
+        assert_eq!(count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaves_cache_alone_when_under_caps() {
+        let dir = tmp_cache("cap-under");
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("icon-{i}.png")), b"fake").unwrap();
+        }
+        enforce_cache_cap(&dir);
+        let (count, _) = cache_stats(&dir);
+        assert_eq!(count, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_dir_is_a_noop() {
+        enforce_cache_cap(Path::new("/tmp/appmaka-test-does-not-exist-xyz"));
+    }
 }

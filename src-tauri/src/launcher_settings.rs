@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt;
@@ -24,6 +25,10 @@ pub const DEFAULT_HOTKEY: &str = "Alt+Space";
 pub const DEFAULT_PANEL_OPACITY: f32 = 0.55;
 /// Hard floor so the panel can never become unreadably faint.
 pub const MIN_PANEL_OPACITY: f32 = 0.3;
+
+fn default_hotkey() -> String {
+    DEFAULT_HOTKEY.to_string()
+}
 
 fn default_opacity() -> f32 {
     DEFAULT_PANEL_OPACITY
@@ -72,7 +77,11 @@ pub fn clamp_opacity(v: f32) -> f32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherSettings {
+    /// A hand-edited partial file may omit this; the loader's empty-string
+    /// fallback keeps the summon key working either way.
+    #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    #[serde(default)]
     pub autostart: bool,
     #[serde(default = "default_opacity")]
     pub panel_opacity: f32,
@@ -96,6 +105,14 @@ pub struct LauncherSettings {
     /// Whether to check for updates automatically (default on).
     #[serde(default = "default_true")]
     pub auto_update_check: bool,
+    /// Web-search engine for the launcher's `?query` command:
+    /// "duckduckgo" (default) or "google". Old files migrate to DuckDuckGo.
+    #[serde(default = "default_search_engine")]
+    pub search_engine: String,
+}
+
+fn default_search_engine() -> String {
+    "duckduckgo".to_string()
 }
 
 impl Default for LauncherSettings {
@@ -110,6 +127,7 @@ impl Default for LauncherSettings {
             seen_intro: false,
             monitor_mode: MonitorMode::default(),
             auto_update_check: true,
+            search_engine: default_search_engine(),
         }
     }
 }
@@ -265,6 +283,26 @@ pub fn set_panel_opacity(
     save(app, settings)
 }
 
+/// Set the launcher's `?query` web-search engine ("duckduckgo" or "google").
+/// JS: `invoke("set_search_engine", { engine })`.
+#[tauri::command]
+pub fn set_search_engine(
+    app: AppHandle,
+    engine: String,
+) -> Result<LauncherSettings, String> {
+    let engine = engine.trim().to_lowercase();
+    if engine != "duckduckgo" && engine != "google" {
+        return Err("Unknown search engine.".to_string());
+    }
+    let state = app.state::<Mutex<LauncherSettings>>();
+    let mut settings = state
+        .lock()
+        .map_err(|e| format!("settings state poisoned: {e}"))?;
+    settings.search_engine = engine;
+    save(&app, &settings)?;
+    Ok(settings.clone())
+}
+
 /// Toggle run-at-startup through the autostart plugin.
 pub fn set_autostart(
     app: &AppHandle,
@@ -282,4 +320,26 @@ pub fn set_autostart(
     }
     settings.autostart = enabled;
     save(app, settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_object_falls_back_to_defaults() {
+        let s: LauncherSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.hotkey, DEFAULT_HOTKEY);
+        assert!(!s.autostart);
+        assert_eq!(s.panel_opacity, DEFAULT_PANEL_OPACITY);
+    }
+
+    #[test]
+    fn partial_file_keeps_known_fields() {
+        let s: LauncherSettings =
+            serde_json::from_str(r#"{"hotkey":"Ctrl+Alt+A","seen_intro":true}"#).unwrap();
+        assert_eq!(s.hotkey, "Ctrl+Alt+A");
+        assert!(!s.autostart);
+        assert!(s.seen_intro);
+    }
 }

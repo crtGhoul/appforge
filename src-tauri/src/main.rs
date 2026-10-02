@@ -2,14 +2,17 @@
 
 mod adblock;
 mod custom_programs;
+mod downloads;
 mod favicon;
 mod favicon_parse;
 mod launcher;
 mod launcher_ext;
 mod launcher_settings;
+mod links;
 mod page_title;
 mod preview;
 mod store;
+mod syscmd;
 mod windows;
 
 use adblock::AdblockState;
@@ -317,6 +320,8 @@ fn set_app_icon_data(
     std::fs::write(&dest, &data).map_err(|e| format!("could not save logo: {e}"))?;
     let s = dest.to_string_lossy().into_owned();
     store.set_app_icon(&app_id, Some(s.clone()))?;
+    // Keep the icon/thumbnail cache bounded (v0.7.0).
+    favicon::enforce_cache_cap(&favicons_dir);
     Ok(s)
 }
 
@@ -610,6 +615,14 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         // File picker for the launcher's manual "add program".
         .plugin(tauri_plugin_dialog::init())
+        // Deep links (v0.7.0): the link dispatcher can handle https URLs.
+        .plugin(tauri_plugin_deep_link::init())
+        // Open URLs/files in the OS default browser / file manager.
+        .plugin(tauri_plugin_opener::init())
+        // One instance only: a clicked link wakes the running app instead of
+        // spawning a duplicate. The deep-link feature forwards the URL args
+        // to the deep-link plugin before the (empty) callback runs.
+        .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .setup(|app| {
             let store =
                 AppStore::load(app.handle()).map_err(std::io::Error::other)?;
@@ -619,6 +632,9 @@ fn main() {
             app.manage(store);
             app.manage(WindowState::default());
             app.manage(PreviewState::default());
+            // In-app download manager (v0.7.0): account-window downloads are
+            // intercepted natively so the webview session is preserved.
+            app.manage(crate::downloads::DownloadState::load(app.handle()).map_err(std::io::Error::other)?);
             // Sweep preview temp dirs left behind by a crash or a window
             // closed by hand before "Add as app" / "Discard" ran.
             preview::cleanup_stale_previews(app.handle());
@@ -683,6 +699,19 @@ fn main() {
             }
 
             windows::start_suspend_watcher(app.handle().clone());
+            // Link dispatcher (v0.7.0): incoming https URLs go to the account
+            // chosen by the user's domain rules, or a picker when no rule
+            // matches. Best-effort registration so links reach the app even
+            // without a perfect install; the user still picks their default
+            // browser in OS settings.
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("deep-link register_all: {e}");
+                }
+            }
+            links::register_link_handler(app.handle());
             Ok(())
         })
         // Closing the main window hides it to the tray; Quit is via the
@@ -744,6 +773,32 @@ fn main() {
             custom_programs::add_custom_program,
             custom_programs::remove_custom_program,
             custom_programs::pick_executable,
+            // v0.7.0: RAM dashboard + forget-login
+            windows::close_all_account_windows,
+            windows::list_open_account_windows,
+            windows::memory_snapshot,
+            windows::forget_login,
+            // v0.7.0: floating back/forward toolbar for account windows
+            windows::account_nav,
+            // v0.7.0: link dispatcher
+            links::get_link_config,
+            links::set_link_opt_in,
+            links::add_link_rule,
+            links::remove_link_rule,
+            links::open_link_in_account,
+            // v0.7.0: launcher system commands + open-in-browser
+            syscmd::system_command,
+            syscmd::open_url_in_browser,
+            // v0.7.0: in-app download manager
+            downloads::list_downloads,
+            downloads::open_download,
+            downloads::show_in_folder,
+            downloads::remove_download,
+            downloads::clear_finished,
+            downloads::get_download_dir,
+            downloads::set_download_dir,
+            // v0.7.0: launcher search-engine setting
+            launcher_settings::set_search_engine,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -13,3 +13,6 @@ src-tauri/gen/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Runtime account session data (created at runtime, never committed)
+src-tauri/sessions/

@@ -99,6 +99,8 @@ export interface LauncherSettings {
   monitor_mode: "cursor" | "primary";
   /** Whether to silently check for updates on startup (and every 24h). */
   auto_update_check: boolean;
+  /** Web-search engine for the launcher's `?query` command. Backend always sends it (serde default). */
+  search_engine: "duckduckgo" | "google";
 }
 
 /**
@@ -143,4 +145,31 @@ export interface PreviewAddOutcome {
   app: WebApp;
   created: boolean;
   addedAccount: Account | null;
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0 — launcher experience (owned by Worker C)
+// ---------------------------------------------------------------------------
+
+/** One open account window, from `list_open_account_windows`. */
+export interface OpenAccountWindow {
+  label: string;
+  appId: string;
+  accountId: string;
+  appName: string;
+  accountLabel: string;
+  focused: boolean;
+}
+
+/**
+ * Process memory snapshot, from `memory_snapshot`. Keys are camelCase in
+ * JSON because Tauri serializes Rust `total_rss_kb` as `totalRssKb`.
+ * All numbers are RSS in kibibytes; treat them as approximate.
+ */
+export interface MemorySnapshot {
+  totalRssKb: number;
+  mainRssKb: number;
+  topChildren: Array<{ name: string; rssKb: number }>;
+  /** False on platforms where memory numbers aren't available. */
+  supported: boolean;
 }

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { evaluateExpression, formatCalcResult } from "./calc";
 import type {
   Account,
   HotkeyStatus,
@@ -377,6 +378,9 @@ export function SearchBar({
       <span className="search-hint" aria-hidden="true">
         Arrow keys move · Enter opens · Esc clears, then hides
       </span>
+      <span className="search-hint search-hint-sub" aria-hidden="true">
+        = calculates · &gt; runs a system command · ? searches the web
+      </span>
     </div>
   );
 }
@@ -401,6 +405,9 @@ export function LauncherSettingsPanel({
 }) {
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [autostart, setAutostart] = useState(settings.autostart);
+  const [searchEngine, setSearchEngine] = useState<"duckduckgo" | "google">(
+    settings.search_engine ?? "duckduckgo"
+  );
   const [opacity, setOpacity] = useState(
     Math.round((settings.panel_opacity ?? 0.55) * 100)
   );
@@ -473,6 +480,22 @@ export function LauncherSettingsPanel({
       const msg = errMsg(err);
       setFormError(msg);
       onError(msg);
+    }
+  }
+
+  async function handleSearchEngine(engine: "duckduckgo" | "google") {
+    setSearchEngine(engine);
+    setFormError(null);
+    try {
+      const updated = await invoke<LauncherSettings>("set_search_engine", {
+        engine,
+      });
+      onSaved(updated);
+    } catch (err) {
+      const msg = errMsg(err);
+      setFormError(msg);
+      onError(msg);
+      setSearchEngine(settings.search_engine ?? "duckduckgo");
     }
   }
 
@@ -559,6 +582,23 @@ export function LauncherSettingsPanel({
           onChange={(e) => void handleAutostart(e.target.checked)}
         />
         <span>Run AppMaka when I sign in</span>
+      </label>
+
+      <label className="inline-form">
+        <span>Web search for launcher commands</span>
+        <select
+          value={searchEngine}
+          onChange={(e) =>
+            void handleSearchEngine(e.target.value as "duckduckgo" | "google")
+          }
+          aria-label="Search engine for launcher commands"
+        >
+          <option value="duckduckgo">DuckDuckGo</option>
+          <option value="google">Google</option>
+        </select>
+        <span className="help">
+          Used by the launcher's ?query command. DuckDuckGo is the default.
+        </span>
       </label>
 
       <label className="slider-row">
@@ -783,6 +823,7 @@ export interface TileMenuActions {
   onTogglePin: (itemId: string) => void | Promise<void>;
   onEditApp: (app: WebApp) => void;
   onRemoveApp: (app: WebApp) => void;
+  onForgetLogin: (app: WebApp, account: Account) => void;
   onHideProgram: (programId: string) => void | Promise<void>;
   onRemoveCustomProgram: (programId: string) => void | Promise<void>;
 }
@@ -833,10 +874,20 @@ export function buildTileMenuEntries(
     return entries;
   }
   if (r.kind === "account") {
-    return [
+    const acct = r.account;
+    const entries: MenuEntry[] = [
       { key: "open", label: "Open", onSelect: () => a.onOpen(r) },
       pin,
     ];
+    if (acct) {
+      entries.push({
+        key: "forget-login",
+        label: "Forget this login",
+        danger: true,
+        onSelect: () => a.onForgetLogin(r.app, acct),
+      });
+    }
+    return entries;
   }
   const prog = r.program;
   const entries: MenuEntry[] = [
@@ -1205,3 +1256,309 @@ export async function requestEditApp(appId: string): Promise<void> {
     new CustomEvent(EDIT_APP_EVENT, { detail: { appId } })
   );
 }
+
+// ---------------------------------------------------------------------------
+// v0.7.0 — launcher command bar: built-in commands + quick-add
+//
+// Pure matching logic plus one small rows component. The overlay wiring
+// (App.tsx, owned by the coordinator) is roughly:
+//   const results = buildResults(query, apps, programs, sortOpts);
+//   const command = matchLauncherCommand(query, results.length === 0);
+//   ...render <LauncherCommandRows ref={cmdRef} command={command}
+//        onDone={() => { setQuery(""); void invoke("hide_library"); }}
+//        onError={setError} /> above/beside the grid when `command` is non-null,
+//   and route Enter to cmdRef.current?.activate() while a command is shown.
+// Prefix commands (=, >, ?) take precedence over app/program matches;
+// quick-add only appears when nothing else matched.
+// ---------------------------------------------------------------------------
+
+/** Actions for `system_command`. Single words, so JS casing matches Rust. */
+export type SystemAction = "lock" | "sleep" | "shutdown" | "restart";
+
+const SYSTEM_ACTIONS: ReadonlySet<string> = new Set([
+  "lock",
+  "sleep",
+  "shutdown",
+  "restart",
+]);
+
+/** Trimmed input that looks like a URL, with or without the scheme. */
+const URL_LIKE = /^(https?:\/\/)?[\w-]+(\.[\w-]+)+(:\d+)?(\/\S*)?$/;
+
+export type LauncherCommand =
+  /** `=2+2` — `value` is null when the expression isn't valid ("Not a calculation"). */
+  | { kind: "calc"; expression: string; value: number | null }
+  /** `>lock` etc. Shutdown/restart always go through an inline confirm. */
+  | { kind: "system"; action: SystemAction }
+  /** `>bogus` — hint row naming the known commands. */
+  | { kind: "system-unknown"; text: string }
+  /** `?query` — web search. */
+  | { kind: "web-search"; query: string }
+  /** URL-like input with no other matches — "Add <domain> as app…". */
+  | { kind: "quick-add"; domain: string; url: string };
+
+/**
+ * Match the launcher input against the built-in commands. Pure — no
+ * backend calls, ~0 RAM. `hasOtherResults` is whether the normal
+ * app/program search already matched something (quick-add only shows
+ * when it didn't).
+ */
+export function matchLauncherCommand(
+  query: string,
+  hasOtherResults: boolean
+): LauncherCommand | null {
+  const q = query.trim();
+  if (!q) return null;
+  const first = q[0];
+
+  if (first === "=") {
+    const expression = q.slice(1).trim();
+    return {
+      kind: "calc",
+      expression,
+      value: expression ? evaluateExpression(expression) : null,
+    };
+  }
+
+  if (first === ">") {
+    const word = (q.slice(1).trim().toLowerCase().split(/\s+/)[0] ?? "");
+    if (SYSTEM_ACTIONS.has(word)) {
+      return { kind: "system", action: word as SystemAction };
+    }
+    return { kind: "system-unknown", text: q.slice(1).trim() };
+  }
+
+  if (first === "?") {
+    const rest = q.slice(1).trim();
+    if (!rest) return null;
+    return { kind: "web-search", query: rest };
+  }
+
+  if (!hasOtherResults && URL_LIKE.test(q)) {
+    const url = /^https?:\/\//i.test(q) ? q : `https://${q}`;
+    let domain = q;
+    try {
+      domain = new URL(url).hostname;
+    } catch {
+      /* keep the raw input as the label */
+    }
+    return { kind: "quick-add", domain, url };
+  }
+
+  return null;
+}
+
+// --- Backend calls (exact invoke signatures; camelCase per the AGENTS.md lesson) ---
+
+/** invoke("system_command", { action }) — action is "lock"|"sleep"|"shutdown"|"restart". */
+export async function runSystemCommand(action: SystemAction): Promise<void> {
+  await invoke("system_command", { action });
+}
+
+/**
+ * invoke("open_url_in_browser", { url }) — web search with the engine from
+ * the launcher settings (DuckDuckGo default, Google selectable). Read at
+ * call time so a settings change applies to the next search.
+ */
+export async function openWebSearch(query: string): Promise<void> {
+  let engine: string = "duckduckgo";
+  try {
+    const settings = await invoke<LauncherSettings>("get_launcher_settings");
+    if (settings.search_engine === "google") engine = "google";
+  } catch {
+    /* fall back to DuckDuckGo */
+  }
+  const url =
+    engine === "google"
+      ? `https://www.google.com/search?q=${encodeURIComponent(query)}`
+      : `https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
+  await invoke("open_url_in_browser", { url });
+}
+
+/** invoke("preview_start", { url }) — the existing preview/sign-in flow takes over. */
+export async function quickAddFromLauncher(url: string): Promise<void> {
+  await invoke("preview_start", { url });
+}
+
+/** Best-effort clipboard write — never throws (some webviews block it). */
+export async function copyCalcResult(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    /* clipboard unavailable; the result is still visible in the row */
+  }
+}
+
+export interface LauncherCommandRowsHandle {
+  /** Activate the command row — the same thing clicking it does. */
+  activate: () => void;
+}
+
+/**
+ * The command rows for the launcher overlay. One row per matched command
+ * (calc result, system command, web search, quick-add) or a quiet hint
+ * row for unknown/invalid input.
+ *
+ * Confirm gating (logic-reviewed): the FIRST activation of a shutdown or
+ * restart row only ARMS an inline confirm ("Shut down the PC?
+ * [Shut down] [Cancel]") and moves focus to the confirm button.
+ * `invoke("system_command", { action: "shutdown" | "restart" })` is called
+ * solely from that confirm button's onClick — a single Enter can never
+ * fire a destructive command. Lock/sleep/web-search/quick-add run on
+ * activation directly.
+ */
+export const LauncherCommandRows = forwardRef<
+  LauncherCommandRowsHandle,
+  {
+    command: LauncherCommand;
+    /** Dismiss the overlay after a command ran (e.g. clear query + hide). */
+    onDone: () => void;
+    onError: (msg: string) => void;
+  }
+>(function LauncherCommandRows({ command, onDone, onError }, ref) {
+  const [confirming, setConfirming] = useState(false);
+  const confirmBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  // A new command (the user kept typing) disarms any pending confirm.
+  useEffect(() => {
+    setConfirming(false);
+  }, [command]);
+
+  const fire = useCallback(
+    async (action: () => Promise<void>) => {
+      try {
+        await action();
+        onDone();
+      } catch (err) {
+        onError(errMsg(err));
+      }
+    },
+    [onDone, onError]
+  );
+
+  const activate = useCallback(() => {
+    switch (command.kind) {
+      case "calc":
+        if (command.value === null) return; // hint row — nothing to do
+        void copyCalcResult(formatCalcResult(command.value)).then(onDone, onDone);
+        break;
+      case "system":
+        if (command.action === "shutdown" || command.action === "restart") {
+          setConfirming(true);
+          // Keyboard users: land focus on the confirm button so Enter works.
+          requestAnimationFrame(() => confirmBtnRef.current?.focus());
+        } else {
+          void fire(() => runSystemCommand(command.action));
+        }
+        break;
+      case "web-search":
+        void fire(() => openWebSearch(command.query));
+        break;
+      case "quick-add":
+        void fire(() => quickAddFromLauncher(command.url));
+        break;
+      default:
+        break; // system-unknown: hint row — nothing to run
+    }
+  }, [command, fire, onDone]);
+
+  useImperativeHandle(ref, () => ({ activate }), [activate]);
+
+  const systemLabels: Record<SystemAction, { row: string; sub: string }> = {
+    lock: { row: ">lock", sub: "Lock the PC" },
+    sleep: { row: ">sleep", sub: "Put the PC to sleep" },
+    shutdown: { row: ">shutdown", sub: "Shut down the PC" },
+    restart: { row: ">restart", sub: "Restart the PC" },
+  };
+
+  function rows(): React.ReactNode {
+    switch (command.kind) {
+      case "calc":
+        if (command.value === null) {
+          return (
+            <div className="cmd-row cmd-hint" role="status">
+              <span className="cmd-title">Not a calculation</span>
+              <span className="cmd-sub">Try something like =12*8 or =(3+4)/2</span>
+            </div>
+          );
+        }
+        return (
+          <button type="button" className="cmd-row" onClick={activate}>
+            <span className="cmd-title">
+              {command.expression} = {formatCalcResult(command.value)}
+            </span>
+            <span className="cmd-sub">Enter copies the result</span>
+          </button>
+        );
+      case "system": {
+        const labels = systemLabels[command.action];
+        const needsConfirm =
+          command.action === "shutdown" || command.action === "restart";
+        if (needsConfirm && confirming) {
+          const verb = command.action === "shutdown" ? "Shut down" : "Restart";
+          return (
+            <div
+              className="cmd-row cmd-confirm"
+              role="alertdialog"
+              aria-label={`${verb} confirmation`}
+            >
+              <span className="cmd-title">{verb} the PC?</span>
+              <span className="cmd-confirm-actions">
+                <button
+                  type="button"
+                  className="cmd-confirm-yes"
+                  ref={confirmBtnRef}
+                  onClick={() => void fire(() => runSystemCommand(command.action))}
+                >
+                  {verb}
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setConfirming(false)}
+                >
+                  Cancel
+                </button>
+              </span>
+            </div>
+          );
+        }
+        return (
+          <button type="button" className="cmd-row" onClick={activate}>
+            <span className="cmd-title">{labels.row}</span>
+            <span className="cmd-sub">{labels.sub}</span>
+          </button>
+        );
+      }
+      case "system-unknown":
+        return (
+          <div className="cmd-row cmd-hint" role="status">
+            <span className="cmd-title">Unknown command</span>
+            <span className="cmd-sub">
+              Try &gt;lock, &gt;sleep, &gt;shutdown or &gt;restart.
+            </span>
+          </div>
+        );
+      case "web-search":
+        return (
+          <button type="button" className="cmd-row" onClick={activate}>
+            <span className="cmd-title">Search the web for &lsquo;{command.query}&rsquo;</span>
+            <span className="cmd-sub">Opens in your browser</span>
+          </button>
+        );
+      case "quick-add":
+        return (
+          <button type="button" className="cmd-row" onClick={activate}>
+            <span className="cmd-title">Add {command.domain} as app…</span>
+            <span className="cmd-sub">Opens the sign-in flow to add it to your library</span>
+          </button>
+        );
+    }
+  }
+
+  return (
+    <div className="cmd-rows" aria-label="Commands">
+      {rows()}
+    </div>
+  );
+});
