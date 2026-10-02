@@ -5,10 +5,12 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 import {
+  GRID_COLUMNS,
+  IconGrid,
   LauncherSettingsPanel,
   ProgramIcon,
   SearchBar,
-  SearchResults,
+  browseAll,
   buildResults,
 } from "./Launcher";
 import type { SearchResult } from "./Launcher";
@@ -690,6 +692,12 @@ export default function App() {
   // manager refuses, the window still works.
   useEffect(() => {
     const win = getCurrentWindow();
+    // The main window is transparent-capable (tauri.conf.json). The
+    // launcher overlay must leave the canvas unpainted so the desktop shows
+    // through the frosted panel; the library view keeps the normal opaque
+    // background from styles.css.
+    document.documentElement.style.background =
+      view === "launcher" ? "transparent" : "";
     void (async () => {
       try {
         if (view === "launcher") {
@@ -866,11 +874,29 @@ export default function App() {
 
   // --- launcher search -------------------------------------------------
 
-  const results = useMemo(() => buildResults(query, apps, programs), [query, apps, programs]);
+  // Empty query shows the whole phone-folder grid; typing filters it with
+  // the fuzzy matcher.
+  const items = useMemo(
+    () => (query.trim() ? buildResults(query, apps, programs) : browseAll(apps, programs)),
+    [query, apps, programs]
+  );
 
   useEffect(() => {
     setActiveIndex(0);
   }, [query]);
+
+  // Keep the highlight inside the list when the items change underneath it
+  // (e.g. apps finishing loading while the overlay is open).
+  useEffect(() => {
+    setActiveIndex((i) => Math.min(i, Math.max(0, items.length - 1)));
+  }, [items]);
+
+  // Keep the highlighted tile visible while arrow-keying through the grid.
+  useEffect(() => {
+    document
+      .querySelector(".icon-tile.is-active")
+      ?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
 
   function mostRecentAccount(app: WebApp): Account | undefined {
     return [...app.accounts].sort((a, b) => b.last_opened - a.last_opened)[0];
@@ -900,14 +926,21 @@ export default function App() {
   }
 
   function onSearchKeyDown(e: React.KeyboardEvent) {
+    const last = items.length - 1;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIndex((i) => Math.min(i + 1, results.length - 1));
+      setActiveIndex((i) => Math.min(i + GRID_COLUMNS, last));
     } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.max(i - GRID_COLUMNS, 0));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.min(i + 1, last));
+    } else if (e.key === "ArrowLeft") {
       e.preventDefault();
       setActiveIndex((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
-      const r = results[activeIndex];
+      const r = items[activeIndex];
       if (r) void activateResult(r);
     } else if (e.key === "Escape") {
       if (query) {
@@ -962,43 +995,47 @@ export default function App() {
     ]);
   };
 
-  // Spotlight overlay: search field + ranked list only. Management lives one
-  // click away in the library view.
+  // Phone-folder overlay: search field on top, grid of app icons below.
+  // Management lives one click away in the library view.
   if (view === "launcher") {
     return (
       <div className="launcher-shell">
-        <SearchBar
-          query={query}
-          onQuery={setQuery}
-          onKeyDown={onSearchKeyDown}
-          inputRef={searchRef}
-        />
-        {banners}
-        <div className="launcher-results">
-          {query ? (
-            <SearchResults
-              results={results}
-              activeIndex={activeIndex}
-              onHover={setActiveIndex}
-              onActivate={(r) => void activateResult(r)}
-              renderIcon={renderResultIcon}
-            />
-          ) : loading ? (
-            <p className="muted launcher-hint">Loading…</p>
-          ) : (
-            <p className="muted launcher-hint">
-              Type to search your web apps, accounts, and programs.
-            </p>
-          )}
+        <div className="folder-panel">
+          <SearchBar
+            query={query}
+            onQuery={setQuery}
+            onKeyDown={onSearchKeyDown}
+            inputRef={searchRef}
+          />
+          {banners}
+          <div className="folder-grid-wrap">
+            {loading ? (
+              <p className="muted folder-hint">Loading…</p>
+            ) : items.length === 0 && query.trim() ? (
+              <p className="muted folder-hint">No matches.</p>
+            ) : items.length === 0 ? (
+              <p className="muted folder-hint">
+                Nothing here yet — add your first web app from Manage apps below.
+              </p>
+            ) : (
+              <IconGrid
+                items={items}
+                activeIndex={activeIndex}
+                onHover={setActiveIndex}
+                onActivate={(r) => void activateResult(r)}
+                renderIcon={renderResultIcon}
+              />
+            )}
+          </div>
+          <footer className="launcher-foot">
+            <button className="text-button" onClick={() => setView("library")}>
+              Manage apps →
+            </button>
+            <span className="muted small">
+              {apps.length} web apps · {programs.length} programs
+            </span>
+          </footer>
         </div>
-        <footer className="launcher-foot">
-          <button className="text-button" onClick={() => setView("library")}>
-            Manage apps →
-          </button>
-          <span className="muted small">
-            {apps.length} web apps · {programs.length} programs
-          </span>
-        </footer>
       </div>
     );
   }

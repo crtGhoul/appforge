@@ -53,6 +53,61 @@ export type SearchResult =
   | { kind: "program"; id: string; title: string; context: string; score: number; program: NativeProgram };
 
 /**
+ * Columns in the launcher folder grid. Must match `grid-template-columns`
+ * in App.css — keyboard navigation moves by this many rows per Up/Down.
+ */
+export const GRID_COLUMNS = 6;
+
+/** Max tiles shown when browsing with an empty query. Search caps at 25. */
+const BROWSE_LIMIT = 48;
+
+/**
+ * Everything, for the phone-folder grid when no query is typed: web apps
+ * (with their accounts right after each app), then installed programs —
+ * alphabetical, capped. Like opening a folder on a phone home screen.
+ */
+export function browseAll(apps: WebApp[], programs: NativeProgram[]): SearchResult[] {
+  const items: SearchResult[] = [];
+  const sortedApps = [...apps].sort((a, b) => a.name.localeCompare(b.name));
+  for (const app of sortedApps) {
+    items.push({
+      kind: "app",
+      id: `app:${app.id}`,
+      title: app.name,
+      context: hostOf(app.url),
+      score: 0,
+      app,
+    });
+    const sortedAccounts = [...app.accounts].sort((a, b) =>
+      a.label.localeCompare(b.label)
+    );
+    for (const account of sortedAccounts) {
+      items.push({
+        kind: "account",
+        id: `account:${account.id}`,
+        title: account.label,
+        context: app.name,
+        score: 0,
+        app,
+        account,
+      });
+    }
+  }
+  const sortedPrograms = [...programs].sort((a, b) => a.name.localeCompare(b.name));
+  for (const program of sortedPrograms) {
+    items.push({
+      kind: "program",
+      id: `program:${program.id}`,
+      title: program.name,
+      context: "",
+      score: 0,
+      program,
+    });
+  }
+  return items.slice(0, BROWSE_LIMIT);
+}
+
+/**
  * One ranked result list across accounts, web apps, and native programs.
  * Apps only appear as their own row when the query matches the app itself
  * (not just its accounts) — keeps the list short.
@@ -111,9 +166,43 @@ export function buildResults(
   return results.sort((a, b) => b.score - a.score).slice(0, 25);
 }
 
-function KindBadge({ kind }: { kind: SearchResult["kind"] }) {
-  const label = kind === "account" ? "Account" : kind === "app" ? "Web app" : "Program";
-  return <span className={`kind-badge kind-${kind}`}>{label}</span>;
+/**
+ * Phone-folder grid: one tile per result — icon with the name underneath.
+ * Accounts show their app's icon with the account label (and the app name
+ * as a quiet sub-label); programs show their extracted .exe icon.
+ */
+export function IconGrid({
+  items,
+  activeIndex,
+  onHover,
+  onActivate,
+  renderIcon,
+}: {
+  items: SearchResult[];
+  activeIndex: number;
+  onHover: (i: number) => void;
+  onActivate: (r: SearchResult) => void;
+  renderIcon: (r: SearchResult) => React.ReactNode;
+}) {
+  return (
+    <div className="icon-grid" role="listbox" aria-label="Apps and programs">
+      {items.map((r, i) => (
+        <button
+          key={r.id}
+          type="button"
+          role="option"
+          aria-selected={i === activeIndex}
+          className={`icon-tile${i === activeIndex ? " is-active" : ""}`}
+          onMouseEnter={() => onHover(i)}
+          onClick={() => onActivate(r)}
+        >
+          <span className="tile-icon">{renderIcon(r)}</span>
+          <span className="tile-label">{r.title}</span>
+          {r.kind === "account" && <span className="tile-sub">{r.context}</span>}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export function ProgramIcon({ program }: { program: NativeProgram }) {
@@ -162,50 +251,9 @@ export function SearchBar({
         spellCheck={false}
       />
       <span className="search-hint" aria-hidden="true">
-        ↑↓ navigate · Enter opens · Esc clears, then hides
+        Arrow keys move · Enter opens · Esc clears, then hides
       </span>
     </div>
-  );
-}
-
-export function SearchResults({
-  results,
-  activeIndex,
-  onHover,
-  onActivate,
-  renderIcon,
-}: {
-  results: SearchResult[];
-  activeIndex: number;
-  onHover: (i: number) => void;
-  onActivate: (r: SearchResult) => void;
-  renderIcon: (r: SearchResult) => React.ReactNode;
-}) {
-  if (results.length === 0) {
-    return <p className="muted">No matches.</p>;
-  }
-  return (
-    <ul className="results-list" role="listbox" aria-label="Search results">
-      {results.map((r, i) => (
-        <li key={r.id}>
-          <button
-            type="button"
-            role="option"
-            aria-selected={i === activeIndex}
-            className={`result-row${i === activeIndex ? " is-active" : ""}`}
-            onMouseEnter={() => onHover(i)}
-            onClick={() => onActivate(r)}
-          >
-            {renderIcon(r)}
-            <span className="result-meta">
-              <span className="result-title">{r.title}</span>
-              <span className="result-context">{r.context}</span>
-            </span>
-            <KindBadge kind={r.kind} />
-          </button>
-        </li>
-      ))}
-    </ul>
   );
 }
 
