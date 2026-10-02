@@ -85,8 +85,10 @@ export function browseAll(apps: WebApp[], programs: NativeProgram[]): SearchResu
       items.push({
         kind: "account",
         id: `account:${account.id}`,
-        title: account.label,
-        context: app.name,
+        // App name first (the "Default" account label used to be the big
+        // text, which confused users); the account label is the sublabel.
+        title: app.name,
+        context: account.label,
         score: 0,
         app,
         account,
@@ -139,8 +141,10 @@ export function buildResults(
         results.push({
           kind: "account",
           id: `account:${account.id}`,
-          title: account.label,
-          context: app.name,
+          // Tile shows the app name big, the account label small — the
+          // account label still participates in matching via the score.
+          title: app.name,
+          context: account.label,
           score: score + 1, // accounts edge out the bare app row
           app,
           account,

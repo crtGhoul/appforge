@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -80,6 +80,74 @@ function hostOf(appUrl: string): string {
 
 function errMsg(err: unknown): string {
   return typeof err === "string" ? err : "Something went wrong.";
+}
+
+/**
+ * Inline rename: click the text to edit it, Enter to save, Esc to cancel,
+ * clicking away saves too. Empty input reverts instead of saving blank.
+ */
+function InlineEdit({
+  value,
+  onSave,
+  className,
+  maxLength,
+}: {
+  value: string;
+  onSave: (next: string) => void;
+  className?: string;
+  maxLength?: number;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+
+  function start() {
+    setDraft(value);
+    setEditing(true);
+  }
+
+  function commit() {
+    const clean = draft.trim();
+    setEditing(false);
+    if (clean && clean !== value) onSave(clean);
+  }
+
+  function cancel() {
+    setEditing(false);
+    setDraft(value);
+  }
+
+  if (!editing) {
+    return (
+      <span
+        className={`inline-edit${className ? ` ${className}` : ""}`}
+        onClick={start}
+        title="Click to rename"
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") start();
+        }}
+      >
+        {value}
+      </span>
+    );
+  }
+  return (
+    <input
+      className="inline-edit-input"
+      value={draft}
+      maxLength={maxLength ?? 80}
+      autoFocus
+      onFocus={(e) => e.target.select()}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        else if (e.key === "Escape") cancel();
+      }}
+      aria-label="Rename"
+    />
+  );
 }
 
 /**
@@ -226,8 +294,8 @@ function PreviewSignInForm({ onError }: { onError: (msg: string) => void }) {
       </form>
       {previewOpen && (
         <p className="muted small">
-          Preview opened — sign in on the real site, then click “Add as app” in
-          its header. Nothing is kept until you do.
+          Preview opened — sign in on the real site, then click “Add to the
+          Forge” in its header. Nothing is kept until you do.
         </p>
       )}
       <p className="muted small">
@@ -253,7 +321,13 @@ function openedLabel(lastOpened: number): string {
 
 function AppIcon({ app }: { app: WebApp }) {
   const [failed, setFailed] = useState(false);
-  const src = !failed ? app.icon ?? faviconUrl(app.url) : null;
+  // `app.icon` is a locally cached logo file (absolute path); fall back to
+  // the live /favicon.ico, then to a letter tile when all fetching fails.
+  const src = !failed
+    ? app.icon
+      ? convertFileSrc(app.icon)
+      : faviconUrl(app.url)
+    : null;
   if (!src) {
     return (
       <span
@@ -281,11 +355,13 @@ function AccountRow({
   onOpen,
   onSuspend,
   onRemove,
+  onRename,
 }: {
   account: Account;
   onOpen: () => void;
   onSuspend: () => void;
   onRemove: () => void;
+  onRename: (label: string) => void;
 }) {
   return (
     <li className="account-row">
@@ -295,7 +371,12 @@ function AccountRow({
         style={{ backgroundColor: safeColor(account.color) }}
       />
       <div className="account-meta">
-        <span className="account-label">{account.label}</span>
+        <InlineEdit
+          value={account.label}
+          onSave={onRename}
+          className="account-label"
+          maxLength={60}
+        />
         <span className="account-opened">{openedLabel(account.last_opened)}</span>
       </div>
       <div className="app-actions">
@@ -565,6 +646,9 @@ export default function App() {
   // full management window ("library"). The hotkey always lands on the
   // launcher; the tray menu and the in-overlay button open the library.
   const [view, setView] = useState<"launcher" | "library">("launcher");
+  // Bumped on every hotkey summon so the panel entrance animation replays
+  // (the React tree stays mounted while the window just hides/shows).
+  const [summonCount, setSummonCount] = useState(0);
 
   // Add-app form
   const [name, setName] = useState("");
@@ -587,6 +671,11 @@ export default function App() {
       setPlatform(info);
       setPrograms(progList);
       setLauncherSettings(launchSettings);
+      // Backfill logos for apps added before icon caching existed (or where
+      // the fetch failed last time). Best-effort, in the background.
+      for (const a of list) {
+        if (!a.icon) void refreshAppIcon(a.id);
+      }
     } catch (err) {
       setError(errMsg(err) === "Something went wrong." ? "Could not load your apps." : errMsg(err));
     } finally {
@@ -634,6 +723,14 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
+  // The panel remounts on every summon (key bump replays the entrance
+  // animation) — focus the fresh input after each remount, since the
+  // window-focus event can race the remount.
+  useEffect(() => {
+    searchRef.current?.focus();
+    searchRef.current?.select();
+  }, [summonCount]);
+
   // View-switch events from the backend: tray "Show library" and the hotkey
   // summon (which always resets to the spotlight view).
   useEffect(() => {
@@ -644,7 +741,10 @@ export default function App() {
         offLibrary = off;
       })
       .catch(() => {});
-    listen("appforge:show-launcher", () => setView("launcher"))
+    listen("appforge:show-launcher", () => {
+      setView("launcher");
+      setSummonCount((c) => c + 1);
+    })
       .then((off) => {
         offLauncher = off;
       })
@@ -679,6 +779,8 @@ export default function App() {
           (err) => setError(`Could not open "${created.name}". ${errMsg(err)}`)
         );
       }
+      // The new tile gets its logo in the background.
+      void refreshAppIcon(created.id);
     })
       .then((unlisten) => {
         off = unlisten;
@@ -872,6 +974,60 @@ export default function App() {
     }
   }
 
+  async function handleRenameApp(app: WebApp, name: string) {
+    setError(null);
+    try {
+      // Tauri exposes Rust snake_case params as camelCase to JS.
+      const updated = await invoke<WebApp>("rename_app", { id: app.id, name });
+      replaceApp(updated);
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
+
+  async function handleRenameAccount(app: WebApp, account: Account, label: string) {
+    setError(null);
+    try {
+      const updated = await invoke<Account>("rename_account", {
+        appId: app.id,
+        accountId: account.id,
+        label,
+      });
+      setApps((prev) =>
+        prev.map((a) =>
+          a.id === app.id
+            ? {
+                ...a,
+                accounts: a.accounts.map((acc) =>
+                  acc.id === account.id ? { ...acc, label: updated.label } : acc
+                ),
+              }
+            : a
+        )
+      );
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
+
+  /**
+   * Best-effort logo fetch: ask the backend to download the site's icon and
+   * cache it locally, then paint it onto the app's tiles. Failures are
+   * silent by design — the tiles keep their fallbacks.
+   */
+  const refreshAppIcon = useCallback(async (appId: string) => {
+    try {
+      const icon = await invoke<string | null>("fetch_favicon", { appId });
+      if (icon) {
+        setApps((prev) =>
+          prev.map((a) => (a.id === appId ? { ...a, icon } : a))
+        );
+      }
+    } catch {
+      /* best-effort: keep the fallback logo */
+    }
+  }, []);
+
   // --- launcher search -------------------------------------------------
 
   // Empty query shows the whole phone-folder grid; typing filters it with
@@ -993,6 +1149,8 @@ export default function App() {
       ...prev,
       { ...created, accounts: created.accounts ?? [], settings: created.settings ?? DEFAULT_SETTINGS },
     ]);
+    // Fetch the site's logo in the background so the new tile gets its icon.
+    void refreshAppIcon(created.id);
   };
 
   // Phone-folder overlay: search field on top, grid of app icons below.
@@ -1000,7 +1158,7 @@ export default function App() {
   if (view === "launcher") {
     return (
       <div className="launcher-shell">
-        <div className="folder-panel">
+        <div className="folder-panel" key={summonCount}>
           <SearchBar
             query={query}
             onQuery={setQuery}
@@ -1116,7 +1274,12 @@ export default function App() {
                   <div className="card-head">
                     <AppIcon app={app} />
                     <div className="app-meta">
-                      <span className="app-name">{app.name}</span>
+                      <InlineEdit
+                        value={app.name}
+                        onSave={(name) => void handleRenameApp(app, name)}
+                        className="app-name"
+                        maxLength={80}
+                      />
                       <span className="app-url" title={app.url}>
                         {hostOf(app.url)}
                       </span>
@@ -1156,6 +1319,7 @@ export default function App() {
                               onOpen={() => void handleOpenAccount(app, account)}
                               onSuspend={() => void handleSuspendAccount(app, account)}
                               onRemove={() => void handleRemoveAccount(app, account)}
+                              onRename={(label) => void handleRenameAccount(app, account, label)}
                             />
                           ))}
                         </ul>

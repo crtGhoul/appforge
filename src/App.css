@@ -445,6 +445,21 @@ input[type="color"] {
     0 32px 80px rgba(0, 0, 0, 0.45),
     inset 0 1px 0 rgba(255, 255, 255, 0.08);
   color: #f2f3f5;
+  /* Entrance: fade + slight scale. Replays on every summon because the
+     panel remounts via a key bump (see App.tsx summonCount). Transform and
+     opacity only — cheap over the backdrop blur. */
+  animation: panel-in 180ms ease-out;
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 .folder-panel .search-wrap {
@@ -513,14 +528,70 @@ input[type="color"] {
   border-radius: 14px;
   cursor: pointer;
   color: #f2f3f5;
+  /* Smooth hover/press; newly appearing tiles (filtering) fade in.
+     Transform + opacity only — cheap over the backdrop blur. */
+  transition: background-color 120ms ease, transform 120ms ease;
+  animation: tile-in 150ms ease-out;
+}
+
+@keyframes tile-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .icon-tile:hover {
   background: rgba(255, 255, 255, 0.08);
 }
 
+.icon-tile:active {
+  transform: scale(0.93);
+}
+
 .icon-tile.is-active {
   background: rgba(99, 102, 241, 0.38);
+}
+
+/* Inline rename affordance: the name itself is the edit control. */
+.inline-edit {
+  cursor: text;
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin: -1px -6px;
+}
+
+.inline-edit:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.inline-edit:focus-visible {
+  outline: 2px solid #4f46e5;
+  outline-offset: 0;
+}
+
+.inline-edit-input {
+  font: inherit;
+  font-weight: inherit;
+  padding: 4px 8px;
+  border: 1px solid #4f46e5;
+  border-radius: 6px;
+  background: #fff;
+  color: inherit;
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .folder-panel,
+  .icon-tile {
+    animation: none;
+  }
+  .icon-tile {
+    transition: none;
+  }
 }
 
 .tile-icon {
