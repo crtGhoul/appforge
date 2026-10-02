@@ -52,6 +52,39 @@ pub struct WindowState {
     inner: Mutex<HashMap<String, TrackedWindow>>,
 }
 
+/// Maximum simultaneously-open account windows. Opening one more closes the
+/// least-recently-used idle window first (never the focused one), bounding
+/// worst-case webview RAM without any timers or configuration.
+const MAX_OPEN_ACCOUNT_WINDOWS: usize = 6;
+
+/// Enforce the LRU cap before opening a new account window.
+fn enforce_account_window_cap(app: &AppHandle, winstate: &WindowState) {
+    let lru: Option<String> = {
+        let Ok(tracked) = winstate.inner.lock() else {
+            return;
+        };
+        let mut labels: Vec<(&String, &TrackedWindow)> = tracked
+            .iter()
+            .filter(|(label, _)| label.starts_with("acct-"))
+            .collect();
+        if labels.len() < MAX_OPEN_ACCOUNT_WINDOWS {
+            return;
+        }
+        labels.sort_by_key(|(_, t)| t.last_active);
+        labels.into_iter().map(|(l, _)| l.clone()).next()
+    };
+    let Some(label) = lru else {
+        return;
+    };
+    // Fail closed: never evict the focused window to make room.
+    if let Some(window) = app.get_webview_window(&label) {
+        if window.is_focused().unwrap_or(true) {
+            return;
+        }
+    }
+    close_tracked_window(app, &label);
+}
+
 /// Open an account's window, or focus it if it is already open. The window is
 /// lazily created here — nothing exists until the user opens the account.
 pub fn open_account(
@@ -79,6 +112,10 @@ pub fn open_account(
         let _ = window.set_focus();
         return Ok(());
     }
+
+    // Bound worst-case RAM: evict the least-recently-used idle account
+    // window before creating a new one.
+    enforce_account_window_cap(app, winstate);
 
     // The store validates URLs on write, so this only fails on hand-edited
     // apps.json — still no unwrap.
@@ -353,14 +390,19 @@ fn resume_window(app: &AppHandle, label: &str) {
 }
 
 /// Background watchdog: every 60s, suspend account windows idle longer than
-/// their app's `auto_suspend_minutes` (0 = never). Suspended windows keep
-/// their session directory, so reopening/focusing resumes the session.
+/// their app's `auto_suspend_minutes` (0 = never), then close account windows
+/// idle longer than their app's `auto_close_minutes` (default 30, 0 = never).
+/// Suspended windows keep their session directory, so reopening/focusing
+/// resumes the session. Closed windows are fully destroyed (renderer freed —
+/// the real RAM win, and the only automatic reclaim on Linux); the session
+/// directory on disk preserves the login, so reopening restores it.
 pub fn start_suspend_watcher(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("appforge-suspend".to_string())
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(60));
             suspend_idle_windows(&app);
+            close_idle_windows(&app);
         });
 }
 
@@ -409,6 +451,48 @@ fn suspend_idle_windows(app: &AppHandle) {
             continue;
         }
         suspend_one(app, &label, &window);
+    }
+}
+
+/// Close account windows idle longer than their app's `auto_close_minutes`
+/// (0 = never; default 30). Closing destroys the renderer and frees its
+/// memory; the session directory on disk preserves the login so reopening
+/// restores it seamlessly. Fail closed: focused windows (or unknown focus
+/// state) are never auto-closed.
+fn close_idle_windows(app: &AppHandle) {
+    let now = unix_secs();
+    let tracked: Vec<(String, String, u64)> = match app.try_state::<WindowState>() {
+        Some(winstate) => match winstate.inner.lock() {
+            Ok(map) => map
+                .iter()
+                .map(|(label, t)| (label.clone(), t.app_id.clone(), t.last_active))
+                .collect(),
+            Err(_) => return,
+        },
+        None => return,
+    };
+    let Some(store) = app.try_state::<AppStore>() else {
+        return;
+    };
+    for (label, app_id, last_active) in tracked {
+        let minutes = match store.get(&app_id) {
+            Ok(a) => a.settings.auto_close_minutes,
+            Err(_) => continue, // app deleted under us; its windows are being closed
+        };
+        if minutes == 0 {
+            continue;
+        }
+        if now.saturating_sub(last_active) < minutes as u64 * 60 {
+            continue;
+        }
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        // Fail closed: if focus state is unknown, don't close.
+        if window.is_focused().unwrap_or(true) {
+            continue;
+        }
+        close_tracked_window(app, &label);
     }
 }
 

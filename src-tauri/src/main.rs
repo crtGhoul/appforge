@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adblock;
+mod custom_programs;
 mod favicon;
 mod favicon_parse;
 mod launcher;
+mod launcher_ext;
 mod launcher_settings;
 mod page_title;
 mod preview;
@@ -416,18 +418,60 @@ fn set_panel_opacity(app: AppHandle, opacity: f32) -> Result<LauncherSettings, S
 /// Alt+Space (or the user's chosen key) toggles the window. Showing always
 /// lands on the launcher (spotlight) view — the frontend resets via the
 /// `appforge:show-launcher` event. Hiding is just hiding.
+///
+/// Positioning honors the `monitor_mode` launcher setting: cursor mode
+/// (default) centers the window on the monitor holding the mouse cursor;
+/// primary mode uses the primary monitor. All math is in physical pixels
+/// (cursor and monitor geometry are physical; monitor origins can be
+/// negative on multi-monitor X11, which the formula handles). The position
+/// is set BEFORE show() so there is no visible jump.
 fn toggle_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let visible = w.is_visible().unwrap_or(false);
         if visible {
             let _ = w.hide();
         } else {
-            let _ = w.center();
+            position_on_target_monitor(app, &w);
             let _ = w.show();
             let _ = w.set_focus();
             let _ = app.emit("appforge:show-launcher", ());
         }
     }
+}
+
+fn position_on_target_monitor(app: &AppHandle, w: &tauri::WebviewWindow) {
+    use tauri::{PhysicalPosition, Position};
+    let cursor_mode = app
+        .try_state::<Mutex<LauncherSettings>>()
+        .and_then(|s| {
+            s.lock()
+                .ok()
+                .map(|s| s.monitor_mode == launcher_settings::MonitorMode::Cursor)
+        })
+        .unwrap_or(true);
+    let monitor = if cursor_mode {
+        app.cursor_position()
+            .ok()
+            .and_then(|p| app.monitor_from_point(p.x, p.y).ok().flatten())
+            .or_else(|| app.primary_monitor().ok().flatten())
+    } else {
+        app.primary_monitor().ok().flatten()
+    };
+    if let Some(m) = monitor {
+        let mp = m.position();
+        let ms = *m.size();
+        // outer_size() is physical; fall back to the monitor size if unknown.
+        let ws = w.outer_size().unwrap_or(ms);
+        let x = mp.x + (ms.width as i32 - ws.width as i32) / 2;
+        let y = mp.y + (ms.height as i32 - ws.height as i32) / 2;
+        if w
+            .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let _ = w.center();
 }
 
 /// Build the tray icon: left-click toggles the launcher overlay, the menu
@@ -512,6 +556,13 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // Self-update (v0.6.0): verifies the free Tauri signature, not
+        // Authenticode — works on unsigned builds. The feed 404s while the
+        // repo is private; the frontend degrades gracefully.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        // File picker for the launcher's manual "add program".
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let store =
                 AppStore::load(app.handle()).map_err(std::io::Error::other)?;
@@ -620,6 +671,15 @@ fn main() {
             set_hotkey,
             set_autostart,
             set_panel_opacity,
+            launcher_ext::toggle_pin,
+            launcher_ext::set_program_hidden,
+            launcher_ext::record_launch,
+            launcher_ext::set_monitor_mode,
+            launcher_ext::set_seen_intro,
+            launcher_ext::set_auto_update_check,
+            custom_programs::add_custom_program,
+            custom_programs::remove_custom_program,
+            custom_programs::pick_executable,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

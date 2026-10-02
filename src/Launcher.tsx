@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   Account,
   LauncherSettings,
@@ -61,12 +62,111 @@ export const GRID_COLUMNS = 6;
 /** Max tiles shown when browsing with an empty query. Search caps at 25. */
 const BROWSE_LIMIT = 48;
 
+// ---------------------------------------------------------------------------
+// v0.6.0: launcher settings fields that the backend now returns but
+// types.ts does not declare yet (owned by another worker). Kept local here
+// so this file compiles without touching ./types.
+// ---------------------------------------------------------------------------
+
+/** One entry of the launch-usage map: how often / how recently an item launched. */
+export interface UsageEntry {
+  count: number;
+  last_used: number;
+}
+
+/**
+ * Optional sorting/filtering input for browseAll / buildResults. All
+ * optional: when omitted, the previous plain ordering is kept, so existing
+ * callers (App.tsx) keep working unchanged.
+ */
+export interface LauncherSortOpts {
+  /** Tagged ids ("app:<id>", "account:<id>", "program:<id>") in pin order. */
+  pinned?: string[];
+  /** Launch stats keyed by tagged id. */
+  usage?: Record<string, UsageEntry>;
+  /** Program ids the user hid from the launcher. */
+  hiddenProgramIds?: string[];
+}
+
+/** A program the user added manually (add_custom_program result). */
+export interface CustomProgram {
+  id: string;
+  name: string;
+  exe_path: string;
+  icon_path: string | null;
+}
+
+/**
+ * Manually added programs carry ids like "custom-<hash>" (see the backend
+ * contract). `is_custom` on NativeProgram isn't in types.ts yet, so read it
+ * defensively: an explicit flag wins, the id prefix is the fallback.
+ */
+export function isCustomProgram(program: NativeProgram): boolean {
+  const flagged = (program as { is_custom?: unknown }).is_custom === true;
+  return flagged || program.id.startsWith("custom-");
+}
+
+/**
+ * Pinned-first ordering: pinned tiles first (in `pinned` array order), then
+ * usage-ranked (higher count, tiebreak most-recent first), then the
+ * incoming order (stable — browse stays alphabetical, search stays by
+ * relevance). Hidden programs are filtered out.
+ */
+export function sortLauncherItems<T extends { id: string }>(
+  items: T[],
+  opts?: LauncherSortOpts
+): T[] {
+  if (!opts) return items;
+  const hidden = new Set(opts.hiddenProgramIds ?? []);
+  const visible =
+    hidden.size === 0
+      ? items
+      : items.filter((it) => {
+          if (it.id.startsWith("program:")) {
+            return !hidden.has(it.id.slice("program:".length));
+          }
+          return true;
+        });
+  if (!opts.pinned?.length && !opts.usage) return visible;
+  const pinRank = new Map((opts.pinned ?? []).map((id, i) => [id, i]));
+  const usage = opts.usage ?? {};
+  const rankOf = (it: T): [number, number, number] => {
+    const p = pinRank.get(it.id);
+    if (p !== undefined) return [0, p, 0];
+    const u = usage[it.id];
+    if (u) return [1, -u.count, -u.last_used];
+    return [1, 0, 0];
+  };
+  return visible
+    .map((it, index) => ({ it, index, rank: rankOf(it) }))
+    .sort((a, b) => {
+      for (let k = 0; k < 3; k++) {
+        if (a.rank[k] !== b.rank[k]) return a.rank[k] - b.rank[k];
+      }
+      return a.index - b.index;
+    })
+    .map((x) => x.it);
+}
+
+/**
+ * Record a successful launch for usage ranking. Fire-and-forget: usage
+ * stats must never break or delay opening something. Call with the tagged
+ * item id ("app:<id>" / "account:<id>" / "program:<id>").
+ */
+export function recordLaunch(itemId: string): void {
+  invoke("record_launch", { itemId }).catch(() => {});
+}
+
 /**
  * Everything, for the phone-folder grid when no query is typed: web apps
  * (with their accounts right after each app), then installed programs —
  * alphabetical, capped. Like opening a folder on a phone home screen.
  */
-export function browseAll(apps: WebApp[], programs: NativeProgram[]): SearchResult[] {
+export function browseAll(
+  apps: WebApp[],
+  programs: NativeProgram[],
+  opts?: LauncherSortOpts
+): SearchResult[] {
   const items: SearchResult[] = [];
   const sortedApps = [...apps].sort((a, b) => a.name.localeCompare(b.name));
   for (const app of sortedApps) {
@@ -106,7 +206,7 @@ export function browseAll(apps: WebApp[], programs: NativeProgram[]): SearchResu
       program,
     });
   }
-  return items.slice(0, BROWSE_LIMIT);
+  return sortLauncherItems(items, opts).slice(0, BROWSE_LIMIT);
 }
 
 /**
@@ -117,7 +217,8 @@ export function browseAll(apps: WebApp[], programs: NativeProgram[]): SearchResu
 export function buildResults(
   query: string,
   apps: WebApp[],
-  programs: NativeProgram[]
+  programs: NativeProgram[],
+  opts?: LauncherSortOpts
 ): SearchResult[] {
   const q = query.trim();
   if (!q) return [];
@@ -167,7 +268,8 @@ export function buildResults(
     }
   }
 
-  return results.sort((a, b) => b.score - a.score).slice(0, 25);
+  results.sort((a, b) => b.score - a.score);
+  return sortLauncherItems(results, opts).slice(0, 25);
 }
 
 /**
@@ -181,12 +283,18 @@ export function IconGrid({
   onHover,
   onActivate,
   renderIcon,
+  pinnedIds,
+  onTileContextMenu,
 }: {
   items: SearchResult[];
   activeIndex: number;
   onHover: (i: number) => void;
   onActivate: (r: SearchResult) => void;
   renderIcon: (r: SearchResult) => React.ReactNode;
+  /** Tagged ids that show the small pin badge. Optional. */
+  pinnedIds?: ReadonlySet<string>;
+  /** Right-click on a tile. Receives the result and the cursor position. Optional. */
+  onTileContextMenu?: (r: SearchResult, x: number, y: number) => void;
 }) {
   return (
     <div className="icon-grid" role="listbox" aria-label="Apps and programs">
@@ -199,7 +307,18 @@ export function IconGrid({
           className={`icon-tile${i === activeIndex ? " is-active" : ""}`}
           onMouseEnter={() => onHover(i)}
           onClick={() => onActivate(r)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            onTileContextMenu?.(r, e.clientX, e.clientY);
+          }}
         >
+          {pinnedIds?.has(r.id) && (
+            <span className="tile-pin" title="Pinned to top" aria-label="Pinned">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <path d="M8 1.5C5.5 1.5 3.5 3.5 3.5 6c0 3.2 4.5 8.5 4.5 8.5s4.5-5.3 4.5-8.5c0-2.5-2-4.5-4.5-4.5zm0 6.3a1.8 1.8 0 1 1 0-3.6 1.8 1.8 0 0 1 0 3.6z" />
+              </svg>
+            </span>
+          )}
           <span className="tile-icon">{renderIcon(r)}</span>
           <span className="tile-label">{r.title}</span>
           {r.kind === "account" && <span className="tile-sub">{r.context}</span>}
@@ -433,5 +552,613 @@ export function LauncherSettingsPanel({
         </p>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v0.6.0 — launcher overlay additions
+// ---------------------------------------------------------------------------
+
+/**
+ * Global right-click guard: suppresses the webview's native context menu
+ * everywhere except inside editable fields, where native copy/paste must
+ * keep working. Mount <ContextMenuGuard /> once near the app root.
+ */
+export function useContextMenuGuard() {
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      const target = e.target;
+      if (target instanceof HTMLElement) {
+        if (target.closest("input, textarea, select")) return;
+        const ce = target.closest("[contenteditable]");
+        if (ce && ce.getAttribute("contenteditable") !== "false") return;
+      }
+      e.preventDefault();
+    };
+    // Capture phase so this runs before any tile-level handler.
+    document.addEventListener("contextmenu", onContextMenu, true);
+    return () => document.removeEventListener("contextmenu", onContextMenu, true);
+  }, []);
+}
+
+/** Renders nothing; installs the global context-menu guard while mounted. */
+export function ContextMenuGuard() {
+  useContextMenuGuard();
+  return null;
+}
+
+// --- Tile context menu -------------------------------------------------------
+
+/** One row in the tile context menu. */
+export interface MenuEntry {
+  key: string;
+  label: string;
+  /** Destructive action (Remove) — styled in red. */
+  danger?: boolean;
+  submenu?: MenuEntry[];
+  onSelect?: () => void | Promise<void>;
+}
+
+/**
+ * Absolutely-positioned menu at the cursor. Clamps itself inside the
+ * viewport, supports one level of submenu, and dismisses on Escape,
+ * outside pointer-down, or focus leaving the menu.
+ */
+export function TileMenu({
+  x,
+  y,
+  entries,
+  onDismiss,
+}: {
+  x: number;
+  y: number;
+  entries: MenuEntry[];
+  onDismiss: () => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState({ left: x, top: y });
+  const [openSub, setOpenSub] = useState<string | null>(null);
+
+  // Clamp inside the viewport once the menu has a measured size.
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const margin = 8;
+    let left = x;
+    let top = y;
+    if (left + rect.width > window.innerWidth - margin) {
+      left = Math.max(margin, window.innerWidth - rect.width - margin);
+    }
+    if (top + rect.height > window.innerHeight - margin) {
+      top = Math.max(margin, window.innerHeight - rect.height - margin);
+    }
+    setPos({ left, top });
+  }, [x, y]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onDismiss();
+      }
+    };
+    const onDown = (e: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        onDismiss();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("pointerdown", onDown, true);
+    };
+  }, [onDismiss]);
+
+  // Focus the menu so Escape works even if nothing was clicked yet.
+  useEffect(() => {
+    rootRef.current?.focus();
+  }, []);
+
+  function handleBlur(e: React.FocusEvent) {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) onDismiss();
+  }
+
+  function choose(entry: MenuEntry) {
+    setOpenSub(null);
+    try {
+      void entry.onSelect?.();
+    } finally {
+      onDismiss();
+    }
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className="tile-menu"
+      role="menu"
+      tabIndex={-1}
+      style={{ left: pos.left, top: pos.top }}
+      onBlur={handleBlur}
+    >
+      <ul className="tile-menu-list">
+        {entries.map((entry) => (
+          <li key={entry.key} className="tile-menu-row">
+            <button
+              type="button"
+              role="menuitem"
+              className={`tile-menu-item${entry.danger ? " is-danger" : ""}`}
+              aria-haspopup={entry.submenu ? "true" : undefined}
+              aria-expanded={entry.submenu ? openSub === entry.key : undefined}
+              onClick={() => (entry.submenu ? setOpenSub(entry.key) : choose(entry))}
+              onMouseEnter={() => {
+                if (entry.submenu) setOpenSub(entry.key);
+              }}
+              onFocus={() => {
+                if (entry.submenu) setOpenSub(entry.key);
+              }}
+            >
+              <span>{entry.label}</span>
+              {entry.submenu && (
+                <span className="tile-menu-caret" aria-hidden="true">
+                  ▸
+                </span>
+              )}
+            </button>
+            {entry.submenu && openSub === entry.key && (
+              <div className="tile-submenu" role="menu" aria-label={entry.label}>
+                {entry.submenu.map((sub) => (
+                  <button
+                    key={sub.key}
+                    type="button"
+                    role="menuitem"
+                    className={`tile-menu-item${sub.danger ? " is-danger" : ""}`}
+                    onClick={() => choose(sub)}
+                  >
+                    <span>{sub.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * Host-provided handlers for tile menu actions. The host (App.tsx) owns
+ * app/program state, so each action is a callback: it performs the backend
+ * call and refreshes settings + list state afterwards.
+ */
+export interface TileMenuActions {
+  onOpen: (r: SearchResult) => void;
+  onOpenAccount: (app: WebApp, account: Account) => void;
+  onTogglePin: (itemId: string) => void | Promise<void>;
+  onEditApp: (app: WebApp) => void;
+  onRemoveApp: (app: WebApp) => void;
+  onHideProgram: (programId: string) => void | Promise<void>;
+  onRemoveCustomProgram: (programId: string) => void | Promise<void>;
+}
+
+/**
+ * Menu rows per tile kind:
+ * - App: Open, Open account ▸ (its accounts), Pin/Unpin, Edit, Remove
+ * - Account: Open, Pin/Unpin
+ * - Program: Launch, Pin/Unpin, Hide from launcher (or Remove if custom)
+ */
+export function buildTileMenuEntries(
+  r: SearchResult,
+  ctx: { isPinned: boolean; actions: TileMenuActions }
+): MenuEntry[] {
+  const a = ctx.actions;
+  const pin: MenuEntry = {
+    key: "pin",
+    label: ctx.isPinned ? "Unpin" : "Pin to top",
+    onSelect: () => a.onTogglePin(r.id),
+  };
+  if (r.kind === "app") {
+    const entries: MenuEntry[] = [
+      { key: "open", label: "Open", onSelect: () => a.onOpen(r) },
+    ];
+    if (r.app.accounts.length > 0) {
+      entries.push({
+        key: "open-account",
+        label: "Open account",
+        submenu: [...r.app.accounts]
+          .sort((x, y) => x.label.localeCompare(y.label))
+          .map((acct) => ({
+            key: `account:${acct.id}`,
+            label: acct.label,
+            onSelect: () => a.onOpenAccount(r.app, acct),
+          })),
+      });
+    }
+    entries.push(
+      pin,
+      { key: "edit", label: "Edit", onSelect: () => a.onEditApp(r.app) },
+      {
+        key: "remove",
+        label: "Remove",
+        danger: true,
+        onSelect: () => a.onRemoveApp(r.app),
+      }
+    );
+    return entries;
+  }
+  if (r.kind === "account") {
+    return [
+      { key: "open", label: "Open", onSelect: () => a.onOpen(r) },
+      pin,
+    ];
+  }
+  const prog = r.program;
+  const entries: MenuEntry[] = [
+    { key: "launch", label: "Launch", onSelect: () => a.onOpen(r) },
+    pin,
+  ];
+  if (isCustomProgram(prog)) {
+    entries.push({
+      key: "remove",
+      label: "Remove",
+      danger: true,
+      onSelect: () => a.onRemoveCustomProgram(prog.id),
+    });
+  } else {
+    entries.push({
+      key: "hide",
+      label: "Hide from launcher",
+      onSelect: () => a.onHideProgram(prog.id),
+    });
+  }
+  return entries;
+}
+
+/**
+ * Owns the open/close state for the tile menu. Wire `openTileMenu` to
+ * IconGrid's `onTileContextMenu` and render `tileMenuNode` next to the grid.
+ */
+export function useTileMenu(deps: {
+  actions: TileMenuActions;
+  isPinned: (itemId: string) => boolean;
+}) {
+  const [target, setTarget] = useState<{
+    r: SearchResult;
+    x: number;
+    y: number;
+  } | null>(null);
+  const close = useCallback(() => setTarget(null), []);
+  const openFor = useCallback((r: SearchResult, x: number, y: number) => {
+    setTarget({ r, x, y });
+  }, []);
+  const actionsRef = useRef(deps.actions);
+  actionsRef.current = deps.actions;
+  const isPinnedRef = useRef(deps.isPinned);
+  isPinnedRef.current = deps.isPinned;
+  const node = target ? (
+    <TileMenu
+      x={target.x}
+      y={target.y}
+      entries={buildTileMenuEntries(target.r, {
+        isPinned: isPinnedRef.current(target.r.id),
+        actions: actionsRef.current,
+      })}
+      onDismiss={close}
+    />
+  ) : null;
+  return { tileMenuNode: node, openTileMenu: openFor, closeTileMenu: close };
+}
+
+// --- Rescan ------------------------------------------------------------------
+
+/**
+ * Rescan button for the overlay (header + empty-results state). Runs
+ * `rescan_programs`, then hands the refreshed list to the host.
+ */
+export function RescanButton({
+  onRefreshed,
+  onError,
+  className,
+  children,
+}: {
+  onRefreshed: (programs: NativeProgram[]) => void;
+  onError?: (msg: string) => void;
+  className?: string;
+  children?: React.ReactNode;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function handle() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await invoke<number>("rescan_programs");
+      const list = await invoke<NativeProgram[]>("list_programs");
+      onRefreshed(list);
+    } catch (err) {
+      onError?.(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <button
+      type="button"
+      className={className ?? "text-button"}
+      disabled={busy}
+      onClick={() => void handle()}
+    >
+      {busy ? "Scanning…" : (children ?? "Rescan programs")}
+    </button>
+  );
+}
+
+/**
+ * Refresh the program list when the backend finishes a scan. The backend
+ * emits `programs-scanned`; this complements (not replaces) the existing
+ * ~8s re-poll in App.tsx.
+ */
+export function useProgramsScannedRefresh(
+  onPrograms: (programs: NativeProgram[]) => void
+) {
+  const ref = useRef(onPrograms);
+  ref.current = onPrograms;
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    listen("programs-scanned", () => {
+      invoke<NativeProgram[]>("list_programs")
+        .then((list) => ref.current(list))
+        .catch(() => {});
+    })
+      .then((unlisten) => {
+        off = unlisten;
+      })
+      .catch(() => {});
+    return () => off?.();
+  }, []);
+}
+
+/** Empty-results state with the "not finding it?" rescan affordance. */
+export function NoMatchesHint({
+  onProgramsRefreshed,
+  onError,
+}: {
+  onProgramsRefreshed: (programs: NativeProgram[]) => void;
+  onError?: (msg: string) => void;
+}) {
+  return (
+    <p className="muted folder-hint">
+      No matches. Not finding it?{" "}
+      <RescanButton onRefreshed={onProgramsRefreshed} onError={onError}>
+        Rescan
+      </RescanButton>
+    </p>
+  );
+}
+
+// --- Manually add a program --------------------------------------------------
+
+/**
+ * Small modal: name + executable path, with a Browse button backed by the
+ * `pick_executable` command. If the picker returns null (plugin missing),
+ * the typed path is used as-is. Backend errors are shown honestly.
+ */
+export function AddProgramModal({
+  open,
+  onClose,
+  onAdded,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onAdded: (program: CustomProgram) => void;
+}) {
+  const [name, setName] = useState("");
+  const [path, setPath] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+  const [pickerNote, setPickerNote] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setName("");
+      setPath("");
+      setError(null);
+      setPickerNote(false);
+    }
+  }, [open ]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  async function browse() {
+    if (browsing) return;
+    setBrowsing(true);
+    setError(null);
+    try {
+      const picked = await invoke<string | null>("pick_executable");
+      if (picked) {
+        setPath(picked);
+      } else {
+        // No file picker available — the user can type the path instead.
+        setPickerNote(true);
+      }
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBrowsing(false);
+    }
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const cleanName = name.trim();
+    const cleanPath = path.trim();
+    if (!cleanName) {
+      setError("Give the program a name.");
+      return;
+    }
+    if (!cleanPath) {
+      setError("Enter the path to the program's executable.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await invoke<CustomProgram>("add_custom_program", {
+        name: cleanName,
+        exePath: cleanPath,
+      });
+      onAdded(created);
+      onClose();
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Add a program"
+      >
+        <h2 className="modal-title">Add a program</h2>
+        <p className="modal-sub">
+          For programs the automatic scan misses — point AppForge at the
+          executable and it shows up in the launcher.
+        </p>
+        <form onSubmit={(e) => void submit(e)}>
+          <label className="modal-field">
+            <span>Name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. QuicMic"
+              maxLength={80}
+              autoComplete="off"
+              spellCheck={false}
+              autoFocus
+            />
+          </label>
+          <label className="modal-field">
+            <span>Executable path</span>
+            <div className="modal-path-row">
+              <input
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="C:\Program Files\QuicMic\quicmic.exe"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="modal-browse"
+                disabled={browsing}
+                onClick={() => void browse()}
+              >
+                {browsing ? "…" : "Browse…"}
+              </button>
+            </div>
+          </label>
+          {pickerNote && (
+            <p className="modal-note">
+              The file picker isn't available — type the full path instead.
+            </p>
+          )}
+          {error && (
+            <p className="modal-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="modal-actions">
+            <button type="button" className="text-button" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="modal-primary" disabled={busy}>
+              {busy ? "Adding…" : "Add program"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/** Button that opens the AddProgramModal. Place it in the overlay header. */
+export function AddProgramButton({
+  onAdded,
+  className,
+  children,
+}: {
+  onAdded: (program: CustomProgram) => void;
+  className?: string;
+  children?: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        className={className ?? "text-button"}
+        onClick={() => setOpen(true)}
+      >
+        {children ?? "Add program"}
+      </button>
+      <AddProgramModal
+        open={open}
+        onClose={() => setOpen(false)}
+        onAdded={onAdded}
+      />
+    </>
+  );
+}
+
+// --- Edit-app handoff ---------------------------------------------------------
+
+/**
+ * Window event fired when the launcher asks the library view to open the
+ * Edit dialog for an app. App.tsx needs a one-line listener, e.g.:
+ *
+ *   window.addEventListener("appforge:edit-app", (e) => {
+ *     const id = (e as CustomEvent).detail?.appId as string | undefined;
+ *     const app = apps.find((x) => x.id === id);
+ *     if (app) setEditingApp(app);
+ *   });
+ */
+export const EDIT_APP_EVENT = "appforge:edit-app";
+
+/**
+ * Switch the main window back to the library view (through the existing
+ * `show_library` command, which App.tsx already listens for) and ask it to
+ * open the Edit dialog for the app. The dialog itself can only open from
+ * App.tsx state, so this dispatches the event above for it to pick up.
+ */
+export async function requestEditApp(appId: string): Promise<void> {
+  try {
+    await invoke("show_library");
+  } catch {
+    // The event below still fires; the view just won't have switched.
+  }
+  window.dispatchEvent(
+    new CustomEvent(EDIT_APP_EVENT, { detail: { appId } })
   );
 }

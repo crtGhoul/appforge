@@ -39,6 +39,11 @@ jobs:
         run: npm run build
 
       - name: Build Tauri bundles (NSIS + MSI)
+        env:
+          # Signs updater artifacts (.sig files) with the minisign key.
+          # Private key is in the TAURI_SIGNING_PRIVATE_KEY repo secret;
+          # the key itself was generated locally with no password.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: npm run tauri build
 
       - name: Upload installers
@@ -48,4 +53,11 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload updater signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: appforge-windows-updater-sigs
+          path: src-tauri/target/release/bundle/**/*.sig
           if-no-files-found: error

@@ -36,9 +36,22 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "targets": "all"
+    "targets": "all",
+    "createUpdaterArtifacts": true
   },
   "identifier": "com.appforge.app",
   "productName": "AppForge",
-  "version": "0.5.3"
+  "version": "0.6.0",
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZDOEY5QzAzMjI1Q0M4QjkKUldTNXlGd2lBNXlQYkpHSCtNaDVSc2tXd094VmwrcGpNbVpZSlltZzBWQ2tidHoxWCtHMjlDNnkK",
+      "endpoints": [
+        "https://github.com/crtGhoul/appforge/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
 }

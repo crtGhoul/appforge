@@ -52,6 +52,11 @@ jobs:
         run: npm run build
 
       - name: Build Tauri bundles (AppImage + deb)
+        env:
+          # Signs updater artifacts (.sig files) with the minisign key.
+          # Private key is in the TAURI_SIGNING_PRIVATE_KEY repo secret;
+          # the key itself was generated locally with no password.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: npm run tauri build
 
       - name: Upload packages
@@ -61,4 +66,11 @@ jobs:
           path: |
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+      - name: Upload updater signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: appforge-linux-updater-sigs
+          path: src-tauri/target/release/bundle/**/*.sig
           if-no-files-found: error

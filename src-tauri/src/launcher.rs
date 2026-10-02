@@ -13,6 +13,8 @@
 //! Launching is always by program **id** with a server-side lookup, so the
 //! frontend can never ask the backend to run an arbitrary path.
 
+use crate::custom_programs;
+
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 #[cfg(not(windows))]
@@ -21,7 +23,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// A native installed program found on this PC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,10 @@ pub struct NativeProgram {
     pub exe_path: String,
     /// Absolute path of the extracted icon PNG, when extraction worked.
     pub icon_path: Option<String>,
+    /// True for manually-added entries (merged from custom-programs.json).
+    /// `#[serde(default)]` so old `programs.json` caches load with false.
+    #[serde(default)]
+    pub is_custom: bool,
 }
 
 fn hash_str(s: &str) -> String {
@@ -42,6 +48,7 @@ fn hash_str(s: &str) -> String {
 }
 
 pub struct LauncherState {
+    app: AppHandle,
     icons_dir: PathBuf,
     cache_path: PathBuf,
     programs: Mutex<Vec<NativeProgram>>,
@@ -62,22 +69,63 @@ impl LauncherState {
             .and_then(|c| serde_json::from_str::<Vec<NativeProgram>>(&c).ok())
             .unwrap_or_default();
         Ok(Self {
+            app: app.clone(),
             icons_dir,
             cache_path,
             programs: Mutex::new(programs),
         })
     }
 
-    /// Cached programs (populated by the startup background scan).
+    /// Cached programs (populated by the startup background scan), merged
+    /// with the user's custom programs. Hidden programs are NOT filtered
+    /// here — the frontend filters them from the grid via `hiddenProgramIds`
+    /// (so the settings panel can still resolve their names for the
+    /// un-hide list). Search never sees hidden items because every
+    /// browse/search path applies the same filter.
     pub fn list(&self) -> Vec<NativeProgram> {
+        let mut out = self.scan_list();
+        out.extend(custom_programs::load(&self.app).into_iter().map(
+            |c| NativeProgram {
+                id: c.id,
+                name: c.name,
+                exe_path: c.exe_path,
+                icon_path: c.icon_path,
+                is_custom: true,
+            },
+        ));
+        out
+    }
+
+    /// Scan-cache programs only (no customs, no hidden filtering).
+    fn scan_list(&self) -> Vec<NativeProgram> {
         self.programs
             .lock()
             .map(|p| p.clone())
             .unwrap_or_default()
     }
 
+    /// All programs the server-side launch lookup may resolve, including
+    /// customs. Never filters hidden: hiding only hides from the list.
+    fn all_for_launch(&self) -> Vec<NativeProgram> {
+        let mut out = self.scan_list();
+        out.extend(custom_programs::load(&self.app).into_iter().map(
+            |c| NativeProgram {
+                id: c.id,
+                name: c.name,
+                exe_path: c.exe_path,
+                icon_path: c.icon_path,
+                is_custom: true,
+            },
+        ));
+        out
+    }
+
     /// Full rescan on the calling thread. Run it on a background thread —
     /// COM work plus icon extraction can take a few seconds.
+    ///
+    /// Emits a `programs-scanned` event with `{"count": n}` when done, so the
+    /// frontend can refresh instead of polling on a timer. This covers both
+    /// the startup background scan and manual rescans (both call this).
     pub fn rescan(&self) -> usize {
         let found = scan_all(&self.icons_dir);
         let json = serde_json::to_string(&found).unwrap_or_else(|_| "[]".to_string());
@@ -90,24 +138,44 @@ impl LauncherState {
         if let Ok(mut guard) = self.programs.lock() {
             *guard = found;
         }
+        let _ = self
+            .app
+            .emit("programs-scanned", serde_json::json!({ "count": n }));
         n
     }
 
     /// Launch a program by id (server-side lookup — the frontend never passes
     /// a raw path, so it can't trick the backend into running something else).
     pub fn launch(&self, id: &str) -> Result<(), String> {
-        let exe_path = self
-            .programs
-            .lock()
-            .map_err(|e| format!("launcher state poisoned: {e}"))?
-            .iter()
+        let prog = self
+            .all_for_launch()
+            .into_iter()
             .find(|p| p.id == id)
-            .map(|p| p.exe_path.clone())
             .ok_or_else(|| "Program not found.".to_string())?;
-        launch_native(&exe_path)
+        #[cfg(windows)]
+        {
+            launch_native(&prog.exe_path)
+        }
+        #[cfg(not(windows))]
+        {
+            // Scanned entries point at .desktop files (launched via gio);
+            // customs point at real binaries, launched directly.
+            if prog.is_custom {
+                std::process::Command::new(&prog.exe_path)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|e| format!("Could not launch it: {e}."))
+            } else {
+                launch_native(&prog.exe_path)
+            }
+        }
     }
 }
 
+/// Read-only load of the `hidden_programs` ids from launcher settings.
+/// `launcher_settings::load` falls back to defaults (empty hidden list) when
+/// the file is missing or corrupt, so a broken settings file can never wipe
+/// the whole launcher list.
 #[cfg(windows)]
 fn scan_all(icons_dir: &Path) -> Vec<NativeProgram> {
     use windows::Win32::System::Com::{
@@ -164,8 +232,13 @@ fn scan_all(icons_dir: &Path) -> Vec<NativeProgram> {
             name,
             exe_path: target.to_string_lossy().into_owned(),
             icon_path,
+            is_custom: false,
         });
     }
+
+    // Registry-only installs (MSI without a Start Menu/Desktop shortcut):
+    // lnk results win, registry fills the gaps.
+    out.extend(scan_uninstall_registry(&mut seen, icons_dir));
 
     if com_ok {
         unsafe {
@@ -174,6 +247,198 @@ fn scan_all(icons_dir: &Path) -> Vec<NativeProgram> {
     }
     out.sort_by_key(|a| a.name.to_lowercase());
     out
+}
+
+/// MSI/registry-only installs: read DisplayName + DisplayIcon from the
+/// Uninstall keys
+/// (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`,
+/// `HKLM\SOFTWARE\WOW6432Node\...\Uninstall`, and the HKCU equivalents),
+/// resolve an exe from DisplayIcon (strip quotes/args, keep the first path
+/// ending in .exe), keep only targets that exist on disk, and de-dupe by
+/// lowercase exe path against `seen` (the .lnk results already in there win).
+#[cfg(windows)]
+fn scan_uninstall_registry(
+    seen: &mut std::collections::HashSet<String>,
+    icons_dir: &Path,
+) -> Vec<NativeProgram> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY,
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+
+    const ROOTS: [(HKEY, &str); 4] = [
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+    ];
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Read a string value from an already-open key. Returns None for
+    /// missing/empty/unreadable values.
+    fn read_string(hkey: HKEY, name: &str) -> Option<String> {
+        let wname = wide(name);
+        unsafe {
+            let mut len: u32 = 0;
+            if RegQueryValueExW(
+                hkey,
+                PCWSTR(wname.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&mut len),
+            )
+            .ok()
+            .is_err()
+            {
+                return None;
+            }
+            if len == 0 || len > 65536 {
+                return None;
+            }
+            // len is bytes; round up to u16 units, plus room for a NUL.
+            let mut buf = vec![0u16; (len as usize).div_ceil(2) + 1];
+            let mut out_len = (buf.len() * 2) as u32;
+            if RegQueryValueExW(
+                hkey,
+                PCWSTR(wname.as_ptr()),
+                None,
+                None,
+                Some(buf.as_mut_ptr() as *mut u8),
+                Some(&mut out_len),
+            )
+            .ok()
+            .is_err()
+            {
+                return None;
+            }
+            let used = (out_len as usize).div_ceil(2).min(buf.len());
+            let end = buf[..used].iter().position(|&c| c == 0).unwrap_or(used);
+            String::from_utf16(&buf[..end])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+    }
+
+    let mut out = Vec::new();
+    for (hive, sub) in ROOTS {
+        let wsub = wide(sub);
+        let mut hkey = HKEY::default();
+        let opened = unsafe {
+            RegOpenKeyExW(hive, PCWSTR(wsub.as_ptr()), Some(0), KEY_READ, &mut hkey)
+        };
+        if opened.ok().is_err() {
+            continue;
+        }
+        let mut index: u32 = 0;
+        loop {
+            let mut name_buf = [0u16; 256];
+            let mut name_len = name_buf.len() as u32;
+            let enumerated = unsafe {
+                RegEnumKeyExW(
+                    hkey,
+                    index,
+                    Some(PWSTR(name_buf.as_mut_ptr())),
+                    &mut name_len,
+                    None,
+                    Some(PWSTR::null()),
+                    None,
+                    None,
+                )
+            };
+            if enumerated.ok().is_err() {
+                break; // ERROR_NO_MORE_ITEMS (or a real error) — done here.
+            }
+            index += 1;
+            let sub_name =
+                String::from_utf16(&name_buf[..name_len as usize]).unwrap_or_default();
+            if sub_name.is_empty() {
+                continue;
+            }
+            let wfull = wide(&format!("{sub}\\{sub_name}"));
+            let mut happ = HKEY::default();
+            let app_opened = unsafe {
+                RegOpenKeyExW(hive, PCWSTR(wfull.as_ptr()), Some(0), KEY_READ, &mut happ)
+            };
+            if app_opened.ok().is_err() {
+                continue;
+            }
+            let display_name = read_string(happ, "DisplayName");
+            let display_icon = read_string(happ, "DisplayIcon");
+            unsafe {
+                let _ = RegCloseKey(happ);
+            }
+            let (Some(name), Some(icon)) = (display_name, display_icon) else {
+                continue;
+            };
+            let Some(exe) = parse_display_icon(&icon) else {
+                continue;
+            };
+            let key = exe.to_lowercase();
+            if !seen.insert(key.clone()) {
+                continue; // same exe already found via .lnk — lnk wins
+            }
+            let icon_path = extract_icon_png(Path::new(&exe), icons_dir);
+            out.push(NativeProgram {
+                id: hash_str(&key),
+                name,
+                exe_path: exe,
+                icon_path,
+                is_custom: false,
+            });
+        }
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+    }
+    out
+}
+
+/// Parse a registry DisplayIcon value into an exe path:
+/// `"C:\a\b.exe",0`, `"C:\a\b.exe"`, or `C:\a\b.exe`.
+/// Returns None unless it resolves to an existing `.exe` on disk.
+/// (REG_EXPAND_SZ values with `%VAR%` are not expanded — DisplayIcon is
+/// almost always an absolute path; exotic entries are skipped, not guessed.)
+#[cfg(windows)]
+fn parse_display_icon(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let path = if let Some(rest) = raw.strip_prefix('"') {
+        rest.split('"').next()?.trim()
+    } else {
+        raw.split(',').next()?.trim()
+    };
+    if path.is_empty() {
+        return None;
+    }
+    let is_exe = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if !is_exe {
+        return None;
+    }
+    let pb = PathBuf::from(path);
+    if !pb.is_file() {
+        return None;
+    }
+    Some(pb.to_string_lossy().into_owned())
 }
 
 #[cfg(windows)]
@@ -228,8 +493,11 @@ fn resolve_lnk_target(lnk: &Path) -> Option<PathBuf> {
 /// hash of the exe path so it is only ever extracted once. Returns the
 /// absolute PNG path, or None when anything goes wrong (the UI then shows a
 /// generic glyph — extraction is best-effort).
+///
+/// `pub(crate)` so `custom_programs` can extract icons for manually-added
+/// entries too.
 #[cfg(windows)]
-fn extract_icon_png(exe: &Path, icons_dir: &Path) -> Option<String> {
+pub(crate) fn extract_icon_png(exe: &Path, icons_dir: &Path) -> Option<String> {
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
         DeleteDC, DeleteObject, GetDIBits, GetObjectW, HDC, HGDIOBJ, RGBQUAD,
@@ -465,6 +733,7 @@ fn parse_desktop(path: &Path) -> Option<NativeProgram> {
         name,
         exe_path: path.to_string_lossy().into_owned(),
         icon_path: None,
+        is_custom: false,
     })
 }
 

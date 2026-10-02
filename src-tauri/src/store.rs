@@ -36,6 +36,15 @@ pub struct AppSettings {
     /// Idle minutes after which an unfocused account window is suspended.
     /// 0 = never.
     pub auto_suspend_minutes: u64,
+    /// Idle minutes after which an unfocused account window is closed outright
+    /// (the session dir survives, so reopening restores the login). 0 = never.
+    /// Old records without it migrate to 30.
+    #[serde(default = "default_auto_close_minutes")]
+    pub auto_close_minutes: u32,
+}
+
+fn default_auto_close_minutes() -> u32 {
+    30
 }
 
 impl Default for AppSettings {
@@ -45,6 +54,7 @@ impl Default for AppSettings {
             popup_allowlist: Vec::new(),
             adblock_enabled: true,
             auto_suspend_minutes: 30,
+            auto_close_minutes: 30,
         }
     }
 }

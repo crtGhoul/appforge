@@ -3,15 +3,26 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { check } from "@tauri-apps/plugin-updater";
+import type { Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 import {
+  AddProgramButton,
+  ContextMenuGuard,
+  EDIT_APP_EVENT,
   GRID_COLUMNS,
   IconGrid,
   LauncherSettingsPanel,
+  NoMatchesHint,
   ProgramIcon,
+  RescanButton,
   SearchBar,
   browseAll,
   buildResults,
+  recordLaunch,
+  useProgramsScannedRefresh,
+  useTileMenu,
 } from "./Launcher";
 import type { SearchResult } from "./Launcher";
 import type {
@@ -31,6 +42,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   popup_allowlist: [],
   adblock_enabled: true,
   auto_suspend_minutes: 30,
+  auto_close_minutes: 30,
 };
 
 const DEFAULT_COLOR = "#64748b";
@@ -540,6 +552,7 @@ function AppSettingsForm({
   const [allowlist, setAllowlist] = useState(settings.popup_allowlist.join("\n"));
   const [adblockEnabled, setAdblockEnabled] = useState(settings.adblock_enabled);
   const [suspendMinutes, setSuspendMinutes] = useState(String(settings.auto_suspend_minutes));
+  const [closeMinutes, setCloseMinutes] = useState(String(settings.auto_close_minutes ?? 30));
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -557,6 +570,7 @@ function AppSettingsForm({
       return;
     }
     const minutes = Math.max(0, parseInt(suspendMinutes, 10) || 0);
+    const closeMins = Math.max(0, parseInt(closeMinutes, 10) || 0);
     const newSettings: AppSettings = {
       popup_policy: popupPolicy,
       popup_allowlist: allowlist
@@ -565,6 +579,7 @@ function AppSettingsForm({
         .filter(Boolean),
       adblock_enabled: adblockEnabled,
       auto_suspend_minutes: minutes,
+      auto_close_minutes: closeMins,
     };
     setSaving(true);
     try {
@@ -661,6 +676,17 @@ function AppSettingsForm({
           onChange={(e) => setSuspendMinutes(e.target.value)}
         />
         <span className="help">Idle account windows are suspended to save RAM. 0 = never suspend.</span>
+      </label>
+      <label>
+        <span>Close idle window after (minutes)</span>
+        <input
+          type="number"
+          min={0}
+          step={1}
+          value={closeMinutes}
+          onChange={(e) => setCloseMinutes(e.target.value)}
+        />
+        <span className="help">Idle account windows are closed to free RAM; their login survives, reopening restores it. 0 = never close.</span>
       </label>
       <div className="form-actions">
         <button type="submit" disabled={saving}>
@@ -903,6 +929,339 @@ function EditAppDialog({
   );
 }
 
+/**
+ * The rest of the launcher preferences: which monitor the launcher
+ * summons on, automatic update checks, and the hidden-programs list.
+ * Rendered under LauncherSettingsPanel in the library's Launcher section
+ * (Launcher.tsx stays untouched).
+ *
+ * ID shapes, kept straight: `hidden_programs` holds RAW program ids
+ * (e.g. `ab12cd`), passed to set_program_hidden as `programId`. Pins and
+ * usage use tagged ids (`app:<id>`, `account:<id>`, `program:<id>`).
+ */
+function LauncherExtras({
+  settings,
+  programs,
+  onSaved,
+  onProgramsRefreshed,
+  onError,
+}: {
+  settings: LauncherSettings;
+  programs: NativeProgram[];
+  onSaved: (s: LauncherSettings) => void;
+  onProgramsRefreshed: (programs: NativeProgram[]) => void;
+  onError: (msg: string) => void;
+}) {
+  const [formError, setFormError] = useState<string | null>(null);
+  const [unhiding, setUnhiding] = useState<string | null>(null);
+
+  // Every mutation refreshes from the command's returned settings object.
+  async function mutate(run: () => Promise<LauncherSettings>, label: string) {
+    setFormError(null);
+    try {
+      onSaved(await run());
+    } catch (err) {
+      const msg = `${label}: ${errMsg(err)}`;
+      setFormError(msg);
+      onError(msg);
+    }
+  }
+
+  function handleMonitorMode(mode: "cursor" | "primary") {
+    if (mode === (settings.monitor_mode ?? "cursor")) return;
+    void mutate(
+      () => invoke<LauncherSettings>("set_monitor_mode", { mode }),
+      "Could not change the monitor"
+    );
+  }
+
+  function handleAutoUpdateCheck(enabled: boolean) {
+    void mutate(
+      () => invoke<LauncherSettings>("set_auto_update_check", { enabled }),
+      "Could not change update checks"
+    );
+  }
+
+  async function handleUnhide(programId: string) {
+    setUnhiding(programId);
+    try {
+      await mutate(
+        () =>
+          invoke<LauncherSettings>("set_program_hidden", {
+            programId,
+            hidden: false,
+          }),
+        "Could not unhide the program"
+      );
+      // The id is visible again — pull the fresh program list so its tile returns.
+      const list = await invoke<NativeProgram[]>("list_programs");
+      onProgramsRefreshed(list);
+    } catch (err) {
+      onError(errMsg(err));
+    } finally {
+      setUnhiding(null);
+    }
+  }
+
+  const hidden = settings.hidden_programs ?? [];
+  const monitorMode = settings.monitor_mode ?? "cursor";
+
+  return (
+    <div className="launcher-extras">
+      <fieldset className="radio-group">
+        <legend>Open on</legend>
+        <label className="radio-row">
+          <input
+            type="radio"
+            name="monitor-mode"
+            checked={monitorMode === "cursor"}
+            onChange={() => handleMonitorMode("cursor")}
+          />
+          <span>Monitor with cursor</span>
+        </label>
+        <label className="radio-row">
+          <input
+            type="radio"
+            name="monitor-mode"
+            checked={monitorMode === "primary"}
+            onChange={() => handleMonitorMode("primary")}
+          />
+          <span>Primary monitor</span>
+        </label>
+      </fieldset>
+
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={settings.auto_update_check ?? false}
+          onChange={(e) => handleAutoUpdateCheck(e.target.checked)}
+        />
+        <span>Check for updates automatically</span>
+      </label>
+      <span className="help">
+        Checks quietly in the background. Never downloads or restarts without you.
+      </span>
+
+      {hidden.length > 0 && (
+        <div className="hidden-programs">
+          <span className="field-label">
+            Hidden programs ({hidden.length})
+          </span>
+          <ul className="hidden-list">
+            {hidden.map((id) => {
+              const name = programs.find((p) => p.id === id)?.name;
+              return (
+                <li key={id} className="hidden-row">
+                  <span className="hidden-name" title={id}>
+                    {name ?? `Hidden program (${id.slice(0, 8)}…)`}
+                  </span>
+                  <button
+                    className="text-button"
+                    disabled={unhiding === id}
+                    onClick={() => void handleUnhide(id)}
+                  >
+                    {unhiding === id ? "Unhiding…" : "Unhide"}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {formError && (
+        <p className="form-error" role="alert">
+          {formError}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * First-run 101: four short, honest cards over the library. Dismissed once
+ * and never nagged again; the header "?" reopens it anytime.
+ */
+function IntroOverlay({ onGotIt }: { onGotIt: () => void }) {
+  const cards = [
+    {
+      title: "Open it anywhere",
+      body: "Press Alt+Space from anywhere — the launcher pops up over your work. Esc hides it again.",
+    },
+    {
+      title: "Websites become apps",
+      body: "Paste a URL and it joins your library, each with its own isolated accounts and logins.",
+    },
+    {
+      title: "Sign in safely",
+      body: "\u201CPreview & sign in\u201D opens the real site in a throwaway window. You sign in there yourself — AppForge never sees your password.",
+    },
+    {
+      title: "Tidy the launcher",
+      body: "Right-click any tile to pin it to the top, hide it, or edit it. Unhide hidden programs in the Launcher settings below.",
+    },
+  ];
+  return (
+    <div
+      className="dialog-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Welcome to AppForge"
+    >
+      <div className="dialog intro-dialog">
+        <h3>The 30-second tour</h3>
+        <div className="intro-cards">
+          {cards.map((card, i) => (
+            <div key={card.title} className="intro-card">
+              <h4>
+                <span className="step" aria-hidden="true">
+                  {i + 1}
+                </span>
+                {card.title}
+              </h4>
+              <p>{card.body}</p>
+            </div>
+          ))}
+        </div>
+        <div className="dialog-actions">
+          <button onClick={onGotIt}>Got it</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type UpdateStatus =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "uptodate" }
+  | { kind: "none" }
+  | { kind: "available"; version: string }
+  | { kind: "downloading"; version: string; progress: number | null }
+  | { kind: "ready"; version: string };
+
+/**
+ * Self-update UI. Manual "Check for updates" → download with progress →
+ * "Restart to finish" (never force-restarted). The release feed 404s while
+ * the repo is private, and the updater may not be wired up yet — any throw
+ * is a neutral "No updates found", never an error popup.
+ */
+function UpdaterSection() {
+  const [status, setStatus] = useState<UpdateStatus>({ kind: "idle" });
+  const pending = useRef<Update | null>(null);
+  const downloadedBytes = useRef(0);
+  const totalBytes = useRef<number | null>(null);
+
+  async function handleCheck() {
+    setStatus({ kind: "checking" });
+    pending.current = null;
+    try {
+      const update = await check();
+      if (!update) {
+        setStatus({ kind: "uptodate" });
+      } else {
+        pending.current = update;
+        setStatus({ kind: "available", version: update.version });
+      }
+    } catch {
+      setStatus({ kind: "none" });
+    }
+  }
+
+  async function handleDownload() {
+    const update = pending.current;
+    if (!update) return;
+    downloadedBytes.current = 0;
+    totalBytes.current = null;
+    setStatus({ kind: "downloading", version: update.version, progress: null });
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          totalBytes.current = event.data.contentLength ?? null;
+        } else if (event.event === "Progress") {
+          downloadedBytes.current += event.data.chunkLength;
+          const total = totalBytes.current;
+          const progress = total
+            ? Math.min(99, Math.round((downloadedBytes.current / total) * 100))
+            : null;
+          setStatus((prev) =>
+            prev.kind === "downloading" ? { ...prev, progress } : prev
+          );
+        }
+      });
+      setStatus({ kind: "ready", version: update.version });
+    } catch {
+      setStatus({ kind: "none" });
+    }
+  }
+
+  async function handleRestart() {
+    try {
+      await relaunch();
+    } catch {
+      /* the app is going away anyway — nothing honest left to say */
+    }
+  }
+
+  const busy = status.kind === "checking" || status.kind === "downloading";
+
+  return (
+    <div className="updater">
+      <div className="updater-row">
+        <button onClick={() => void handleCheck()} disabled={busy}>
+          {status.kind === "checking" ? "Checking…" : "Check for updates"}
+        </button>
+        <span className="muted small" role="status">
+          {status.kind === "idle" && "Never checked this session."}
+          {status.kind === "checking" && "Checking…"}
+          {status.kind === "uptodate" && "You're up to date."}
+          {status.kind === "none" && "No updates found."}
+          {status.kind === "available" &&
+            `Version ${status.version} is available.`}
+          {status.kind === "downloading" &&
+            (status.progress === null
+              ? `Downloading ${status.version}…`
+              : `Downloading ${status.version}… ${status.progress}%`)}
+          {status.kind === "ready" &&
+            `${status.version} installed — restart to finish.`}
+        </span>
+      </div>
+      {status.kind === "available" && (
+        <div>
+          <button onClick={() => void handleDownload()}>
+            Download &amp; install {status.version}
+          </button>
+        </div>
+      )}
+      {status.kind === "downloading" && status.progress !== null && (
+        <div
+          className="progress-track"
+          role="progressbar"
+          aria-valuenow={status.progress}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label="Download progress"
+        >
+          <div
+            className="progress-fill"
+            style={{ width: `${status.progress}%` }}
+          />
+        </div>
+      )}
+      {status.kind === "ready" && (
+        <div>
+          <button onClick={() => void handleRestart()}>
+            Restart to finish
+          </button>
+        </div>
+      )}
+      <p className="muted small">
+        Updates never download or restart on their own — you stay in charge.
+      </p>
+    </div>
+  );
+}
+
 export default function App() {
   const [apps, setApps] = useState<WebApp[]>([]);
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
@@ -920,6 +1279,56 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const searchRef = useRef<HTMLInputElement | null>(null);
+
+  // Refresh the program list whenever a scan finishes (startup scan or a
+  // manual rescan), instead of only the one ~8s re-poll below.
+  useProgramsScannedRefresh(setPrograms);
+
+  // The launcher overlay asks the library view to open the Edit dialog for
+  // an app (right-click → Edit). The dialog itself is App.tsx state, so we
+  // pick up the event here.
+  useEffect(() => {
+    const onEditApp = (e: Event) => {
+      const id = (e as CustomEvent).detail?.appId as string | undefined;
+      const app = apps.find((a) => a.id === id);
+      if (app) setEditingApp(app);
+    };
+    window.addEventListener(EDIT_APP_EVENT, onEditApp);
+    return () => window.removeEventListener(EDIT_APP_EVENT, onEditApp);
+  }, [apps]);
+
+  // First-run 101 overlay: shows over the library until dismissed once,
+  // reopenable anytime with the header "?". Never nags after dismissal.
+  const [introOpen, setIntroOpen] = useState(false);
+  const showIntro =
+    introOpen || (launcherSettings !== null && !launcherSettings.seen_intro);
+
+  async function dismissIntro() {
+    // Never nag: even if the backend write fails, treat it as seen locally.
+    try {
+      const updated = await invoke<LauncherSettings>("set_seen_intro", {
+        seen: true,
+      });
+      setLauncherSettings(updated);
+    } catch {
+      setLauncherSettings((prev) =>
+        prev ? { ...prev, seen_intro: true } : prev
+      );
+    }
+    setIntroOpen(false);
+  }
+
+  // Silent automatic update check when enabled: on mount and every 24h.
+  // Any failure — including the private release feed 404ing — is swallowed
+  // on purpose. The manual "Check for updates" button is the honest surface.
+  useEffect(() => {
+    if (!launcherSettings?.auto_update_check) return;
+    check().catch(() => {});
+    const id = window.setInterval(() => {
+      check().catch(() => {});
+    }, 24 * 60 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [launcherSettings?.auto_update_check]);
 
   // Two views: the hotkey-summoned spotlight overlay ("launcher") and the
   // full management window ("library"). The hotkey always lands on the
@@ -1333,11 +1742,70 @@ export default function App() {
   // --- launcher search -------------------------------------------------
 
   // Empty query shows the whole phone-folder grid; typing filters it with
-  // the fuzzy matcher.
-  const items = useMemo(
-    () => (query.trim() ? buildResults(query, apps, programs) : browseAll(apps, programs)),
-    [query, apps, programs]
+  // the fuzzy matcher. Pinned tiles sort first (in pin order), then
+  // usage-ranked, then the existing order.
+  const sortOpts = useMemo(
+    () => ({
+      pinned: launcherSettings?.pinned,
+      usage: launcherSettings?.usage,
+      hiddenProgramIds: launcherSettings?.hidden_programs,
+    }),
+    [launcherSettings]
   );
+  const items = useMemo(
+    () =>
+      query.trim()
+        ? buildResults(query, apps, programs, sortOpts)
+        : browseAll(apps, programs, sortOpts),
+    [query, apps, programs, sortOpts]
+  );
+
+  // Right-click tile menu (Open / Pin / Hide / Edit / Remove).
+  const { tileMenuNode, openTileMenu } = useTileMenu({
+    isPinned: (id) => launcherSettings?.pinned?.includes(id) ?? false,
+    actions: {
+      onOpen: (r) => void activateResult(r),
+      onOpenAccount: (app, acct) => void handleOpenAccount(app, acct),
+      onTogglePin: async (itemId) => {
+        try {
+          const updated = await invoke<LauncherSettings>("toggle_pin", {
+            itemId,
+          });
+          setLauncherSettings(updated);
+        } catch (err) {
+          setError(errMsg(err));
+        }
+      },
+      onEditApp: (app) => {
+        // The Edit dialog lives in the library view: switch there first,
+        // then open it. Both state updates batch into one render.
+        void invoke("show_library").catch(() => {});
+        const found = apps.find((a) => a.id === app.id);
+        if (found) setEditingApp(found);
+      },
+      onRemoveApp: (app) => void handleRemoveApp(app),
+      onHideProgram: async (programId) => {
+        try {
+          const updated = await invoke<LauncherSettings>("set_program_hidden", {
+            programId,
+            hidden: true,
+          });
+          setLauncherSettings(updated);
+          setPrograms(await invoke<NativeProgram[]>("list_programs"));
+        } catch (err) {
+          setError(errMsg(err));
+        }
+      },
+      onRemoveCustomProgram: async (programId) => {
+        try {
+          await invoke("remove_custom_program", { programId });
+          setPrograms(await invoke<NativeProgram[]>("list_programs"));
+        } catch (err) {
+          setError(errMsg(err));
+        }
+      },
+    },
+  });
 
   useEffect(() => {
     setActiveIndex(0);
@@ -1375,6 +1843,9 @@ export default function App() {
         const ok = await handleOpenAccount(r.app, acct);
         if (!ok) return;
       }
+      // Usage ranking: the tile's tagged id (app:/account:/program:) feeds
+      // the pinned-first, usage-ranked sort. Fire-and-forget.
+      recordLaunch(r.id);
       // Spotlight behavior: a successful activation dismisses the overlay.
       setQuery("");
       await invoke("hide_library");
@@ -1462,6 +1933,7 @@ export default function App() {
   if (view === "launcher") {
     return (
       <div className="launcher-shell">
+        <ContextMenuGuard />
         <div
           className="folder-panel"
           key={summonCount}
@@ -1478,7 +1950,10 @@ export default function App() {
             {loading ? (
               <p className="muted folder-hint">Loading…</p>
             ) : items.length === 0 && query.trim() ? (
-              <p className="muted folder-hint">No matches.</p>
+              <NoMatchesHint
+                onProgramsRefreshed={setPrograms}
+                onError={setError}
+              />
             ) : items.length === 0 ? (
               <p className="muted folder-hint">
                 Nothing here yet — add your first web app from Manage apps below.
@@ -1490,13 +1965,29 @@ export default function App() {
                 onHover={setActiveIndex}
                 onActivate={(r) => void activateResult(r)}
                 renderIcon={renderResultIcon}
+                pinnedIds={new Set(launcherSettings?.pinned ?? [])}
+                onTileContextMenu={(r, x, y) => openTileMenu(r, x, y)}
               />
             )}
+            {tileMenuNode}
           </div>
           <footer className="launcher-foot">
             <button className="text-button" onClick={() => setView("library")}>
               Manage apps →
             </button>
+            <span className="launcher-foot-actions">
+              <AddProgramButton
+                onAdded={() =>
+                  invoke<NativeProgram[]>("list_programs")
+                    .then(setPrograms)
+                    .catch((err) => setError(errMsg(err)))
+                }
+              />
+              <RescanButton
+                onRefreshed={setPrograms}
+                onError={setError}
+              />
+            </span>
             <span className="muted small">
               {apps.length} web apps · {programs.length} programs
             </span>
@@ -1508,12 +1999,26 @@ export default function App() {
 
   return (
     <div className="shell">
+      <ContextMenuGuard />
+      {showIntro && <IntroOverlay onGotIt={() => void dismissIntro()} />}
       <button className="text-button library-back" onClick={() => setView("launcher")}>
         ← Launcher
       </button>
       <header className="header">
-        <h1>AppForge</h1>
-        <p className="subtitle">Your web apps, each with its own isolated accounts.</p>
+        <div className="header-row">
+          <div>
+            <h1>AppForge</h1>
+            <p className="subtitle">Your web apps, each with its own isolated accounts.</p>
+          </div>
+          <button
+            className="intro-help"
+            onClick={() => setIntroOpen(true)}
+            aria-label="Show the quick tour"
+            title="Quick tour"
+          >
+            ?
+          </button>
+        </div>
       </header>
 
       {banners}
@@ -1690,16 +2195,32 @@ export default function App() {
         </div>
         {launcherPanelOpen &&
           (launcherSettings ? (
-            <LauncherSettingsPanel
-              settings={launcherSettings}
-              onSaved={setLauncherSettings}
-              programsCount={programs.length}
-              onProgramsRefreshed={setPrograms}
-              onError={setError}
-            />
+            <>
+              <LauncherSettingsPanel
+                settings={launcherSettings}
+                onSaved={setLauncherSettings}
+                programsCount={programs.length}
+                onProgramsRefreshed={setPrograms}
+                onError={setError}
+              />
+              <LauncherExtras
+                settings={launcherSettings}
+                programs={programs}
+                onSaved={setLauncherSettings}
+                onProgramsRefreshed={setPrograms}
+                onError={setError}
+              />
+            </>
           ) : (
             <p className="muted">Loading…</p>
           ))}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Updates</h2>
+        </div>
+        <UpdaterSection />
       </section>
 
       <footer className="footer muted">

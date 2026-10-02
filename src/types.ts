@@ -18,6 +18,8 @@ export interface AppSettings {
   popup_allowlist: string[];
   adblock_enabled: boolean;
   auto_suspend_minutes: number;
+  /** Minutes of idleness after which an account window is closed (0 = never). */
+  auto_close_minutes: number;
 }
 
 export interface Account {
@@ -56,6 +58,16 @@ export interface NativeProgram {
   name: string;
   exe_path: string;
   icon_path: string | null;
+  /** True when the entry was added manually by the user (never wiped by rescans). */
+  is_custom: boolean;
+}
+
+/** A program added manually by the user, stored in custom-programs.json. */
+export interface CustomProgram {
+  id: string;
+  name: string;
+  exe_path: string;
+  icon_path: string | null;
 }
 
 /** Summon hotkey + run-at-startup + launcher panel look, stored in launcher.json on the backend. */
@@ -64,6 +76,24 @@ export interface LauncherSettings {
   autostart: boolean;
   /** Launcher panel translucency, 0.3 (faint) .. 1.0 (solid). Backend always sends it (serde default). */
   panel_opacity: number;
+  /**
+   * Tagged ids of pinned tiles (`app:<id>`, `account:<id>`, `program:<id>`);
+   * pins span all tile kinds, so the kind prefix disambiguates.
+   */
+  pinned: string[];
+  /** Raw program ids (NOT tagged) hidden from the launcher grid. */
+  hidden_programs: string[];
+  /**
+   * Launch frequency, keyed by the same tagged ids as `pinned`
+   * (e.g. `app:<id>`), for usage-frequency ranking.
+   */
+  usage: Record<string, { count: number; last_used: number }>;
+  /** Whether the first-run 101 overlay was shown/dismissed (never nag again). */
+  seen_intro: boolean;
+  /** Which monitor the launcher summons on. */
+  monitor_mode: "cursor" | "primary";
+  /** Whether to silently check for updates on startup (and every 24h). */
+  auto_update_check: boolean;
 }
 
 /** Result of the preview_start command: a signed-in-later throwaway session. */

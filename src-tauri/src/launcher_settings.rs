@@ -8,8 +8,10 @@
 //! no way to be summoned.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -27,6 +29,37 @@ fn default_opacity() -> f32 {
     DEFAULT_PANEL_OPACITY
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Launch-usage statistics for one tile, used for frequency ranking in the
+/// launcher. The key in `LauncherSettings::usage` is a tagged tile id
+/// (`app:<id>`, `account:<id>`, `program:<id>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageStat {
+    #[serde(default)]
+    pub count: u64,
+    /// Unix seconds of the most recent launch.
+    #[serde(default)]
+    pub last_used: i64,
+}
+
+/// Which monitor the launcher summon should appear on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MonitorMode {
+    /// Open on the monitor that holds the cursor (default).
+    #[default]
+    Cursor,
+    /// Open on the primary monitor.
+    Primary,
+}
+
+/// Cap on tracked usage entries; the least recently used entries are
+/// evicted first so the map can never grow unbounded.
+pub const MAX_USAGE_ENTRIES: usize = 500;
+
 /// Clamp to the usable range. NaN (which serde could never produce, but a
 /// hand-edited file might) falls back to the default.
 pub fn clamp_opacity(v: f32) -> f32 {
@@ -43,6 +76,26 @@ pub struct LauncherSettings {
     pub autostart: bool,
     #[serde(default = "default_opacity")]
     pub panel_opacity: f32,
+    /// Pinned launcher tiles, tagged ids: `app:<id>`, `account:<id>`,
+    /// `program:<id>`. Old files migrate to an empty vec.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    /// Program ids hidden from the launcher. Old files migrate to an empty vec.
+    #[serde(default)]
+    pub hidden_programs: Vec<String>,
+    /// Per-tile launch statistics for frequency ranking, keyed by tagged id.
+    /// Old files migrate to an empty map.
+    #[serde(default)]
+    pub usage: HashMap<String, UsageStat>,
+    /// Whether the first-run intro card has been dismissed.
+    #[serde(default)]
+    pub seen_intro: bool,
+    /// Which monitor the summon opens on. Old files migrate to `Cursor`.
+    #[serde(default)]
+    pub monitor_mode: MonitorMode,
+    /// Whether to check for updates automatically (default on).
+    #[serde(default = "default_true")]
+    pub auto_update_check: bool,
 }
 
 impl Default for LauncherSettings {
@@ -51,6 +104,60 @@ impl Default for LauncherSettings {
             hotkey: DEFAULT_HOTKEY.to_string(),
             autostart: false,
             panel_opacity: DEFAULT_PANEL_OPACITY,
+            pinned: Vec::new(),
+            hidden_programs: Vec::new(),
+            usage: HashMap::new(),
+            seen_intro: false,
+            monitor_mode: MonitorMode::default(),
+            auto_update_check: true,
+        }
+    }
+}
+
+impl LauncherSettings {
+    /// Pin or unpin a tagged tile id (`app:<id>`, `account:<id>`, `program:<id>`).
+    pub fn toggle_pin(&mut self, item_id: &str) {
+        if let Some(pos) = self.pinned.iter().position(|p| p == item_id) {
+            self.pinned.remove(pos);
+        } else {
+            self.pinned.push(item_id.to_string());
+        }
+    }
+
+    /// Hide or unhide a program tile by program id.
+    pub fn set_program_hidden(&mut self, program_id: &str, hidden: bool) {
+        if hidden {
+            if !self.hidden_programs.iter().any(|h| h == program_id) {
+                self.hidden_programs.push(program_id.to_string());
+            }
+        } else {
+            self.hidden_programs.retain(|h| h != program_id);
+        }
+    }
+
+    /// Record a launch for usage-frequency ranking: bump the count and stamp
+    /// `last_used` with the current Unix time. The map is capped at
+    /// `MAX_USAGE_ENTRIES`; the least recently used entries are evicted first.
+    pub fn record_launch(&mut self, item_id: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let stat = self.usage.entry(item_id.to_string()).or_default();
+        stat.count = stat.count.saturating_add(1);
+        stat.last_used = now;
+        while self.usage.len() > MAX_USAGE_ENTRIES {
+            let oldest = self
+                .usage
+                .iter()
+                .min_by_key(|(_, s)| (s.last_used, s.count))
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    self.usage.remove(&k);
+                }
+                None => break,
+            }
         }
     }
 }

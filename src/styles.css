@@ -19,3 +19,293 @@ body {
 #root {
   min-height: 100vh;
 }
+
+/* --- v0.6.0 launcher overlay additions (Launcher.tsx) --- */
+/* Frosted dark, matching the folder panel in App.css. One accent: indigo. */
+
+/* Anchor for the pin badge. Additive — App.css doesn't position .icon-tile. */
+.icon-tile {
+  position: relative;
+}
+
+.tile-pin {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  width: 13px;
+  height: 13px;
+  color: #818cf8;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.tile-pin svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+}
+
+/* Tile context menu */
+.tile-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 190px;
+  max-width: 260px;
+  padding: 5px;
+  background: rgba(28, 30, 38, 0.94);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5);
+  backdrop-filter: blur(28px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  box-shadow:
+    0 16px 48px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  color: #f2f3f5;
+  animation: tile-menu-in 120ms ease-out;
+}
+
+.tile-menu:focus {
+  outline: none;
+}
+
+@keyframes tile-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.tile-menu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tile-menu-row {
+  position: relative;
+  margin: 0;
+  padding: 0;
+}
+
+.tile-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tile-menu-item:hover,
+.tile-menu-item:focus-visible {
+  background: rgba(255, 255, 255, 0.09);
+  outline: none;
+}
+
+.tile-menu-item.is-danger {
+  color: #fca5a5;
+}
+
+.tile-menu-item.is-danger:hover,
+.tile-menu-item.is-danger:focus-visible {
+  background: rgba(248, 113, 113, 0.14);
+}
+
+.tile-menu-caret {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 12px;
+}
+
+.tile-submenu {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  min-width: 170px;
+  max-width: 230px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 5px;
+  background: rgba(28, 30, 38, 0.96);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5);
+  backdrop-filter: blur(28px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  animation: tile-menu-in 120ms ease-out;
+}
+
+/* Add-program modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(8, 9, 12, 0.55);
+  animation: tile-menu-in 120ms ease-out;
+}
+
+.modal-card {
+  width: 420px;
+  max-width: 100%;
+  padding: 20px;
+  background: rgba(28, 30, 38, 0.96);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5);
+  backdrop-filter: blur(28px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 18px;
+  box-shadow:
+    0 32px 80px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  color: #f2f3f5;
+}
+
+.modal-title {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.modal-sub {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.modal-field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.modal-field > span {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.modal-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  background: rgba(255, 255, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+}
+
+.modal-field input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+.modal-field input:focus {
+  outline: 2px solid #818cf8;
+  outline-offset: -1px;
+  border-color: #818cf8;
+}
+
+.modal-path-row {
+  display: flex;
+  gap: 8px;
+}
+
+.modal-path-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-browse {
+  flex: none;
+  padding: 9px 14px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  color: #f2f3f5;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.modal-browse:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.modal-browse:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.modal-note {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.modal-error {
+  margin: 0 0 12px;
+  padding: 8px 11px;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 8px;
+  color: #fca5a5;
+  font-size: 13px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.modal-actions .text-button {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.modal-primary {
+  padding: 9px 16px;
+  background: #818cf8;
+  border: none;
+  border-radius: 10px;
+  color: #14151c;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.modal-primary:hover:not(:disabled) {
+  background: #939dfa;
+}
+
+.modal-primary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tile-menu,
+  .tile-submenu,
+  .modal-backdrop {
+    animation: none;
+  }
+}
