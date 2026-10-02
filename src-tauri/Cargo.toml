@@ -9,10 +9,12 @@ tauri-build = { version = "2", features = [] }
 adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 serde = { features = ["derive"], version = "1" }
 serde_json = "1"
-# "unstable" enables the multi-webview APIs the preview sign-in flow needs
-# (WindowBuilder, WebviewBuilder, Window::add_child, Manager::get_window).
-# They are stable in practice; the flag is Tauri's staging gate.
-tauri = { features = ["tray-icon", "unstable"], version = "2" }
+# Note: window creation must never run on a WebView2 IPC thread — on Windows,
+# WebviewWindowBuilder::build() deadlocks in synchronous Tauri commands
+# (wry#583). Window-creating commands (open_account, preview_start) are
+# `async fn`, and the OAuth modal builds on a dedicated spawned thread.
+# Only the stable WebviewWindowBuilder API is used anywhere.
+tauri = { features = ["tray-icon"], version = "2" }
 tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
 # Filter-list downloads. rustls ("tls") only; no native-tls dependency.
@@ -51,4 +53,4 @@ authors = ["AppForge"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
 name = "appforge"
-version = "0.3.0"
+version = "0.3.1"
