@@ -47,9 +47,13 @@ const MOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// reveal the existing one when the previewed site was already added).
 const PREVIEW_ADDED_EVENT: &str = "appforge:preview-added";
 
+/// Event the library window listens for so it can clear its "preview opened"
+/// notice when a preview is discarded or closed by hand.
+const PREVIEW_CLOSED_EVENT: &str = "appforge:preview-closed";
+
 /// Control window size in physical pixels (used for placement math).
 /// Tall enough for the sign-in banner row above the controls row.
-const CONTROL_W: i32 = 660;
+const CONTROL_W: i32 = 940;
 const CONTROL_H: i32 = 200;
 
 #[derive(Debug, Clone)]
@@ -277,6 +281,7 @@ pub fn discard_preview(app: &AppHandle, preview_id: &str) -> Result<(), String> 
     if let Some(s) = session {
         let _ = std::fs::remove_dir_all(&s.session_dir);
     }
+    let _ = app.emit(PREVIEW_CLOSED_EVENT, preview_id);
     Ok(())
 }
 
@@ -331,6 +336,7 @@ pub fn add_preview_as_app(
         created: is_new,
     };
     let _ = app.emit(PREVIEW_ADDED_EVENT, &outcome);
+    let _ = app.emit(PREVIEW_CLOSED_EVENT, preview_id);
     Ok(outcome)
 }
 
@@ -346,6 +352,7 @@ pub fn window_closed(app: &AppHandle, label: &str) {
     if let Some(session) = take_session(app, &id) {
         let _ = std::fs::remove_dir_all(&session.session_dir);
     }
+    let _ = app.emit(PREVIEW_CLOSED_EVENT, id);
 }
 
 /// Delete leftover `.preview-*` temp dirs (crash safety). Best-effort.

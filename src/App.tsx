@@ -241,6 +241,18 @@ function PreviewSignInForm({ onError }: { onError: (msg: string) => void }) {
   const [formError, setFormError] = useState<string | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
 
+  // The control window closes previews on its own (Add/Discard/X) — clear
+  // the "preview opened" notice when that happens.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    listen("appforge:preview-closed", () => setPreviewOpen(false))
+      .then((unlisten) => {
+        off = unlisten;
+      })
+      .catch(() => {});
+    return () => off?.();
+  }, []);
+
   async function handleOpenPreview(e: React.FormEvent) {
     e.preventDefault();
     setFormError(null);
