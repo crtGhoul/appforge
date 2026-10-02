@@ -67,3 +67,13 @@ export interface PreviewStart {
   id: string;
   url: string;
 }
+
+/**
+ * Result of add_app / preview_add. `created` is false when the site was
+ * already in the library — the backend never creates duplicates; the UI
+ * reveals the existing entry instead.
+ */
+export interface AddAppOutcome {
+  app: WebApp;
+  created: boolean;
+}

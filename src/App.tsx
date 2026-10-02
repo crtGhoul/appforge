@@ -14,6 +14,7 @@ import {
 import type { SearchResult } from "./Launcher";
 import type {
   Account,
+  AddAppOutcome,
   AppSettings,
   LauncherSettings,
   NativeProgram,
@@ -88,7 +89,7 @@ function QuickAddForm({
   onAdded,
   onError,
 }: {
-  onAdded: (app: WebApp) => void;
+  onAdded: (outcome: AddAppOutcome) => void;
   onError: (msg: string) => void;
 }) {
   const [quickUrl, setQuickUrl] = useState("");
@@ -122,7 +123,7 @@ function QuickAddForm({
       } catch {
         name = prettifiedDomain(cleanUrl);
       }
-      const created = await invoke<WebApp>("add_app", { name, url: cleanUrl });
+      const created = await invoke<AddAppOutcome>("add_app", { name, url: cleanUrl });
       onAdded(created);
       setQuickUrl("");
     } catch (err) {
@@ -546,6 +547,7 @@ export default function App() {
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [settingsOpen, setSettingsOpen] = useState<Set<string>>(new Set());
 
@@ -605,6 +607,14 @@ export default function App() {
     return () => clearTimeout(t);
   }, []);
 
+  // Notices ("already in your library") are transient — clear after a while
+  // so a stale one can't confuse a later action.
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 9000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
   // Focus the search box every time the window is summoned.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -645,14 +655,20 @@ export default function App() {
 
   // A preview that was added as an app: pick it up in the library and open
   // its first account, which carries the session the user signed in to.
+  // If the site was already in the library (no duplicate was created),
+  // reveal the existing entry instead.
   useEffect(() => {
     let off: (() => void) | undefined;
-    listen<WebApp>("appforge:preview-added", (event) => {
+    listen<AddAppOutcome>("appforge:preview-added", (event) => {
       const created = {
-        ...event.payload,
-        accounts: event.payload.accounts ?? [],
-        settings: event.payload.settings ?? DEFAULT_SETTINGS,
+        ...event.payload.app,
+        accounts: event.payload.app.accounts ?? [],
+        settings: event.payload.app.settings ?? DEFAULT_SETTINGS,
       };
+      if (!event.payload.created) {
+        revealApp(created, `"${created.name}" is already in your library — showing it instead of adding a duplicate.`);
+        return;
+      }
       setApps((prev) => [...prev, created]);
       const first = created.accounts[0];
       if (first) {
@@ -712,6 +728,22 @@ export default function App() {
     setApps((prev) => prev.map((a) => (a.id === updated.id ? { ...updated, accounts: updated.accounts ?? [], settings: updated.settings ?? DEFAULT_SETTINGS } : a)));
   }
 
+  /**
+   * Reveal an already-existing app instead of creating a duplicate: make
+   * sure it's in the list, expand its card, and say what's happening.
+   */
+  function revealApp(app: WebApp, message: string) {
+    const full = { ...app, accounts: app.accounts ?? [], settings: app.settings ?? DEFAULT_SETTINGS };
+    setApps((prev) => (prev.some((a) => a.id === full.id) ? prev : [...prev, full]));
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.add(full.id);
+      return next;
+    });
+    setError(null);
+    setNotice(message);
+  }
+
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
     setFormError(null);
@@ -727,14 +759,20 @@ export default function App() {
     }
     setAdding(true);
     try {
-      const created = await invoke<WebApp>("add_app", {
+      const outcome = await invoke<AddAppOutcome>("add_app", {
         name: cleanName,
         url: cleanUrl,
       });
-      setApps((prev) => [
-        ...prev,
-        { ...created, accounts: created.accounts ?? [], settings: created.settings ?? DEFAULT_SETTINGS },
-      ]);
+      if (!outcome.created) {
+        revealApp(outcome.app, `"${outcome.app.name}" is already in your library — showing it instead of adding a duplicate.`);
+      } else {
+        const created = outcome.app;
+        setNotice(null);
+        setApps((prev) => [
+          ...prev,
+          { ...created, accounts: created.accounts ?? [], settings: created.settings ?? DEFAULT_SETTINGS },
+        ]);
+      }
       setName("");
       setUrl("");
       setColor(DEFAULT_COLOR);
@@ -875,7 +913,7 @@ export default function App() {
       if (query) {
         setQuery("");
       } else {
-        void invoke("hide_library").catch(() => {});
+        void invoke("hide_library").catch((err) => setError(errMsg(err)));
       }
     }
   }
@@ -892,6 +930,11 @@ export default function App() {
           {error}
         </div>
       )}
+      {notice && (
+        <div className="banner banner-info" role="status">
+          {notice}
+        </div>
+      )}
       {platform && !platform.network_adblock && (
         <div className="banner banner-info" role="status">
           Network-level ad blocking is Windows-only in this build. On this device you still
@@ -906,11 +949,18 @@ export default function App() {
     </>
   );
 
-  const addCreatedApp = (created: WebApp) =>
+  const addCreatedApp = (outcome: AddAppOutcome) => {
+    if (!outcome.created) {
+      revealApp(outcome.app, `"${outcome.app.name}" is already in your library — showing it instead of adding a duplicate.`);
+      return;
+    }
+    const created = outcome.app;
+    setNotice(null);
     setApps((prev) => [
       ...prev,
       { ...created, accounts: created.accounts ?? [], settings: created.settings ?? DEFAULT_SETTINGS },
     ]);
+  };
 
   // Spotlight overlay: search field + ranked list only. Management lives one
   // click away in the library view.
