@@ -109,6 +109,11 @@ pub struct LauncherSettings {
     /// "duckduckgo" (default) or "google". Old files migrate to DuckDuckGo.
     #[serde(default = "default_search_engine")]
     pub search_engine: String,
+    /// Whether the library's "Hidden programs" list is collapsed.
+    /// None = never touched: the UI defaults to collapsed whenever the list
+    /// is non-empty. Old files migrate to None.
+    #[serde(default)]
+    pub hidden_section_collapsed: Option<bool>,
 }
 
 fn default_search_engine() -> String {
@@ -128,6 +133,7 @@ impl Default for LauncherSettings {
             monitor_mode: MonitorMode::default(),
             auto_update_check: true,
             search_engine: default_search_engine(),
+            hidden_section_collapsed: None,
         }
     }
 }
@@ -299,6 +305,23 @@ pub fn set_search_engine(
         .lock()
         .map_err(|e| format!("settings state poisoned: {e}"))?;
     settings.search_engine = engine;
+    save(&app, &settings)?;
+    Ok(settings.clone())
+}
+
+/// Collapse/expand the library's "Hidden programs" list. Saved immediately
+/// so the choice survives restarts.
+/// JS: `invoke("set_hidden_section_collapsed", { collapsed })`.
+#[tauri::command]
+pub fn set_hidden_section_collapsed(
+    app: AppHandle,
+    collapsed: bool,
+) -> Result<LauncherSettings, String> {
+    let state = app.state::<Mutex<LauncherSettings>>();
+    let mut settings = state
+        .lock()
+        .map_err(|e| format!("settings state poisoned: {e}"))?;
+    settings.hidden_section_collapsed = Some(collapsed);
     save(&app, &settings)?;
     Ok(settings.clone())
 }

@@ -1028,6 +1028,25 @@ input[type="color"] {
   font-size: 14px;
 }
 
+/* Collapse toggle for the hidden-programs list: plain button reset so the
+ * whole header row is the click target; chevron uses the UI accent. */
+.collapse-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.collapse-chevron {
+  color: #4f46e5;
+  font-size: 14px;
+  line-height: 1;
+}
+
 .hidden-list {
   list-style: none;
   margin: 8px 0 0;
@@ -1145,4 +1164,39 @@ input[type="color"] {
   background: #4f46e5;
   border-radius: 4px;
   transition: width 0.2s;
+}
+
+/* Per-command hotkeys section (v0.8.0): quiet rows, same language as the
+   summon-hotkey settings. */
+.cmd-hotkeys h3 {
+  margin: 18px 0 4px;
+  font-size: 14px;
+}
+.cmd-hotkey-rows {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cmd-hotkey-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cmd-hotkey-target {
+  min-width: 160px;
+  font-size: 13px;
+}
+.cmd-hotkey-row input[type="text"] {
+  width: 130px;
+}
+.cmd-hotkey-row .danger {
+  color: #8f1d1d;
+  border-color: #eec9c9;
+}
+.cmd-hotkey-row .danger:hover {
+  background: #fdecec;
 }

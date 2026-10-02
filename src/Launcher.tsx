@@ -7,6 +7,7 @@ import type {
   HotkeyStatus,
   LauncherSettings,
   NativeProgram,
+  Routine,
   WebApp,
 } from "./types";
 
@@ -53,7 +54,8 @@ export function fuzzyScore(query: string, text: string): number {
 export type SearchResult =
   | { kind: "account"; id: string; title: string; context: string; score: number; app: WebApp; account: Account }
   | { kind: "app"; id: string; title: string; context: string; score: number; app: WebApp }
-  | { kind: "program"; id: string; title: string; context: string; score: number; program: NativeProgram };
+  | { kind: "program"; id: string; title: string; context: string; score: number; program: NativeProgram }
+  | { kind: "routine"; id: string; title: string; context: string; score: number; routine: Routine };
 
 /**
  * Columns in the launcher folder grid. Must match `grid-template-columns`
@@ -220,6 +222,7 @@ export function buildResults(
   query: string,
   apps: WebApp[],
   programs: NativeProgram[],
+  routines: Routine[],
   opts?: LauncherSortOpts
 ): SearchResult[] {
   const q = query.trim();
@@ -266,6 +269,22 @@ export function buildResults(
         context: "Program",
         score,
         program,
+      });
+    }
+  }
+
+  // v0.8.0: routines match on their name. The tile shows the routine name
+  // plus "Routine — Enter to run".
+  for (const routine of routines) {
+    const score = fuzzyScore(q, routine.name);
+    if (score > 0) {
+      results.push({
+        kind: "routine",
+        id: `routine:${routine.id}`,
+        title: routine.name,
+        context: "Routine — Enter to run",
+        score,
+        routine,
       });
     }
   }
@@ -323,7 +342,9 @@ export function IconGrid({
           )}
           <span className="tile-icon">{renderIcon(r)}</span>
           <span className="tile-label">{r.title}</span>
-          {r.kind === "account" && <span className="tile-sub">{r.context}</span>}
+          {(r.kind === "account" || r.kind === "routine") && (
+            <span className="tile-sub">{r.context}</span>
+          )}
         </button>
       ))}
     </div>
@@ -825,6 +846,7 @@ export interface TileMenuActions {
   onRemoveApp: (app: WebApp) => void;
   onForgetLogin: (app: WebApp, account: Account) => void;
   onHideProgram: (programId: string) => void | Promise<void>;
+  onRevealProgramLocation: (program: NativeProgram) => void | Promise<void>;
   onRemoveCustomProgram: (programId: string) => void | Promise<void>;
 }
 
@@ -832,7 +854,7 @@ export interface TileMenuActions {
  * Menu rows per tile kind:
  * - App: Open, Open account ▸ (its accounts), Pin/Unpin, Edit, Remove
  * - Account: Open, Pin/Unpin
- * - Program: Launch, Pin/Unpin, Hide from launcher (or Remove if custom)
+ * - Program: Launch, Pin/Unpin, Open file location, Hide from launcher (or Remove if custom)
  */
 export function buildTileMenuEntries(
   r: SearchResult,
@@ -889,10 +911,18 @@ export function buildTileMenuEntries(
     }
     return entries;
   }
+  if (r.kind === "routine") {
+    return [{ key: "run", label: "Run", onSelect: () => a.onOpen(r) }];
+  }
   const prog = r.program;
   const entries: MenuEntry[] = [
     { key: "launch", label: "Launch", onSelect: () => a.onOpen(r) },
     pin,
+    {
+      key: "open-location",
+      label: "Open file location",
+      onSelect: () => a.onRevealProgramLocation(prog),
+    },
   ];
   if (isCustomProgram(prog)) {
     entries.push({

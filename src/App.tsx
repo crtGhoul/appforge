@@ -7,6 +7,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { isAppHidden } from "./visibility";
 import { RamDashboard } from "./RamDashboard";
 import { ForgetLoginDialog, forgetLogin } from "./ForgetLoginDialog";
@@ -14,6 +15,12 @@ import LinkPicker from "./LinkPicker";
 import type { LinkPickerAccount } from "./LinkPicker";
 import LinkRules from "./LinkRules";
 import { DownloadsList } from "./DownloadsList";
+import { RoutinesSection } from "./RoutinesSection";
+import WorkspacesSection from "./WorkspacesSection";
+import { filterAppsByWorkspace } from "./WorkspacesSection";
+import type { WorkspaceList } from "./WorkspacesSection";
+import { useHotkeyDispatch } from "./useHotkeyDispatch";
+import { CmdHotkeysSection } from "./CmdHotkeysSection";
 import "./App.css";
 import {
   AddProgramButton,
@@ -44,6 +51,7 @@ import type {
   PlatformInfo,
   PreviewAddOutcome,
   PreviewStart,
+  Routine,
   WebApp,
 } from "./types";
 
@@ -1194,6 +1202,28 @@ function LauncherExtras({
 
   const hidden = settings.hidden_programs ?? [];
   const monitorMode = settings.monitor_mode ?? "cursor";
+  // Collapse toggle for the hidden-programs list. `null` = untouched this
+  // session; the persisted pref wins, and with neither set the list starts
+  // collapsed whenever it is non-empty (it only renders when non-empty).
+  const [collapsedChoice, setCollapsedChoice] = useState<boolean | null>(null);
+  const hiddenCollapsed =
+    collapsedChoice ?? settings.hidden_section_collapsed ?? hidden.length > 0;
+
+  async function handleToggleHiddenCollapsed() {
+    const next = !hiddenCollapsed;
+    setCollapsedChoice(next);
+    try {
+      onSaved(
+        await invoke<LauncherSettings>("set_hidden_section_collapsed", {
+          collapsed: next,
+        })
+      );
+    } catch (err) {
+      const msg = `Could not save the list state: ${errMsg(err)}`;
+      setFormError(msg);
+      onError(msg);
+    }
+  }
 
   return (
     <div className="launcher-extras">
@@ -1233,9 +1263,20 @@ function LauncherExtras({
 
       {hidden.length > 0 && (
         <div className="hidden-programs">
-          <span className="field-label">
-            Hidden programs ({hidden.length})
-          </span>
+          <button
+            type="button"
+            className="collapse-head"
+            onClick={() => void handleToggleHiddenCollapsed()}
+            aria-expanded={!hiddenCollapsed}
+          >
+            <span className="field-label">
+              Hidden programs ({hidden.length})
+            </span>
+            <span className="collapse-chevron" aria-hidden="true">
+              {hiddenCollapsed ? "▸" : "▾"}
+            </span>
+          </button>
+          {!hiddenCollapsed && (
           <ul className="hidden-list">
             {hidden.map((id) => {
               const name = programs.find((p) => p.id === id)?.name;
@@ -1255,6 +1296,7 @@ function LauncherExtras({
               );
             })}
           </ul>
+          )}
         </div>
       )}
 
@@ -1292,6 +1334,10 @@ function IntroOverlay({ onGotIt }: { onGotIt: () => void }) {
     {
       title: "Launcher shortcuts",
       body: "Type =2+2 to calculate, >lock to lock your PC (destructive commands ask first), ?cats for a web search. Paste any URL to add it as an app.",
+    },
+    {
+      title: "Routines open your whole morning at once",
+      body: "A routine opens a set of apps and accounts with one click or one keystroke. Set them up in the Routines section below. For example, 'Morning' can open your work email, your main chat account, and a dashboard.",
     },
   ];
   return (
@@ -1353,8 +1399,9 @@ function VersionLine() {
 
 /**
  * Self-update UI. Manual "Check for updates" → download with progress →
- * "Restart to finish" (never force-restarted). Any manual-check throw is a
- * neutral "No updates found", never an error popup.
+ * "Restart to finish" (never force-restarted). A failed check says
+ * "Couldn't reach the update server." — never a silent "no updates" and
+ * never an error popup.
  *
  * The automatic check also lives here: once on mount when `autoCheck` is
  * on, then every 24h (skipped while the window is hidden). A found update
@@ -1370,7 +1417,7 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
 
   async function adoptFoundUpdate() {
     try {
-      const update = await check();
+      const update = await check({ timeout: 30_000 });
       if (update) {
         pending.current = update;
         setStatus({ kind: "available", version: update.version });
@@ -1398,7 +1445,7 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
     setStatus({ kind: "checking" });
     pending.current = null;
     try {
-      const update = await check();
+      const update = await check({ timeout: 30_000 });
       if (!update) {
         setStatus({ kind: "uptodate" });
       } else {
@@ -1457,7 +1504,7 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
           {status.kind === "idle" && "Never checked this session."}
           {status.kind === "checking" && "Checking…"}
           {status.kind === "uptodate" && "You're up to date."}
-          {status.kind === "none" && "No updates found."}
+          {status.kind === "none" && "Couldn't reach the update server."}
           {status.kind === "available" &&
             `Version ${status.version} is available.`}
           {status.kind === "downloading" &&
@@ -1506,6 +1553,7 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
 
 export default function App() {
   const [apps, setApps] = useState<WebApp[]>([]);
+  const [routines, setRoutines] = useState<Routine[]>([]);
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1534,6 +1582,10 @@ export default function App() {
   const [launcherPanelOpen, setLauncherPanelOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
+  // v0.8.0 workspaces: owned here so the launcher filter and the library
+  // section share it. Refreshed on `appmaka:workspace-changed` (fired by
+  // set_active_workspace, including workspace hotkey presses).
+  const [workspaceList, setWorkspaceList] = useState<WorkspaceList | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   // Refresh the program list whenever a scan finishes (startup scan or a
@@ -1596,16 +1648,19 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const [list, info, progList, launchSettings] = await Promise.all([
-        invoke<WebApp[]>("list_apps"),
-        invoke<PlatformInfo>("platform_info"),
-        invoke<NativeProgram[]>("list_programs"),
-        invoke<LauncherSettings>("get_launcher_settings"),
-      ]);
+      const [list, info, progList, launchSettings, routineList] =
+        await Promise.all([
+          invoke<WebApp[]>("list_apps"),
+          invoke<PlatformInfo>("platform_info"),
+          invoke<NativeProgram[]>("list_programs"),
+          invoke<LauncherSettings>("get_launcher_settings"),
+          invoke<Routine[]>("list_routines"),
+        ]);
       setApps(list.map((a) => ({ ...a, accounts: a.accounts ?? [], settings: a.settings ?? DEFAULT_SETTINGS })));
       setPlatform(info);
       setPrograms(progList);
       setLauncherSettings(launchSettings);
+      setRoutines(routineList);
       // Backfill logos for apps added before icon caching existed (or where
       // the fetch failed last time). Best-effort, in the background.
       for (const a of list) {
@@ -1665,6 +1720,39 @@ export default function App() {
     searchRef.current?.focus();
     searchRef.current?.select();
   }, [summonCount]);
+
+  // v0.8.0 workspaces: load once; the backend emits
+  // `appmaka:workspace-changed` whenever the active workspace changes
+  // (including via a workspace hotkey while the library section is
+  // unmounted). Lives here — not in WorkspacesSection — so the launcher
+  // filter updates in every view.
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => {
+      invoke<WorkspaceList>("list_workspaces")
+        .then((l) => {
+          if (alive) setWorkspaceList(l);
+        })
+        .catch((err) => {
+          if (alive) setError(`Could not load workspaces: ${errMsg(err)}`);
+        });
+    };
+    refresh();
+    let off: (() => void) | undefined;
+    listen("appmaka:workspace-changed", refresh)
+      .then((u) => {
+        off = u;
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      off?.();
+    };
+  }, []);
+
+  // v0.8.0: dispatch global hotkey presses (routines / workspaces /
+  // per-command hotkeys) to the existing invoke commands.
+  useHotkeyDispatch(apps, setError);
 
   // View-switch events from the backend: tray "Show library" and the hotkey
   // summon (which always resets to the spotlight view).
@@ -2060,13 +2148,22 @@ export default function App() {
     }),
     [launcherSettings]
   );
-  const items = useMemo(
+  // v0.8.0 workspaces: filter apps/accounts to the active workspace.
+  // Programs and launcher commands stay visible (programs can't be
+  // workspace members; hiding them would strand access).
+  const activeWorkspace = useMemo(
     () =>
-      query.trim()
-        ? buildResults(query, apps, programs, sortOpts)
-        : browseAll(apps, programs, sortOpts),
-    [query, apps, programs, sortOpts]
+      workspaceList?.workspaces.find(
+        (w) => w.id === workspaceList.active_workspace_id
+      ) ?? null,
+    [workspaceList]
   );
+  const items = useMemo(() => {
+    const scopedApps = filterAppsByWorkspace(apps, activeWorkspace);
+    return query.trim()
+      ? buildResults(query, scopedApps, programs, routines, sortOpts)
+      : browseAll(scopedApps, programs, sortOpts);
+  }, [query, apps, programs, routines, sortOpts, activeWorkspace]);
 
   // v0.7.0: built-in launcher commands (=calc, >system, ?web-search,
   // URL quick-add). Prefix commands take precedence over app/program
@@ -2114,6 +2211,13 @@ export default function App() {
           setError(errMsg(err));
         }
       },
+      onRevealProgramLocation: async (program) => {
+        try {
+          await revealItemInDir(program.exe_path);
+        } catch (err) {
+          setError(errMsg(err));
+        }
+      },
       onRemoveCustomProgram: async (programId) => {
         try {
           await invoke("remove_custom_program", { programId });
@@ -2149,7 +2253,13 @@ export default function App() {
   async function activateResult(r: SearchResult) {
     setError(null);
     try {
-      if (r.kind === "program") {
+      if (r.kind === "routine") {
+        // camelCase invoke arg for the snake_case Rust param `routine_id`.
+        const summary = await invoke<string>("run_routine", {
+          routineId: r.routine.id,
+        });
+        setNotice(`${r.routine.name}: ${summary}`);
+      } else if (r.kind === "program") {
         await invoke("launch_program", { id: r.program.id });
       } else if (r.kind === "account") {
         const ok = await handleOpenAccount(r.app, r.account);
@@ -2205,6 +2315,12 @@ export default function App() {
 
   function renderResultIcon(r: SearchResult): React.ReactNode {
     if (r.kind === "program") return <ProgramIcon program={r.program} />;
+    if (r.kind === "routine")
+      return (
+        <span className="app-icon-fallback" aria-hidden="true">
+          {r.routine.name.charAt(0).toUpperCase() || "?"}
+        </span>
+      );
     if (r.kind === "account")
       return <AccountThumb account={r.account} app={r.app} />;
     return <AppIcon app={r.app} />;
@@ -2268,6 +2384,50 @@ export default function App() {
             onKeyDown={onSearchKeyDown}
             inputRef={searchRef}
           />
+          {workspaceList && workspaceList.workspaces.length > 0 && (
+            <div
+              className="workspace-chips"
+              role="group"
+              aria-label="Workspace filter"
+            >
+              <button
+                className={`workspace-chip${
+                  workspaceList.active_workspace_id === null
+                    ? " is-active"
+                    : ""
+                }`}
+                onClick={() =>
+                  void invoke<WorkspaceList>("set_active_workspace", {
+                    workspaceId: null,
+                  })
+                    .then(setWorkspaceList)
+                    .catch((err) => setError(errMsg(err)))
+                }
+              >
+                All
+              </button>
+              {workspaceList.workspaces.map((ws) => (
+                <button
+                  key={ws.id}
+                  className={`workspace-chip${
+                    workspaceList.active_workspace_id === ws.id
+                      ? " is-active"
+                      : ""
+                  }`}
+                  title={ws.hotkey ? `Hotkey: ${ws.hotkey}` : undefined}
+                  onClick={() =>
+                    void invoke<WorkspaceList>("set_active_workspace", {
+                      workspaceId: ws.id,
+                    })
+                      .then(setWorkspaceList)
+                      .catch((err) => setError(errMsg(err)))
+                  }
+                >
+                  {ws.name}
+                </button>
+              ))}
+            </div>
+          )}
           {banners}
           <div className="folder-grid-wrap">
             {command && (
@@ -2325,7 +2485,8 @@ export default function App() {
               />
             </span>
             <span className="muted small">
-              {apps.length} web apps · {programs.length} programs
+              {apps.length} {apps.length === 1 ? "web app" : "web apps"} ·{" "}
+              {programs.length} {programs.length === 1 ? "program" : "programs"}
             </span>
           </footer>
         </div>
@@ -2522,6 +2683,18 @@ export default function App() {
 
       <section className="panel">
         <div className="panel-head">
+          <h2>Workspaces</h2>
+        </div>
+        <WorkspacesSection
+          apps={apps}
+          list={workspaceList}
+          onList={setWorkspaceList}
+          onError={setError}
+        />
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
           <h2>Memory</h2>
           <button
             className="text-button"
@@ -2587,10 +2760,27 @@ export default function App() {
                 onProgramsRefreshed={setPrograms}
                 onError={setError}
               />
+              <CmdHotkeysSection apps={apps} onError={setError} />
             </>
           ) : (
             <p className="muted">Loading…</p>
           ))}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Routines</h2>
+        </div>
+        <p className="muted small">
+          Open a set of apps and accounts with one click or one keystroke.
+          For example, "Morning" can open your work email, your main chat
+          account, and a dashboard.
+        </p>
+        <RoutinesSection
+          apps={apps}
+          programs={programs}
+          onChanged={(list) => setRoutines(list)}
+        />
       </section>
 
       <section className="panel">

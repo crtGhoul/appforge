@@ -101,6 +101,12 @@ export interface LauncherSettings {
   auto_update_check: boolean;
   /** Web-search engine for the launcher's `?query` command. Backend always sends it (serde default). */
   search_engine: "duckduckgo" | "google";
+  /**
+   * Whether the library's "Hidden programs" list is collapsed. Null when the
+   * user never toggled it: the UI then defaults to collapsed whenever the
+   * list is non-empty.
+   */
+  hidden_section_collapsed: boolean | null;
 }
 
 /**
@@ -172,4 +178,30 @@ export interface MemorySnapshot {
   topChildren: Array<{ name: string; rssKb: number }>;
   /** False on platforms where memory numbers aren't available. */
   supported: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 — routines ("morning stack")
+// ---------------------------------------------------------------------------
+
+/**
+ * One item in a routine. `kind` is "account" (opens app_id + account_id in
+ * an account window) or "program" (launches the native program_id).
+ * Struct fields stay snake_case in JSON (serde) — unlike invoke args,
+ * which are camelCase.
+ */
+export interface RoutineItem {
+  kind: "account" | "program";
+  app_id: string;
+  account_id: string | null;
+  program_id: string | null;
+}
+
+/** A named, hotkey-able set of things to open together. */
+export interface Routine {
+  id: string;
+  name: string;
+  /** Global hotkey like "Ctrl+Alt+M", or null for none. */
+  hotkey: string | null;
+  items: RoutineItem[];
 }

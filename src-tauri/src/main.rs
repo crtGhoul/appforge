@@ -7,10 +7,13 @@ mod favicon;
 mod favicon_parse;
 mod launcher;
 mod launcher_ext;
+mod hotkeys;
+mod workspaces;
 mod launcher_settings;
 mod links;
 mod page_title;
 mod preview;
+mod routines;
 mod store;
 mod syscmd;
 mod windows;
@@ -595,11 +598,21 @@ fn main() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state
                         == tauri_plugin_global_shortcut::ShortcutState::Pressed
                     {
-                        toggle_main_window(app);
+                        // Named hotkey bindings (routines / workspaces /
+                        // per-command hotkeys) dispatch through the shared
+                        // registry. Anything with no binding — the launcher
+                        // summon hotkey — keeps the old behavior.
+                        if let Some((binding_id, kind)) =
+                            crate::hotkeys::lookup_binding(app, shortcut.id())
+                        {
+                            crate::hotkeys::emit_hotkey_fired(app, &binding_id, &kind);
+                        } else {
+                            toggle_main_window(app);
+                        }
                     }
                 })
                 .build(),
@@ -679,6 +692,15 @@ fn main() {
                 }
             }
             app.manage(Mutex::new(settings));
+            // Named hotkey registry (v0.8.0): one registry for routine /
+            // workspace / per-command hotkeys so the global-shortcut
+            // handler can dispatch presses. register_all_saved reads
+            // routines.json, workspaces.json and cmdhotkeys.json and
+            // registers each saved hotkey best-effort; a failure is
+            // recorded in the binding status (UI warns) and logged —
+            // startup never crashes on a hotkey.
+            crate::hotkeys::init_registry(app.handle());
+            crate::hotkeys::register_all_saved(app.handle());
             // First program scan runs in the background; results land in the
             // cache and are picked up by list_programs.
             {
@@ -799,6 +821,24 @@ fn main() {
             downloads::set_download_dir,
             // v0.7.0: launcher search-engine setting
             launcher_settings::set_search_engine,
+            // v0.8.0: hidden-programs collapse state (polish)
+            launcher_settings::set_hidden_section_collapsed,
+            // v0.8.0: centralized hotkey registry + per-command hotkeys
+            hotkeys::list_cmdhotkeys,
+            hotkeys::save_cmdhotkey,
+            hotkeys::delete_cmdhotkey,
+            hotkeys::get_binding_status,
+            // v0.8.0: routines ("morning stack")
+            routines::list_routines,
+            routines::save_routine,
+            routines::delete_routine,
+            routines::run_routine,
+            // v0.8.0: workspaces
+            workspaces::list_workspaces,
+            workspaces::save_workspace,
+            workspaces::delete_workspace,
+            workspaces::set_active_workspace,
+            workspaces::create_workspace_from_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
