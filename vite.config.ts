@@ -12,6 +12,21 @@ export default defineConfig(async () => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+  // 2. the preview control window is a second page: its script is bundled
+  //    (it needs @tauri-apps/api, which plain public/ files can't import).
+  //    The entry HTML sits at the project ROOT so Vite emits it as
+  //    dist/preview-header.html — the backend loads
+  //    WebviewUrl::App("preview-header.html"). (A src/ entry would be
+  //    mirrored to dist/src/preview-header.html, which the backend would
+  //    not find.)
+  build: {
+    rollupOptions: {
+      input: {
+        main: "index.html",
+        "preview-header": "preview-header.html",
+      },
+    },
+  },
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

@@ -101,6 +101,7 @@
   .primary:hover:not(:disabled) { background: #4338ca; }
   .ghost { background: transparent; color: #5b5e66; border-color: #d4d7dc; }
   .ghost:hover:not(:disabled) { background: #eceef1; }
+  .ghost.small { padding: 6px 10px; font-weight: 500; }
   .error { color: #b3261e; font-size: 12px; flex: none; }
 </style>
 </head>
@@ -118,55 +119,8 @@
     <span class="error" id="msg" role="alert"></span>
     <button id="add" class="action primary">Add to the Forge</button>
     <button id="discard" class="action ghost">Discard</button>
+    <button id="reload" class="action ghost small" title="Reload the preview page">↻ Reload</button>
   </div>
-<script>
-(function () {
-  "use strict";
-  var id = window.__APPFORGE_PREVIEW_ID__;
-  var url = window.__APPFORGE_PREVIEW_URL__ || "";
-  var msg = document.getElementById("msg");
-  var addBtn = document.getElementById("add");
-  var discardBtn = document.getElementById("discard");
-  document.getElementById("url").textContent = url;
-  document.getElementById("dismiss").addEventListener("click", function () {
-    document.getElementById("banner").classList.add("hidden");
-  });
-
-  function setBusy(busy) {
-    addBtn.disabled = busy;
-    discardBtn.disabled = busy;
-  }
-  function fail(text) {
-    msg.textContent = text || "Something went wrong.";
-    setBusy(false);
-  }
-  function getInvoke() {
-    // Tauri exposes Rust snake_case params as camelCase to JS.
-    if (!id || !window.__TAURI__ || !window.__TAURI__.core || !window.__TAURI__.core.invoke) {
-      fail("Preview bridge unavailable — close this window and try again.");
-      return null;
-    }
-    return window.__TAURI__.core.invoke;
-  }
-
-  addBtn.addEventListener("click", function () {
-    var invoke = getInvoke();
-    if (!invoke) return;
-    setBusy(true);
-    msg.textContent = "";
-    var label = document.getElementById("label").value.trim();
-    // The backend closes this window on success, so this promise may never
-    // resolve — that is the happy path, not an error.
-    invoke("preview_add", { previewId: id, label: label || null }).catch(fail);
-  });
-
-  discardBtn.addEventListener("click", function () {
-    var invoke = getInvoke();
-    if (!invoke) return;
-    setBusy(true);
-    invoke("preview_discard", { previewId: id }).catch(fail);
-  });
-})();
-</script>
+<script type="module" src="./src/preview-header.ts"></script>
 </body>
 </html>

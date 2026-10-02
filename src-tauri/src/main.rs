@@ -259,6 +259,13 @@ fn preview_discard(app: AppHandle, preview_id: String) -> Result<(), String> {
     preview::discard_preview(&app, &preview_id)
 }
 
+/// Reload the preview's site window (the control strip's refresh button).
+/// Tauri exposes `preview_id` as `previewId` to JS.
+#[tauri::command]
+fn preview_reload(app: AppHandle, preview_id: String) -> Result<(), String> {
+    preview::reload_preview(&app, &preview_id)
+}
+
 /// Turn a preview into a real app: the signed-in throwaway session becomes
 /// the new app's first account. The frontend sends `label` for the account
 /// (empty = "Main"). Tauri exposes `preview_id` as `previewId` to JS.
@@ -512,6 +519,7 @@ fn main() {
             preview_start,
             preview_discard,
             preview_add,
+            preview_reload,
             get_launcher_settings,
             set_hotkey,
             set_autostart,

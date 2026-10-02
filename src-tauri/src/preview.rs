@@ -280,6 +280,17 @@ pub fn discard_preview(app: &AppHandle, preview_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Reload the preview's site window (the control strip's refresh button).
+/// Only the site webview is reloaded; the temp session is untouched.
+pub fn reload_preview(app: &AppHandle, preview_id: &str) -> Result<(), String> {
+    let window = app
+        .get_webview_window(&site_window_label(preview_id))
+        .ok_or_else(|| "Preview not found.".to_string())?;
+    window
+        .eval("window.location.reload()")
+        .map_err(|e| format!("could not reload preview: {e}"))
+}
+
 /// Turn a preview into a real app: the temp session dir becomes the new
 /// app's first account session dir, preserving the sign-in the user just
 /// completed. The preview windows are closed *before* the move so WebView2
