@@ -117,6 +117,23 @@ fn rename_account(
     store.rename_account(&app_id, &account_id, label)
 }
 
+/// Edit an account's label, color, and per-account popup policy override.
+/// Tauri exposes the snake_case params as camelCase to JS: invoke as
+/// `invoke("update_account", { appId, accountId, label, color, popupPolicy })`
+/// — `popupPolicy` is `null` for "use app setting", `"block"` or `"allow"`
+/// for an override.
+#[tauri::command]
+fn update_account(
+    app_id: String,
+    account_id: String,
+    label: String,
+    color: String,
+    popup_policy: Option<String>,
+    store: State<'_, AppStore>,
+) -> Result<WebApp, String> {
+    store.update_account(&app_id, &account_id, label, color, popup_policy)
+}
+
 /// Opens the account's window. ASYNC ON PURPOSE: on Windows,
 /// `WebviewWindowBuilder::build()` deadlocks when called from a synchronous
 /// Tauri command (the command body runs on a WebView2 IPC thread; see
@@ -650,6 +667,7 @@ fn main() {
             update_app_settings,
             add_account,
             rename_account,
+            update_account,
             remove_account,
             open_account,
             suspend_account,

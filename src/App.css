@@ -353,6 +353,22 @@ input[type="color"] {
   color: #5b5e66;
 }
 
+.popup-badge {
+  font-size: 11px;
+  color: #4f46e5;
+  background: rgba(79, 70, 229, 0.1);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .popup-badge {
+    background: rgba(129, 140, 248, 0.18);
+    color: #a5b4fc;
+  }
+}
+
 .inline-form {
   display: flex;
   gap: 10px;

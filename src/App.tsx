@@ -422,6 +422,7 @@ function AccountRow({
   onSuspend,
   onRemove,
   onRename,
+  onEdit,
 }: {
   account: Account;
   app: WebApp;
@@ -429,6 +430,7 @@ function AccountRow({
   onSuspend: () => void;
   onRemove: () => void;
   onRename: (label: string) => void;
+  onEdit: () => void;
 }) {
   return (
     <li className="account-row">
@@ -441,15 +443,177 @@ function AccountRow({
           maxLength={60}
         />
         <span className="account-opened">{openedLabel(account.last_opened)}</span>
+        {account.popup_policy && (
+          <span
+            className="popup-badge"
+            title="Per-account popup override (inherits app setting otherwise)"
+          >
+            Popups: {account.popup_policy === "allow" ? "allowed" : "blocked"}
+          </span>
+        )}
       </div>
       <div className="app-actions">
         <button onClick={onOpen}>Open</button>
         <button onClick={onSuspend}>Suspend</button>
+        <button className="text-button" onClick={onEdit}>
+          Edit
+        </button>
         <button className="danger" onClick={onRemove}>
           Remove
         </button>
       </div>
     </li>
+  );
+}
+
+/**
+ * Per-account edit dialog: label, color, and a three-way popup policy
+ * choice — inherit the app's setting, allow, or block popups.
+ */
+function EditAccountDialog({
+  app,
+  account,
+  onClose,
+  onSaved,
+}: {
+  app: WebApp;
+  account: Account;
+  onClose: () => void;
+  onSaved: (app: WebApp) => void;
+}) {
+  const [label, setLabel] = useState(account.label);
+  const [color, setColor] = useState(safeColor(account.color));
+  const [popupChoice, setPopupChoice] = useState<"inherit" | "block" | "allow">(
+    account.popup_policy ?? "inherit"
+  );
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  // Escape closes the dialog.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setFormError(null);
+    const cleanLabel = label.trim();
+    if (!cleanLabel) {
+      setFormError("Give the account a label.");
+      return;
+    }
+    if (!isValidHexColor(color)) {
+      setFormError("Color must look like #6366f1.");
+      return;
+    }
+    setSaving(true);
+    try {
+      // Tauri exposes Rust snake_case params as camelCase to JS; null means
+      // "inherit the app setting" and deserializes to Rust's None.
+      const updated = await invoke<WebApp>("update_account", {
+        appId: app.id,
+        accountId: account.id,
+        label: cleanLabel,
+        color,
+        popupPolicy: popupChoice === "inherit" ? null : popupChoice,
+      });
+      onSaved(updated);
+    } catch (err) {
+      setFormError(errMsg(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="dialog-overlay"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Edit account ${account.label}`}
+    >
+      <div className="dialog" onClick={(e) => e.stopPropagation()}>
+        <h3>Edit account</h3>
+        <form onSubmit={(e) => void handleSave(e)}>
+          <label>
+            <span>Label</span>
+            <input
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              maxLength={60}
+              autoComplete="off"
+            />
+          </label>
+          <label>
+            <span>Color</span>
+            <span className="color-row">
+              <input
+                type="color"
+                value={safeColor(color)}
+                onChange={(e) => setColor(e.target.value)}
+                aria-label="Account color"
+              />
+              <input
+                value={color}
+                onChange={(e) => setColor(e.target.value)}
+                maxLength={7}
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="Color hex value"
+              />
+            </span>
+          </label>
+          <fieldset className="radio-group">
+            <legend>Popup blocking</legend>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-popup-policy"
+                checked={popupChoice === "inherit"}
+                onChange={() => setPopupChoice("inherit")}
+              />
+              <span>Use app setting (currently {app.settings.popup_policy})</span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-popup-policy"
+                checked={popupChoice === "allow"}
+                onChange={() => setPopupChoice("allow")}
+              />
+              <span>Allow popups</span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-popup-policy"
+                checked={popupChoice === "block"}
+                onChange={() => setPopupChoice("block")}
+              />
+              <span>Block popups</span>
+            </label>
+          </fieldset>
+          {formError && (
+            <p className="form-error" role="alert">
+              {formError}
+            </p>
+          )}
+          <div className="dialog-actions">
+            <button type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" disabled={saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -1271,6 +1435,10 @@ export default function App() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [settingsOpen, setSettingsOpen] = useState<Set<string>>(new Set());
   const [editingApp, setEditingApp] = useState<WebApp | null>(null);
+  const [editingAccount, setEditingAccount] = useState<{
+    app: WebApp;
+    account: Account;
+  } | null>(null);
 
   // Launcher: hotkey-summoned search over apps, accounts, and programs.
   const [programs, setPrograms] = useState<NativeProgram[]>([]);
@@ -2140,6 +2308,7 @@ export default function App() {
                               onSuspend={() => void handleSuspendAccount(app, account)}
                               onRemove={() => void handleRemoveAccount(app, account)}
                               onRename={(label) => void handleRenameAccount(app, account, label)}
+                              onEdit={() => setEditingAccount({ app, account })}
                             />
                           ))}
                         </ul>
@@ -2240,6 +2409,18 @@ export default function App() {
           onSaved={(updated) => {
             replaceApp(updated);
             setEditingApp(null);
+          }}
+        />
+      )}
+
+      {editingAccount && (
+        <EditAccountDialog
+          app={editingAccount.app}
+          account={editingAccount.account}
+          onClose={() => setEditingAccount(null)}
+          onSaved={(updated) => {
+            replaceApp(updated);
+            setEditingAccount(null);
           }}
         />
       )}

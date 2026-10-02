@@ -30,6 +30,11 @@ export interface Account {
   session_dir: string;
   /** Locally cached og:image thumbnail for the account tile (may be null). */
   thumbnail: string | null;
+  /**
+   * Per-account popup policy override: "block" | "allow".
+   * `null` (or missing on old records) = inherit the app's setting.
+   */
+  popup_policy?: "block" | "allow" | null;
   last_opened: number;
   created_at: number;
 }

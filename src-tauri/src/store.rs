@@ -90,6 +90,11 @@ pub struct Account {
     /// Old records without it migrate via the serde default.
     #[serde(default)]
     pub thumbnail: Option<String>,
+    /// Per-account popup policy override: "block" or "allow".
+    /// `None` = inherit the app's `settings.popup_policy`. Old records
+    /// without it migrate via the serde default.
+    #[serde(default)]
+    pub popup_policy: Option<String>,
     pub last_opened: u64,
     pub created_at: u64,
 }
@@ -313,6 +318,7 @@ impl AppStore {
                     color: DEFAULT_COLOR.to_string(),
                     session_dir: session_dir.to_string_lossy().into_owned(),
                     thumbnail: None,
+                    popup_policy: None,
                     last_opened: 0,
                     created_at: now,
                 }],
@@ -413,6 +419,7 @@ impl AppStore {
                 color: DEFAULT_COLOR.to_string(),
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail: None,
+                popup_policy: None,
                 last_opened: 0,
                 created_at: now,
             }],
@@ -485,6 +492,7 @@ impl AppStore {
                 color: DEFAULT_COLOR.to_string(),
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail,
+                popup_policy: None,
                 last_opened: 0,
                 created_at: now,
             };
@@ -533,6 +541,7 @@ impl AppStore {
                 color: DEFAULT_COLOR.to_string(),
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail,
+                popup_policy: None,
                 last_opened: 0,
                 created_at: now,
             }],
@@ -631,6 +640,60 @@ impl AppStore {
                 .ok_or_else(|| "Account not found.".to_string())?;
             account.label = label;
             account.clone()
+        };
+        self.save()?;
+        Ok(updated)
+    }
+
+    /// Edit an account's label, color, and per-account popup policy override.
+    /// `popup_policy` is `None` = inherit the app's setting, `Some("block")`
+    /// or `Some("allow")` = override. Anything else is rejected so a bad
+    /// value can never be persisted even if invoked directly.
+    pub fn update_account(
+        &self,
+        app_id: &str,
+        account_id: &str,
+        label: String,
+        color: String,
+        popup_policy: Option<String>,
+    ) -> Result<WebApp, String> {
+        let label = label.trim().to_string();
+        if label.is_empty() {
+            return Err("Account label is required.".to_string());
+        }
+        if label.chars().count() > 60 {
+            return Err("Account label is too long (60 characters max).".to_string());
+        }
+        let color = normalize_hex_color(&color)
+            .ok_or_else(|| "Color must be a hex color like #6366f1.".to_string())?;
+        let popup_policy = match popup_policy {
+            None => None,
+            Some(p) => {
+                let p = p.trim().to_lowercase();
+                if p != "block" && p != "allow" {
+                    return Err("Popup policy must be \"block\" or \"allow\".".to_string());
+                }
+                Some(p)
+            }
+        };
+        let updated = {
+            let mut apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            let app = apps
+                .iter_mut()
+                .find(|a| a.id == app_id)
+                .ok_or_else(|| "App not found.".to_string())?;
+            let account = app
+                .accounts
+                .iter_mut()
+                .find(|ac| ac.id == account_id)
+                .ok_or_else(|| "Account not found.".to_string())?;
+            account.label = label;
+            account.color = color;
+            account.popup_policy = popup_policy;
+            app.clone()
         };
         self.save()?;
         Ok(updated)
@@ -745,6 +808,7 @@ impl AppStore {
                     .unwrap_or_else(|| app.color.clone()),
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail,
+                popup_policy: None,
                 last_opened: 0,
                 created_at: now,
             };

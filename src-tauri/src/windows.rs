@@ -127,6 +127,11 @@ pub fn open_account(
     // The stored absolute path is the source of truth for the data directory.
     let session_dir = store.session_dir_for(app_id, account_id)?;
 
+    // Per-account override wins; None means "inherit the app setting".
+    let popup_policy = account
+        .popup_policy
+        .clone()
+        .unwrap_or_else(|| web_app.settings.popup_policy.clone());
     let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(page_url))
         .data_directory(session_dir.clone())
         .title(&title)
@@ -139,7 +144,7 @@ pub fn open_account(
             app_name: web_app.name.clone(),
             app_url: web_app.url.clone(),
             session_dir: session_dir.clone(),
-            popup_policy: web_app.settings.popup_policy.clone(),
+            popup_policy,
             popup_allowlist: web_app.settings.popup_allowlist.clone(),
         }));
     // Cosmetic filtering: engine-generated hide selectors injected before
