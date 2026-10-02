@@ -15,7 +15,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AppForge",
+        "title": "AppMaka",
         "width": 680,
         "height": 480,
         "transparent": true
@@ -39,8 +39,8 @@
     "targets": "all",
     "createUpdaterArtifacts": true
   },
-  "identifier": "com.appforge.app",
-  "productName": "AppForge",
+  "identifier": "com.appmaka.app",
+  "productName": "AppMaka",
   "version": "0.6.0",
   "plugins": {
     "updater": {

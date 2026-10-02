@@ -198,7 +198,7 @@ pub(crate) fn cosmetic_init_script(css: &str) -> String {
     format!(
         "(function(){{try{{var css={json_css};\
         var s=document.createElement('style');\
-        s.setAttribute('data-appforge','cosmetic');s.textContent=css;\
+        s.setAttribute('data-appmaka','cosmetic');s.textContent=css;\
         var root=document.head||document.documentElement;\
         if(root){{root.appendChild(s);}}}}catch(e){{}}}})();"
     )
@@ -311,7 +311,7 @@ fn spawn_oauth_modal(
     let home_origin = home_origin.to_string();
     let title = format!("{app_name} — sign-in");
     let _ = std::thread::Builder::new()
-        .name(format!("appforge-oauth-{n}"))
+        .name(format!("appmaka-oauth-{n}"))
         .spawn(move || {
             let json_home =
                 serde_json::to_string(&home_origin).unwrap_or_else(|_| "\"\"".to_string());
@@ -336,7 +336,7 @@ fn spawn_oauth_modal(
             .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
             .build()
             .map_err(|e| {
-                eprintln!("[appforge] oauth modal failed for {app_id}/{account_id}: {e}")
+                eprintln!("[appmaka] oauth modal failed for {app_id}/{account_id}: {e}")
             });
         });
 }
@@ -398,7 +398,7 @@ fn resume_window(app: &AppHandle, label: &str) {
 /// directory on disk preserves the login, so reopening restores it.
 pub fn start_suspend_watcher(app: AppHandle) {
     let _ = std::thread::Builder::new()
-        .name("appforge-suspend".to_string())
+        .name("appmaka-suspend".to_string())
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(60));
             suspend_idle_windows(&app);

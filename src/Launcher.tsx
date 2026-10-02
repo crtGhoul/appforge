@@ -505,7 +505,7 @@ export function LauncherSettingsPanel({
           {saving ? "Saving…" : "Set hotkey"}
         </button>
         <span className="help">
-          Press it anywhere to show or hide AppForge. Examples: Alt+Space, Ctrl+Alt+A.
+          Press it anywhere to show or hide AppMaka. Examples: Alt+Space, Ctrl+Alt+A.
         </span>
       </form>
 
@@ -515,7 +515,7 @@ export function LauncherSettingsPanel({
           checked={autostart}
           onChange={(e) => void handleAutostart(e.target.checked)}
         />
-        <span>Run AppForge when I sign in</span>
+        <span>Run AppMaka when I sign in</span>
       </label>
 
       <label className="slider-row">
@@ -1043,7 +1043,7 @@ export function AddProgramModal({
       >
         <h2 className="modal-title">Add a program</h2>
         <p className="modal-sub">
-          For programs the automatic scan misses — point AppForge at the
+          For programs the automatic scan misses — point AppMaka at the
           executable and it shows up in the launcher.
         </p>
         <form onSubmit={(e) => void submit(e)}>
@@ -1138,13 +1138,13 @@ export function AddProgramButton({
  * Window event fired when the launcher asks the library view to open the
  * Edit dialog for an app. App.tsx needs a one-line listener, e.g.:
  *
- *   window.addEventListener("appforge:edit-app", (e) => {
+ *   window.addEventListener("appmaka:edit-app", (e) => {
  *     const id = (e as CustomEvent).detail?.appId as string | undefined;
  *     const app = apps.find((x) => x.id === id);
  *     if (app) setEditingApp(app);
  *   });
  */
-export const EDIT_APP_EVENT = "appforge:edit-app";
+export const EDIT_APP_EVENT = "appmaka:edit-app";
 
 /**
  * Switch the main window back to the library view (through the existing

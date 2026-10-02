@@ -45,11 +45,11 @@ const MOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Event the library window listens for so it can pick up the new app (or
 /// reveal the existing one when the previewed site was already added).
-const PREVIEW_ADDED_EVENT: &str = "appforge:preview-added";
+const PREVIEW_ADDED_EVENT: &str = "appmaka:preview-added";
 
 /// Event the library window listens for so it can clear its "preview opened"
 /// notice when a preview is discarded or closed by hand.
-const PREVIEW_CLOSED_EVENT: &str = "appforge:preview-closed";
+const PREVIEW_CLOSED_EVENT: &str = "appmaka:preview-closed";
 
 /// Control window size in physical pixels (used for placement math).
 /// Tall enough for the sign-in banner row above the controls row.
@@ -172,7 +172,7 @@ pub fn start_preview(
             WebviewUrl::External(page_url),
         )
         .data_directory(session_dir.clone())
-        .title(format!("AppForge Preview — {url}"))
+        .title(format!("AppMaka Preview — {url}"))
         .inner_size(1200.0, 800.0)
         .center()
         .on_new_window(windows::make_popup_handler(PopupContext {
@@ -232,12 +232,12 @@ pub fn start_preview(
             control_window_label(&id),
             WebviewUrl::App("preview-header.html".into()),
         )
-        .title("AppForge Preview")
+        .title("AppMaka Preview")
         .inner_size(CONTROL_W as f64, CONTROL_H as f64)
         .always_on_top(true)
         .initialization_script(format!(
-            "window.__APPFORGE_PREVIEW_ID__={json_id};\
-             window.__APPFORGE_PREVIEW_URL__={json_url};"
+            "window.__APPMAKA_PREVIEW_ID__={json_id};\
+             window.__APPMAKA_PREVIEW_URL__={json_url};"
         ))
         .build()
         .map_err(|e| format!("could not open preview controls: {e}"))?;
@@ -402,7 +402,7 @@ pub(crate) fn move_session_dir(src: &Path, dst: &Path) -> Result<(), String> {
             }
         }
     }
-    eprintln!("[appforge] preview session move failed after retries: {last_err}; starting with a fresh session");
+    eprintln!("[appmaka] preview session move failed after retries: {last_err}; starting with a fresh session");
     std::fs::create_dir_all(dst).map_err(|e| format!("could not create session dir: {e}"))?;
     Ok(())
 }

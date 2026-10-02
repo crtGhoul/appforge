@@ -1,6 +1,6 @@
 name: linux-build
 
-# AppForge — Linux packaging pipeline.
+# AppMaka — Linux packaging pipeline.
 # Produces AppImage + .deb on ubuntu-24.04.
 # Windows-only features (network ad-blocking, window suspend) are labeled
 # honestly in the app and gracefully degrade on Linux.
@@ -62,7 +62,7 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: appforge-linux-packages
+          name: appmaka-linux-packages
           path: |
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/deb/*.deb
@@ -71,6 +71,6 @@ jobs:
       - name: Upload updater signatures
         uses: actions/upload-artifact@v4
         with:
-          name: appforge-linux-updater-sigs
+          name: appmaka-linux-updater-sigs
           path: src-tauri/target/release/bundle/**/*.sig
           if-no-files-found: error

@@ -53,8 +53,8 @@ custom-protocol = ["tauri/custom-protocol"]
 default = ["custom-protocol"]
 
 [package]
-authors = ["AppForge"]
+authors = ["AppMaka"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
-name = "appforge"
+name = "appmaka"
 version = "0.6.0"

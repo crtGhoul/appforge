@@ -96,7 +96,7 @@ impl AdblockState {
                         newest = newest.max(fetched_at);
                     }
                 }
-                Err(e) => eprintln!("[appforge] filter list {file} unavailable: {e}"),
+                Err(e) => eprintln!("[appmaka] filter list {file} unavailable: {e}"),
             }
         }
         if lists.is_empty() {

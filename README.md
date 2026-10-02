@@ -1,11 +1,11 @@
-# AppForge (working title)
+# AppMaka (working title)
 
 Turn any website into a desktop web app. Add a site by name + URL, and it
 opens in its own dedicated window — no browser tabs, no address bar clutter.
 
 **Status: launcher build.** Multi-account isolation, popup blocking,
 network-level ad blocking, and auto-suspend are in. This build adds launcher
-mode: press **Alt+Space** anywhere to summon AppForge, type to fuzzy-search
+mode: press **Alt+Space** anywhere to summon AppMaka, type to fuzzy-search
 your web apps, accounts, and installed programs, and hit Enter.
 
 ## What exists
@@ -20,7 +20,7 @@ your web apps, accounts, and installed programs, and hit Enter.
   per-app settings (popups, ad blocking, auto-suspend), and launcher
   settings (hotkey, run at startup, program rescan). Opened from the tray
   menu or the overlay; the hotkey always returns to the spotlight view.
-- **Native programs** — on Windows, AppForge scans the Start Menu shortcuts
+- **Native programs** — on Windows, AppMaka scans the Start Menu shortcuts
   (all-users + per-user) and Desktop shortcuts (per-user + public), resolves each `.lnk` to its target `.exe`,
   de-dupes, and extracts the exe's icon to PNG (best-effort; a letter glyph
   otherwise). On Linux it reads `.desktop` files. Programs launch through
@@ -59,7 +59,7 @@ your web apps, accounts, and installed programs, and hit Enter.
   itself (`apps.json.corrupt-<timestamp>.bak`) and replaced with a fresh
   empty library.
 - **No credential handling** — you sign in directly on each site's own page
-  inside its app window. AppForge never sees, stores, or transmits passwords.
+  inside its app window. AppMaka never sees, stores, or transmits passwords.
 
 ## Project layout
 

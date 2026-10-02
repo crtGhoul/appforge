@@ -258,7 +258,7 @@ function PreviewSignInForm({ onError }: { onError: (msg: string) => void }) {
   // the "preview opened" notice when that happens.
   useEffect(() => {
     let off: (() => void) | undefined;
-    listen("appforge:preview-closed", () => setPreviewOpen(false))
+    listen("appmaka:preview-closed", () => setPreviewOpen(false))
       .then((unlisten) => {
         off = unlisten;
       })
@@ -1094,7 +1094,7 @@ function IntroOverlay({ onGotIt }: { onGotIt: () => void }) {
     },
     {
       title: "Sign in safely",
-      body: "\u201CPreview & sign in\u201D opens the real site in a throwaway window. You sign in there yourself — AppForge never sees your password.",
+      body: "\u201CPreview & sign in\u201D opens the real site in a throwaway window. You sign in there yourself — AppMaka never sees your password.",
     },
     {
       title: "Tidy the launcher",
@@ -1106,7 +1106,7 @@ function IntroOverlay({ onGotIt }: { onGotIt: () => void }) {
       className="dialog-overlay"
       role="dialog"
       aria-modal="true"
-      aria-label="Welcome to AppForge"
+      aria-label="Welcome to AppMaka"
     >
       <div className="dialog intro-dialog">
         <h3>The 30-second tour</h3>
@@ -1424,12 +1424,12 @@ export default function App() {
   useEffect(() => {
     let offLibrary: (() => void) | undefined;
     let offLauncher: (() => void) | undefined;
-    listen("appforge:show-library", () => setView("library"))
+    listen("appmaka:show-library", () => setView("library"))
       .then((off) => {
         offLibrary = off;
       })
       .catch(() => {});
-    listen("appforge:show-launcher", () => {
+    listen("appmaka:show-launcher", () => {
       setView("launcher");
       setSummonCount((c) => c + 1);
     })
@@ -1449,7 +1449,7 @@ export default function App() {
   // becomes a new account on the existing app instead.
   useEffect(() => {
     let off: (() => void) | undefined;
-    listen<PreviewAddOutcome>("appforge:preview-added", (event) => {
+    listen<PreviewAddOutcome>("appmaka:preview-added", (event) => {
       const created = {
         ...event.payload.app,
         accounts: event.payload.app.accounts ?? [],
@@ -2007,7 +2007,7 @@ export default function App() {
       <header className="header">
         <div className="header-row">
           <div>
-            <h1>AppForge</h1>
+            <h1>AppMaka</h1>
             <p className="subtitle">Your web apps, each with its own isolated accounts.</p>
           </div>
           <button

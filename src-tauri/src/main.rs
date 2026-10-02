@@ -201,7 +201,7 @@ fn hide_library(app: AppHandle) -> Result<(), String> {
 }
 
 /// Show the main window in library (management) view. The frontend listens
-/// for the `appforge:show-library` event and switches views accordingly.
+/// for the `appmaka:show-library` event and switches views accordingly.
 #[tauri::command]
 fn show_library(app: AppHandle) -> Result<(), String> {
     show_library_view(&app)
@@ -371,7 +371,7 @@ fn show_library_view(app: &AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
         w.show().map_err(|e| e.to_string())?;
         w.set_focus().map_err(|e| e.to_string())?;
-        app.emit("appforge:show-library", ())
+        app.emit("appmaka:show-library", ())
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -417,7 +417,7 @@ fn set_panel_opacity(app: AppHandle, opacity: f32) -> Result<LauncherSettings, S
 
 /// Alt+Space (or the user's chosen key) toggles the window. Showing always
 /// lands on the launcher (spotlight) view — the frontend resets via the
-/// `appforge:show-launcher` event. Hiding is just hiding.
+/// `appmaka:show-launcher` event. Hiding is just hiding.
 ///
 /// Positioning honors the `monitor_mode` launcher setting: cursor mode
 /// (default) centers the window on the monitor holding the mouse cursor;
@@ -434,7 +434,7 @@ fn toggle_main_window(app: &AppHandle) {
             position_on_target_monitor(app, &w);
             let _ = w.show();
             let _ = w.set_focus();
-            let _ = app.emit("appforge:show-launcher", ());
+            let _ = app.emit("appmaka:show-launcher", ());
         }
     }
 }
@@ -498,8 +498,8 @@ fn build_tray(app: &mut tauri::App) -> Result<(), String> {
     let menu = Menu::with_items(app.handle(), &[&show, &rescan, &quit])
         .map_err(|e| e.to_string())?;
 
-    let mut builder = TrayIconBuilder::with_id("appforge")
-        .tooltip("AppForge")
+    let mut builder = TrayIconBuilder::with_id("appmaka")
+        .tooltip("AppMaka")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -509,7 +509,7 @@ fn build_tray(app: &mut tauri::App) -> Result<(), String> {
             "tray-rescan" => {
                 let handle = app.clone();
                 std::thread::Builder::new()
-                    .name("appforge-tray-rescan".to_string())
+                    .name("appmaka-tray-rescan".to_string())
                     .spawn(move || {
                         if let Some(state) = handle.try_state::<LauncherState>() {
                             state.rescan();
@@ -581,7 +581,7 @@ fn main() {
             let adblock_bg = adblock.clone();
             app.manage(adblock);
             std::thread::Builder::new()
-                .name("appforge-adblock".to_string())
+                .name("appmaka-adblock".to_string())
                 .spawn(move || adblock_bg.refresh_loop())
                 .map_err(std::io::Error::other)?;
 
@@ -606,7 +606,7 @@ fn main() {
             {
                 let handle = app.handle().clone();
                 std::thread::Builder::new()
-                    .name("appforge-program-scan".to_string())
+                    .name("appmaka-program-scan".to_string())
                     .spawn(move || {
                         if let Some(state) = handle.try_state::<LauncherState>() {
                             state.rescan();

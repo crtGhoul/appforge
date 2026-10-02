@@ -1,5 +1,5 @@
 /**
- * Shared types for the AppForge library window.
+ * Shared types for the AppMaka library window.
  *
  * Backend contract (implemented by the Rust side — do not extend).
  *
@@ -118,7 +118,7 @@ export interface AddAppOutcome {
 
 /**
  * Result of the preview_add command, delivered on the
- * `appforge:preview-added` event. Serialized camelCase by the backend:
+ * `appmaka:preview-added` event. Serialized camelCase by the backend:
  * `addedAccount` is the account that adopted the preview's signed-in
  * session — the first account for a new app, or a new account when the
  * site was already in the library.

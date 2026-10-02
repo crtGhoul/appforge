@@ -6,13 +6,13 @@ import { invoke } from "@tauri-apps/api/core";
 
 declare global {
   interface Window {
-    __APPFORGE_PREVIEW_ID__?: string;
-    __APPFORGE_PREVIEW_URL__?: string;
+    __APPMAKA_PREVIEW_ID__?: string;
+    __APPMAKA_PREVIEW_URL__?: string;
   }
 }
 
-const id = window.__APPFORGE_PREVIEW_ID__;
-const url = window.__APPFORGE_PREVIEW_URL__ || "";
+const id = window.__APPMAKA_PREVIEW_ID__;
+const url = window.__APPMAKA_PREVIEW_URL__ || "";
 
 const msg = document.getElementById("msg") as HTMLElement;
 const addBtn = document.getElementById("add") as HTMLButtonElement;
