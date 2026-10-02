@@ -220,20 +220,6 @@ pub fn attach_network_blocking(
     });
 }
 
-/// Same hookup for a bare webview (the preview flow builds its site view as a
-/// child webview of a plain window, not a WebviewWindow).
-#[cfg(windows)]
-pub fn attach_network_blocking_to_webview(
-    webview: &tauri::Webview,
-    state: &AdblockState,
-    enabled: Arc<std::sync::atomic::AtomicBool>,
-) {
-    let state = state.clone();
-    let _ = webview.with_webview(move |platform| {
-        hook_platform(platform, &state, enabled);
-    });
-}
-
 /// The COM hookup itself, shared by both entry points above.
 #[cfg(windows)]
 fn hook_platform(

@@ -1,20 +1,28 @@
 //! Preview sign-in flow: open a site in a throwaway session, sign in on the
 //! real page, then adopt the session as a new app's first account.
 //!
-//! The preview is one Tauri window holding two webviews: a slim header strip
-//! (our own UI — the URL, an optional account label, Add/Discard buttons)
-//! above the site webview. Buttons are never injected into the site's DOM,
-//! and the header is the only webview in that window allowed to invoke
-//! commands (see `capabilities/preview.json`).
+//! The preview is TWO plain windows, both built with the stable
+//! `WebviewWindowBuilder` API (never the `unstable` multi-webview API —
+//! robustness beats elegance):
+//! - the site window: the real page in a temporary session directory,
+//!   `sessions/.preview-<id>/`;
+//! - the control window: a small always-on-top window with our own UI — the
+//!   URL, an optional account label, Add/Discard buttons (from
+//!   `public/preview-header.html`). Buttons are never injected into the
+//!   site's DOM, and the control window is the only preview webview allowed
+//!   to invoke commands (see `capabilities/preview.json`).
 //!
-//! The site webview gets a *temporary* session directory,
-//! `sessions/.preview-<id>/`, which is either moved into place as the new
-//! account's session dir ("Add as app") or deleted ("Discard", the window
-//! closed by hand, or left behind by a crash and swept at startup).
+//! The temp session is either moved into place as the new account's session
+//! dir ("Add as app") or deleted ("Discard", either window closed by hand,
+//! or left behind by a crash and swept at startup).
 //!
 //! Windows file-lock ordering: WebView2 locks the user-data dir while the
-//! webview lives, so "Add as app" closes the preview window *before* moving
+//! webview lives, so "Add as app" closes the preview windows *before* moving
 //! the directory, with a short retry loop in case teardown lags behind.
+//!
+//! Window creation never happens on a WebView2 IPC thread: on Windows,
+//! `WebviewWindowBuilder::build()` deadlocks in a synchronous Tauri command
+//! (wry#583), so `preview_start` is an async command (see main.rs).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,30 +33,29 @@ use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Webview, WebviewBuilder,
-    WebviewUrl, Window, WindowBuilder, WindowEvent,
-};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::adblock::AdblockState;
-use crate::store::{AppStore, WebApp};
+use crate::store::{AddAppOutcome, AppStore};
 use crate::windows::{self, PopupContext};
-
-/// Header strip height in logical pixels.
-const HEADER_H: f64 = 64.0;
 
 /// How long "Add as app" waits for WebView2 to release the temp dir.
 const MOVE_RETRIES: u32 = 30;
 const MOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Event the library window listens for so it can pick up the new app.
+/// Event the library window listens for so it can pick up the new app (or
+/// reveal the existing one when the previewed site was already added).
 const PREVIEW_ADDED_EVENT: &str = "appforge:preview-added";
+
+/// Control window size in physical pixels (used for placement math).
+const CONTROL_W: i32 = 660;
+const CONTROL_H: i32 = 170;
 
 #[derive(Debug, Clone)]
 struct PreviewSession {
     url: String,
     session_dir: PathBuf,
-    /// Latest non-empty document.title seen in the site webview.
+    /// Latest non-empty document.title seen in the site window.
     title: Option<String>,
 }
 
@@ -65,6 +72,15 @@ pub struct PreviewStart {
     pub url: String,
 }
 
+/// Returned by `preview_add`: the app, plus whether it was freshly created
+/// or already existed (duplicates are never created — the UI reveals the
+/// existing entry instead).
+#[derive(Serialize)]
+pub struct PreviewAddOutcome {
+    pub app: crate::store::WebApp,
+    pub created: bool,
+}
+
 static PREVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn new_preview_id() -> String {
@@ -76,8 +92,20 @@ fn new_preview_id() -> String {
     format!("{ms}-{n}")
 }
 
-fn preview_window_label(id: &str) -> String {
-    format!("preview-{id}")
+fn site_window_label(id: &str) -> String {
+    format!("preview-{id}-site")
+}
+
+fn control_window_label(id: &str) -> String {
+    format!("preview-{id}-header")
+}
+
+/// Extract the preview id from either preview window label.
+fn preview_id_from_label(label: &str) -> Option<String> {
+    let rest = label.strip_prefix("preview-")?;
+    rest.strip_suffix("-site")
+        .or_else(|| rest.strip_suffix("-header"))
+        .map(str::to_string)
 }
 
 fn take_session(app: &AppHandle, preview_id: &str) -> Option<PreviewSession> {
@@ -86,28 +114,17 @@ fn take_session(app: &AppHandle, preview_id: &str) -> Option<PreviewSession> {
     sessions.remove(preview_id)
 }
 
-fn close_preview_window(app: &AppHandle, preview_id: &str) {
-    if let Some(window) = app.get_window(&preview_window_label(preview_id)) {
-        let _ = window.close();
+fn close_preview_windows(app: &AppHandle, preview_id: &str) {
+    for label in [site_window_label(preview_id), control_window_label(preview_id)] {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
     }
 }
 
-/// Position the header strip on top and the site webview below it, in
-/// physical pixels (the window's inner size is physical).
-fn layout_preview_views(window: &Window, site: &Webview, header: &Webview, header_h: u32) {
-    if let Ok(size) = window.inner_size() {
-        let _ = header.set_position(PhysicalPosition::new(0, 0));
-        let _ = header.set_size(PhysicalSize::new(size.width, header_h));
-        let _ = site.set_position(PhysicalPosition::new(0, header_h as i32));
-        let _ = site.set_size(PhysicalSize::new(
-            size.width,
-            size.height.saturating_sub(header_h),
-        ));
-    }
-}
-
-/// Open the preview window for `url`. The caller signs in on the real site;
-/// nothing is persisted until "Add as app".
+/// Open the preview for `url`: the site window (throwaway session) plus the
+/// small always-on-top control window with Add/Discard. The caller signs in
+/// on the real site; nothing is persisted until "Add as app".
 pub fn start_preview(
     app: &AppHandle,
     adblock: &AdblockState,
@@ -132,116 +149,101 @@ pub fn start_preview(
     std::fs::create_dir_all(&session_dir)
         .map_err(|e| format!("could not create preview session dir: {e}"))?;
 
-    // Build the window first; the session is only registered once the window
-    // and both webviews exist, so a half-built preview can never leak state.
-    let window = WindowBuilder::new(app, preview_window_label(&id))
-        .title("AppForge Preview — sign in")
-        .inner_size(1200.0, 860.0)
-        .center()
-        .build()
-        .map_err(|e| format!("could not open preview window: {e}"))?;
     // Clean up the temp dir if anything below fails.
-    let build_result: Result<(Webview, Webview, u32), String> = (|| {
-        let scale = window.scale_factor().unwrap_or(1.0);
-        let header_h = (HEADER_H * scale).round() as u32;
-
-        // Site webview: the real page in the throwaway session. Popups are
+    let build_result: Result<(), String> = (|| {
+        // Site window: the real page in the throwaway session. Popups are
         // allowed as contained modals (never real windows) bound to this same
         // temp session — sign-in flows often use them, and the session is
         // discarded unless the user clicks "Add as app".
         let app_for_title = app.clone();
         let title_id = id.clone();
-        let mut site_builder =
-            WebviewBuilder::new(format!("preview-{id}-site"), WebviewUrl::External(page_url))
-                .data_directory(session_dir.clone())
-                .on_new_window(windows::make_popup_handler(PopupContext {
-                    app: app.clone(),
-                    app_id: format!("preview-{id}"),
-                    account_id: "preview".to_string(),
-                    app_name: "Preview".to_string(),
-                    app_url: url.clone(),
-                    session_dir: session_dir.clone(),
-                    popup_policy: "allow".to_string(),
-                    popup_allowlist: Vec::new(),
-                }))
-                .on_document_title_changed(move |_webview: Webview, title: String| {
-                    let title = title.trim().to_string();
-                    if title.is_empty() {
-                        return;
+        let mut site_builder = WebviewWindowBuilder::new(
+            app,
+            site_window_label(&id),
+            WebviewUrl::External(page_url),
+        )
+        .data_directory(session_dir.clone())
+        .title(format!("AppForge Preview — {url}"))
+        .inner_size(1200.0, 800.0)
+        .center()
+        .on_new_window(windows::make_popup_handler(PopupContext {
+            app: app.clone(),
+            app_id: format!("preview-{id}"),
+            account_id: "preview".to_string(),
+            app_name: "Preview".to_string(),
+            app_url: url.clone(),
+            session_dir: session_dir.clone(),
+            popup_policy: "allow".to_string(),
+            popup_allowlist: Vec::new(),
+        }))
+        .on_document_title_changed(move |_window, title: String| {
+            let title = title.trim().to_string();
+            if title.is_empty() {
+                return;
+            }
+            if let Some(state) = app_for_title.try_state::<PreviewState>() {
+                if let Ok(mut sessions) = state.inner.lock() {
+                    if let Some(s) = sessions.get_mut(&title_id) {
+                        s.title = Some(title.chars().take(160).collect());
                     }
-                    if let Some(state) = app_for_title.try_state::<PreviewState>() {
-                        if let Ok(mut sessions) = state.inner.lock() {
-                            if let Some(s) = sessions.get_mut(&title_id) {
-                                s.title = Some(title.chars().take(160).collect());
-                            }
-                        }
-                    }
-                });
+                }
+            }
+        });
         let css = adblock.cosmetic_css_for(&url);
         if !css.is_empty() {
-            site_builder = site_builder.initialization_script(windows::cosmetic_init_script(&css));
+            site_builder =
+                site_builder.initialization_script(windows::cosmetic_init_script(&css));
         }
-        let site = window
-            .add_child(
-                site_builder,
-                PhysicalPosition::new(0, header_h as i32),
-                PhysicalSize::new(1200, 860),
-            )
-            .map_err(|e| format!("could not build preview site view: {e}"))?;
+        let site = site_builder
+            .build()
+            .map_err(|e| format!("could not open preview window: {e}"))?;
 
-        // Header webview: our own UI. The preview id/url are injected as
-        // globals — the page itself is static and carries no per-preview
-        // markup.
+        // Previews always get ad blocking; there are no per-app settings yet.
+        #[cfg(windows)]
+        crate::adblock::attach_network_blocking(
+            &site,
+            adblock,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        // Control window: our own UI, parked just above the site window and
+        // kept on top so Add/Discard are always one click away. If placement
+        // fails for any reason, a centered window is still perfectly usable.
+        let (cx, cy) = match (site.outer_position(), site.inner_size()) {
+            (Ok(pos), Ok(size)) => (
+                pos.x + (size.width as i32 - CONTROL_W) / 2,
+                (pos.y - CONTROL_H - 12).max(0),
+            ),
+            _ => (120, 80),
+        };
         let json_id = serde_json::to_string(&id).unwrap_or_else(|_| "\"\"".to_string());
         let json_url = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
-        let header_builder = WebviewBuilder::new(
-            format!("preview-{id}-header"),
+        let control = WebviewWindowBuilder::new(
+            app,
+            control_window_label(&id),
             WebviewUrl::App("preview-header.html".into()),
         )
+        .title("AppForge Preview")
+        .inner_size(CONTROL_W as f64, CONTROL_H as f64)
+        .always_on_top(true)
         .initialization_script(format!(
             "window.__APPFORGE_PREVIEW_ID__={json_id};\
              window.__APPFORGE_PREVIEW_URL__={json_url};"
-        ));
-        let header = window
-            .add_child(
-                header_builder,
-                PhysicalPosition::new(0, 0),
-                PhysicalSize::new(1200, header_h),
-            )
-            .map_err(|e| format!("could not build preview header: {e}"))?;
+        ))
+        .build()
+        .map_err(|e| format!("could not open preview controls: {e}"))?;
+        let _ = control.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+            x: cx,
+            y: cy,
+        }));
 
-        Ok((site, header, header_h))
+        Ok(())
     })();
-    let (site, header, header_h) = match build_result {
-        Ok(views) => views,
-        Err(e) => {
-            let _ = window.close();
-            let _ = std::fs::remove_dir_all(&session_dir);
-            return Err(e);
-        }
-    };
-
-    layout_preview_views(&window, &site, &header, header_h);
-
-    // Keep the two webviews glued to the window frame on resize.
-    // Webview handles are Arc-backed, so the closure gets its own clones and
-    // the originals stay usable for the adblock hookup below.
-    let win_r = window.clone();
-    let site_r = site.clone();
-    let header_r = header.clone();
-    window.on_window_event(move |event| {
-        if let WindowEvent::Resized(_) = event {
-            layout_preview_views(&win_r, &site_r, &header_r, header_h);
-        }
-    });
-
-    // Previews always get ad blocking; there are no per-app settings yet.
-    #[cfg(windows)]
-    crate::adblock::attach_network_blocking_to_webview(
-        &site,
-        adblock,
-        Arc::new(AtomicBool::new(true)),
-    );
+    if let Err(e) = build_result {
+        close_preview_windows(app, &id);
+        let _ = std::fs::remove_dir_all(&session_dir);
+        return Err(e);
+    }
 
     {
         let state = app
@@ -264,13 +266,13 @@ pub fn start_preview(
     Ok(PreviewStart { id, url })
 }
 
-/// Abandon a preview: close the window, drop the session, delete the temp
+/// Abandon a preview: close its windows, drop the session, delete the temp
 /// dir. The temp dir deletion is best-effort (a lagging WebView2 teardown
 /// must not fail the command); leftovers are swept at startup.
 pub fn discard_preview(app: &AppHandle, preview_id: &str) -> Result<(), String> {
     let session = take_session(app, preview_id);
     // Close first so WebView2 releases its file locks, then delete.
-    close_preview_window(app, preview_id);
+    close_preview_windows(app, preview_id);
     if let Some(s) = session {
         let _ = std::fs::remove_dir_all(&s.session_dir);
     }
@@ -279,14 +281,16 @@ pub fn discard_preview(app: &AppHandle, preview_id: &str) -> Result<(), String> 
 
 /// Turn a preview into a real app: the temp session dir becomes the new
 /// app's first account session dir, preserving the sign-in the user just
-/// completed. The preview window is closed *before* the move so WebView2
-/// releases its locks on the directory.
+/// completed. The preview windows are closed *before* the move so WebView2
+/// releases its locks on the directory. If the site is already in the
+/// library, no duplicate is created — the temp session is deleted and the
+/// existing app is returned for the UI to reveal.
 pub fn add_preview_as_app(
     app: &AppHandle,
     store: &AppStore,
     preview_id: &str,
     label: Option<String>,
-) -> Result<WebApp, String> {
+) -> Result<PreviewAddOutcome, String> {
     let session = take_session(app, preview_id).ok_or_else(|| "Preview not found.".to_string())?;
     let label = label.unwrap_or_default().trim().to_string();
 
@@ -300,22 +304,34 @@ pub fn add_preview_as_app(
         },
     };
 
-    close_preview_window(app, preview_id);
-    let created = store.add_app_with_session(name, session.url, label, &session.session_dir)?;
+    close_preview_windows(app, preview_id);
+    let AddAppOutcome { app: created, created: is_new } =
+        store.add_app_with_session(name, session.url, label, &session.session_dir)?;
+    if !is_new {
+        // Duplicate: the temp session was not adopted — delete it.
+        let _ = std::fs::remove_dir_all(&session.session_dir);
+    }
 
-    // The library window picks the new app up and opens its first account.
-    let _ = app.emit(PREVIEW_ADDED_EVENT, &created);
-    Ok(created)
+    // The library window picks the new app up (and opens its first account),
+    // or reveals the already-existing entry.
+    let outcome = PreviewAddOutcome {
+        app: created,
+        created: is_new,
+    };
+    let _ = app.emit(PREVIEW_ADDED_EVENT, &outcome);
+    Ok(outcome)
 }
 
-/// Best-effort cleanup when the user closes the preview window by hand (the
-/// X button). `preview_add`/`preview_discard` already removed their state
-/// entries, so those paths no-op here.
+/// Best-effort cleanup when the user closes a preview window by hand (the X
+/// button on either window): close the sibling window, drop the session,
+/// delete the temp dir. `preview_add`/`preview_discard` already removed their
+/// state entries, so those paths no-op here.
 pub fn window_closed(app: &AppHandle, label: &str) {
-    let Some(id) = label.strip_prefix("preview-") else {
+    let Some(id) = preview_id_from_label(label) else {
         return;
     };
-    if let Some(session) = take_session(app, id) {
+    close_preview_windows(app, &id);
+    if let Some(session) = take_session(app, &id) {
         let _ = std::fs::remove_dir_all(&session.session_dir);
     }
 }

@@ -25,7 +25,7 @@ fn list_apps(store: State<'_, AppStore>) -> Result<Vec<WebApp>, String> {
 }
 
 #[tauri::command]
-fn add_app(name: String, url: String, store: State<'_, AppStore>) -> Result<WebApp, String> {
+fn add_app(name: String, url: String, store: State<'_, AppStore>) -> Result<store::AddAppOutcome, String> {
     store.add_app(name, url)
 }
 
@@ -86,8 +86,16 @@ fn remove_account(
     store.remove_account(&app_id, &account_id)
 }
 
+/// Opens the account's window. ASYNC ON PURPOSE: on Windows,
+/// `WebviewWindowBuilder::build()` deadlocks when called from a synchronous
+/// Tauri command (the command body runs on a WebView2 IPC thread; see
+/// wry#583 and the "Known issues" note on WebviewWindowBuilder::new).
+/// An async command moves the blocking build onto a tokio worker thread so
+/// the IPC thread stays free and WebView2 can complete initialization.
+/// A sync version of this produced black, unclosable windows — do not
+/// "simplify" this back to a sync fn.
 #[tauri::command]
-fn open_account(
+async fn open_account(
     app: AppHandle,
     store: State<'_, AppStore>,
     adblock: State<'_, AdblockState>,
@@ -181,8 +189,10 @@ fn fetch_page_title(url: String) -> Result<String, String> {
 
 /// Open a preview window for `url`: the real site in a throwaway session so
 /// the user can sign in, then adopt it via `preview_add`.
+/// ASYNC ON PURPOSE — same Windows deadlock as `open_account`: window
+/// creation must not run on the WebView2 IPC thread of a sync command.
 #[tauri::command]
-fn preview_start(
+async fn preview_start(
     app: AppHandle,
     adblock: State<'_, AdblockState>,
     url: String,
@@ -199,13 +209,15 @@ fn preview_discard(app: AppHandle, preview_id: String) -> Result<(), String> {
 /// Turn a preview into a real app: the signed-in throwaway session becomes
 /// the new app's first account. The frontend sends `label` for the account
 /// (empty = "Default"). Tauri exposes `preview_id` as `previewId` to JS.
+/// Returns whether the app was created or an existing app for the URL was
+/// revealed instead (duplicates are never created).
 #[tauri::command]
 fn preview_add(
     app: AppHandle,
     store: State<'_, AppStore>,
     preview_id: String,
     label: Option<String>,
-) -> Result<store::WebApp, String> {
+) -> Result<preview::PreviewAddOutcome, String> {
     preview::add_preview_as_app(&app, &store, &preview_id, label)
 }
 
@@ -415,9 +427,10 @@ fn main() {
                     let _ = window.hide();
                 }
             } else if window.label().starts_with("preview-") {
-                // A preview closed by hand (X button): drop its session and
-                // delete the temp dir. preview_add/preview_discard already
-                // removed their entries, so those paths no-op here.
+                // A preview window closed by hand (X button on either the
+                // site or the control window): close its sibling, drop the
+                // session, delete the temp dir. preview_add/preview_discard
+                // already removed their entries, so those paths no-op here.
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
                     preview::window_closed(window.app_handle(), window.label());
                 }

@@ -186,8 +186,9 @@ pub(crate) struct PopupContext {
 /// Build the `on_new_window` handler for an account window.
 ///
 /// Runs on a separate thread on Windows, so it must stay non-blocking: the
-/// decision is made synchronously and any window creation is bounced to the
-/// main thread via `run_on_main_thread`. The original request is always
+/// decision is made synchronously and any window creation is bounced to a
+/// dedicated spawned thread (never the calling thread, never the main
+/// thread — see `spawn_oauth_modal`). The original request is always
 /// denied — allowed popups are re-created as contained modals instead.
 ///
 /// Also used by the preview flow with placeholder ids.
@@ -252,41 +253,50 @@ fn spawn_oauth_modal(
 ) {
     let n = OAUTH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let label = format!("oauth-{n}");
-    // run_on_main_thread needs 'static: clone every borrow up front.
-    let app = app.clone();
+    // The window MUST be built on a dedicated thread, never on the calling
+    // (WebView2 popup) thread and never via run_on_main_thread: on Windows,
+    // WebviewWindowBuilder::build() deadlocks in a synchronous context
+    // (wry#583) — and building it *on* the main thread self-deadlocks, since
+    // build() waits for the event loop that is busy running the closure.
+    // A plain spawned thread just blocks on the create-window round-trip
+    // while the main thread and all WebView2 threads stay free.
+    // Everything the thread touches is cloned up front ('static).
+    let modal_app = app.clone();
     let app_id = app_id.to_string();
     let account_id = account_id.to_string();
     let url = url.clone();
     let session_dir = session_dir.to_path_buf();
     let home_origin = home_origin.to_string();
     let title = format!("{app_name} — sign-in");
-    // The closure moves its captures; the run_on_main_thread call itself only
-    // borrows, so hand the closure its own clone.
-    let modal_app = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        let json_home = serde_json::to_string(&home_origin).unwrap_or_else(|_| "\"\"".to_string());
-        let autoclose = format!(
-            "(function(){{var home={json_home};\
-            var t=setInterval(function(){{try{{\
-            if(window.location.origin===home){{window.close();clearInterval(t);}}\
-            }}catch(e){{}}}},1500);}})();"
-        );
-        // Nested popups inside the modal are denied outright: an OAuth flow
-        // that needs a second popup is rare, and this prevents modal loops.
-        let _ = WebviewWindowBuilder::new(
-            &modal_app,
-            &label,
-            WebviewUrl::External(url.clone()),
-        )
-        .data_directory(session_dir.clone())
-        .title(&title)
-        .inner_size(640.0, 720.0)
-        .center()
-        .initialization_script(autoclose)
-        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-        .build()
-        .map_err(|e| eprintln!("[appforge] oauth modal failed for {app_id}/{account_id}: {e}"));
-    });
+    let _ = std::thread::Builder::new()
+        .name(format!("appforge-oauth-{n}"))
+        .spawn(move || {
+            let json_home =
+                serde_json::to_string(&home_origin).unwrap_or_else(|_| "\"\"".to_string());
+            let autoclose = format!(
+                "(function(){{var home={json_home};\
+                var t=setInterval(function(){{try{{\
+                if(window.location.origin===home){{window.close();clearInterval(t);}}\
+                }}catch(e){{}}}},1500);}})();"
+            );
+            // Nested popups inside the modal are denied outright: an OAuth flow
+            // that needs a second popup is rare, and this prevents modal loops.
+            let _ = WebviewWindowBuilder::new(
+                &modal_app,
+                &label,
+                WebviewUrl::External(url.clone()),
+            )
+            .data_directory(session_dir.clone())
+            .title(&title)
+            .inner_size(640.0, 720.0)
+            .center()
+            .initialization_script(autoclose)
+            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+            .build()
+            .map_err(|e| {
+                eprintln!("[appforge] oauth modal failed for {app_id}/{account_id}: {e}")
+            });
+        });
 }
 
 // ---------------------------------------------------------------------------

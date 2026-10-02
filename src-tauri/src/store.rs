@@ -142,6 +142,39 @@ pub(crate) fn is_valid_url(url: &str) -> bool {
     !host.is_empty() && (host.contains('.') || host == "localhost")
 }
 
+/// Result of adding an app: either a fresh app, or the already-existing app
+/// for the same site. Duplicates are never created — the frontend reveals
+/// the existing entry instead.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddAppOutcome {
+    pub app: WebApp,
+    pub created: bool,
+}
+
+/// Canonical key for duplicate detection: lowercase scheme + host, default
+/// ports dropped, trailing slashes trimmed, query/fragment ignored.
+/// "https://muse.ai", "https://muse.ai/" and "https://muse.ai/?x=1" all map
+/// to one entry; different hosts (or schemes) never collide.
+fn normalize_url_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match url::Url::parse(trimmed) {
+        Ok(u) => {
+            let scheme = u.scheme().to_lowercase();
+            let host = u.host_str().unwrap_or("").to_lowercase();
+            if host.is_empty() {
+                return trimmed.to_lowercase();
+            }
+            let port = match (u.scheme(), u.port()) {
+                ("http", Some(80)) | ("https", Some(443)) | (_, None) => String::new(),
+                (_, Some(p)) => format!(":{p}"),
+            };
+            let path = u.path().trim_end_matches('/');
+            format!("{scheme}://{host}{port}{path}")
+        }
+        Err(_) => trimmed.to_lowercase(),
+    }
+}
+
 pub struct AppStore {
     path: PathBuf,
     data_dir: PathBuf,
@@ -266,7 +299,11 @@ impl AppStore {
 
     /// Create the app *and* its first "Default" account in one step, so an app
     /// never exists without at least one session to open.
-    pub fn add_app(&self, name: String, url: String) -> Result<WebApp, String> {
+    ///
+    /// If an app for the same site already exists (URL-normalized), no
+    /// duplicate is created — the existing app is returned with
+    /// `created: false` so the UI can reveal it instead.
+    pub fn add_app(&self, name: String, url: String) -> Result<AddAppOutcome, String> {
         let name = name.trim().to_string();
         let url = url.trim().to_string();
         if name.is_empty() {
@@ -274,6 +311,12 @@ impl AppStore {
         }
         if !is_valid_url(&url) {
             return Err("URL must start with http:// or https://.".to_string());
+        }
+        if let Some(existing) = self.find_by_url(&url) {
+            return Ok(AddAppOutcome {
+                app: existing,
+                created: false,
+            });
         }
         let now = unix_secs();
         let app_id = new_id("app");
@@ -308,7 +351,18 @@ impl AppStore {
             apps.push(app.clone());
         }
         self.save()?;
-        Ok(app)
+        Ok(AddAppOutcome { app, created: true })
+    }
+
+    /// Find an app by normalized URL. Used to refuse duplicates.
+    fn find_by_url(&self, url: &str) -> Option<WebApp> {
+        let key = normalize_url_key(url);
+        self.apps
+            .lock()
+            .ok()?
+            .iter()
+            .find(|a| normalize_url_key(&a.url) == key)
+            .cloned()
     }
 
     /// Create the app *and* its first account from a preview session: the
@@ -322,7 +376,7 @@ impl AppStore {
         url: String,
         label: String,
         temp_dir: &Path,
-    ) -> Result<WebApp, String> {
+    ) -> Result<AddAppOutcome, String> {
         let name = name.trim().to_string();
         let url = url.trim().to_string();
         let label = label.trim().to_string();
@@ -331,6 +385,15 @@ impl AppStore {
         }
         if !is_valid_url(&url) {
             return Err("URL must start with http:// or https://.".to_string());
+        }
+        // A preview of a site that's already in the library must not create
+        // a duplicate — the caller discards the preview and reveals the
+        // existing app instead.
+        if let Some(existing) = self.find_by_url(&url) {
+            return Ok(AddAppOutcome {
+                app: existing,
+                created: false,
+            });
         }
         let now = unix_secs();
         let app_id = new_id("app");
@@ -368,7 +431,7 @@ impl AppStore {
             apps.push(app.clone());
         }
         self.save()?;
-        Ok(app)
+        Ok(AddAppOutcome { app, created: true })
     }
 
     pub fn update_app(        &self,
