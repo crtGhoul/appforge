@@ -14,13 +14,14 @@ mod windows;
 
 use adblock::AdblockState;
 use launcher::{LauncherState, NativeProgram};
-use launcher_settings::LauncherSettings;
+use launcher_settings::{HotkeyStatus, LauncherSettings};
 use preview::PreviewState;
 use serde::Serialize;
 use std::sync::Mutex;
 use store::{Account, AppSettings, AppStore, WebApp};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use windows::WindowState;
 
 #[tauri::command]
@@ -402,13 +403,42 @@ fn get_launcher_settings(app: AppHandle) -> LauncherSettings {
         .unwrap_or_default()
 }
 
+/// Runtime snapshot of whether the saved summon hotkey is actually
+/// registered with the OS. Lets the UI warn when startup registration
+/// failed instead of showing the hotkey as if it were live.
+#[tauri::command]
+fn get_hotkey_status(state: State<'_, Mutex<HotkeyStatus>>) -> Result<HotkeyStatus, String> {
+    state
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|e| format!("hotkey state poisoned: {e}"))
+}
+
 #[tauri::command]
 fn set_hotkey(app: AppHandle, hotkey: String) -> Result<(), String> {
     let state = app.state::<Mutex<LauncherSettings>>();
     let mut settings = state
         .lock()
         .map_err(|e| format!("settings state poisoned: {e}"))?;
-    launcher_settings::set_hotkey(&app, &mut settings, &hotkey)
+    let result = launcher_settings::set_hotkey(&app, &mut settings, &hotkey);
+    // Refresh the runtime status from ground truth so the settings banner
+    // clears (or appears) correctly after every change attempt — including
+    // the rollback path, where the old key should be live again.
+    if let Some(hs) = app.try_state::<Mutex<HotkeyStatus>>() {
+        if let Ok(mut s) = hs.lock() {
+            let current = settings.hotkey.clone();
+            let registered = app.global_shortcut().is_registered(current.as_str());
+            s.hotkey = current;
+            s.registered = registered;
+            s.error = match &result {
+                Ok(()) => None,
+                // Rolled back fine and the saved key is live again.
+                Err(_) if registered => None,
+                Err(e) => Some(e.clone()),
+            };
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -607,11 +637,26 @@ fn main() {
                 LauncherState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(launcher_state);
             let settings = launcher_settings::load(app.handle());
-            if let Err(e) =
-                launcher_settings::register_hotkey(app.handle(), &settings.hotkey)
-            {
-                eprintln!("launcher hotkey: {e}");
-            }
+            // Capture the registration outcome so the UI can warn when the
+            // saved hotkey isn't actually live (e.g. another app already
+            // owns Alt+Space) instead of showing it as if it worked.
+            let hotkey_status =
+                match launcher_settings::register_hotkey(app.handle(), &settings.hotkey) {
+                    Ok(()) => HotkeyStatus {
+                        hotkey: settings.hotkey.clone(),
+                        registered: true,
+                        error: None,
+                    },
+                    Err(e) => {
+                        eprintln!("launcher hotkey: {e}");
+                        HotkeyStatus {
+                            hotkey: settings.hotkey.clone(),
+                            registered: false,
+                            error: Some(e),
+                        }
+                    }
+                };
+            app.manage(Mutex::new(hotkey_status));
             if settings.autostart {
                 if let Err(e) = app.handle().autolaunch().enable() {
                     eprintln!("launcher autostart: {e}");
@@ -686,6 +731,7 @@ fn main() {
             preview_add,
             preview_reload,
             get_launcher_settings,
+            get_hotkey_status,
             set_hotkey,
             set_autostart,
             set_panel_opacity,

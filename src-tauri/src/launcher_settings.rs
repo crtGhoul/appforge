@@ -205,6 +205,21 @@ pub fn register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
         .map_err(|e| format!("could not register {hotkey}: {e}"))
 }
 
+/// Runtime-only snapshot of whether the saved summon hotkey is actually
+/// registered with the OS. Kept as managed state — never written to
+/// launcher.json — so the frontend can warn when startup registration
+/// failed (e.g. another app already owns Alt+Space).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HotkeyStatus {
+    /// The saved hotkey this status describes.
+    pub hotkey: String,
+    /// True when the OS accepted the registration.
+    pub registered: bool,
+    /// The registration failure reason, if any. Worded for direct display
+    /// ("could not register Alt+Space: ...").
+    pub error: Option<String>,
+}
+
 /// Swap the summon hotkey: unregister the old one, register the new one, and
 /// roll back to the old one if the new registration fails.
 pub fn set_hotkey(
@@ -223,7 +238,14 @@ pub fn set_hotkey(
     let _ = app.global_shortcut().unregister(old.as_str());
     if let Err(e) = app.global_shortcut().register(new_hotkey.as_str()) {
         // Roll back: never leave the user without a working summon key.
-        let _ = app.global_shortcut().register(old.as_str());
+        // If the restore itself fails, say so loudly — the caller turns
+        // this into a "no hotkey registered" status instead of pretending
+        // the old key is fine.
+        if let Err(rb) = app.global_shortcut().register(old.as_str()) {
+            return Err(format!(
+                "Couldn't use {new_hotkey} ({e}). Also couldn't restore {old} ({rb}) — no summon hotkey is registered right now."
+            ));
+        }
         return Err(format!(
             "Couldn't use {new_hotkey} ({e}). Kept {old}."
         ));

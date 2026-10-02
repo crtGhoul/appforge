@@ -101,6 +101,17 @@ export interface LauncherSettings {
   auto_update_check: boolean;
 }
 
+/**
+ * Runtime snapshot of whether the saved summon hotkey is actually
+ * registered with the OS (from `get_hotkey_status`). `registered` is false
+ * when startup registration failed — e.g. another app already owns it.
+ */
+export interface HotkeyStatus {
+  hotkey: string;
+  registered: boolean;
+  error: string | null;
+}
+
 /** Result of the preview_start command: a signed-in-later throwaway session. */
 export interface PreviewStart {
   id: string;

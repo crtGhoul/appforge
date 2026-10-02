@@ -3,6 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   Account,
+  HotkeyStatus,
   LauncherSettings,
   NativeProgram,
   WebApp,
@@ -406,8 +407,26 @@ export function LauncherSettingsPanel({
   const [saving, setSaving] = useState(false);
   const [rescanning, setRescanning] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  // Whether the saved summon hotkey is actually registered with the OS.
+  // Startup registration can fail silently (e.g. another app owns Alt+Space);
+  // the banner below tells the user instead of showing a dead hotkey.
+  const [hotkeyStatus, setHotkeyStatus] = useState<HotkeyStatus | null>(null);
   // Debounce slider drags so we save once per pause, not per tick.
   const opacityTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void invoke<HotkeyStatus>("get_hotkey_status")
+      .then((s) => {
+        if (alive) setHotkeyStatus(s);
+      })
+      .catch(() => {
+        /* older backend without the command; no banner */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -416,6 +435,14 @@ export function LauncherSettingsPanel({
       }
     };
   }, []);
+
+  async function refreshHotkeyStatus() {
+    try {
+      setHotkeyStatus(await invoke<HotkeyStatus>("get_hotkey_status"));
+    } catch {
+      /* keep the last known status */
+    }
+  }
 
   async function handleHotkeySave(e: React.FormEvent) {
     e.preventDefault();
@@ -431,6 +458,7 @@ export function LauncherSettingsPanel({
       setFormError(msg);
       onError(msg);
     } finally {
+      await refreshHotkeyStatus();
       setSaving(false);
     }
   }
@@ -489,6 +517,21 @@ export function LauncherSettingsPanel({
 
   return (
     <div className="launcher-settings">
+      {hotkeyStatus && !hotkeyStatus.registered && (
+        <div className="banner banner-error" role="alert">
+          <strong>
+            {hotkeyStatus.hotkey || "The summon hotkey"} couldn't be
+            registered — another app is already using it. Pick a different
+            hotkey below.
+          </strong>
+          {hotkeyStatus.error && (
+            <>
+              <br />
+              <span className="muted small">{hotkeyStatus.error}</span>
+            </>
+          )}
+        </div>
+      )}
       <form className="inline-form" onSubmit={(e) => void handleHotkeySave(e)}>
         <label>
           <span>Summon hotkey</span>
