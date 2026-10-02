@@ -13,11 +13,11 @@
 //!   to invoke commands (see `capabilities/preview.json`).
 //!
 //! The temp session is either moved into place as the new account's session
-//! dir ("Add as app") or deleted ("Discard", either window closed by hand,
+//! dir ("Add to the Forge") or deleted ("Discard", either window closed by hand,
 //! or left behind by a crash and swept at startup).
 //!
 //! Windows file-lock ordering: WebView2 locks the user-data dir while the
-//! webview lives, so "Add as app" closes the preview windows *before* moving
+//! webview lives, so "Add to the Forge" closes the preview windows *before* moving
 //! the directory, with a short retry loop in case teardown lags behind.
 //!
 //! Window creation never happens on a WebView2 IPC thread: on Windows,
@@ -39,7 +39,7 @@ use crate::adblock::AdblockState;
 use crate::store::{AddAppOutcome, AppStore};
 use crate::windows::{self, PopupContext};
 
-/// How long "Add as app" waits for WebView2 to release the temp dir.
+/// How long "Add to the Forge" waits for WebView2 to release the temp dir.
 const MOVE_RETRIES: u32 = 30;
 const MOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
@@ -48,8 +48,9 @@ const MOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PREVIEW_ADDED_EVENT: &str = "appforge:preview-added";
 
 /// Control window size in physical pixels (used for placement math).
+/// Tall enough for the sign-in banner row above the controls row.
 const CONTROL_W: i32 = 660;
-const CONTROL_H: i32 = 170;
+const CONTROL_H: i32 = 200;
 
 #[derive(Debug, Clone)]
 struct PreviewSession {
@@ -124,7 +125,7 @@ fn close_preview_windows(app: &AppHandle, preview_id: &str) {
 
 /// Open the preview for `url`: the site window (throwaway session) plus the
 /// small always-on-top control window with Add/Discard. The caller signs in
-/// on the real site; nothing is persisted until "Add as app".
+/// on the real site; nothing is persisted until "Add to the Forge".
 pub fn start_preview(
     app: &AppHandle,
     adblock: &AdblockState,
@@ -154,7 +155,7 @@ pub fn start_preview(
         // Site window: the real page in the throwaway session. Popups are
         // allowed as contained modals (never real windows) bound to this same
         // temp session — sign-in flows often use them, and the session is
-        // discarded unless the user clicks "Add as app".
+        // discarded unless the user clicks "Add to the Forge".
         let app_for_title = app.clone();
         let title_id = id.clone();
         let mut site_builder = WebviewWindowBuilder::new(

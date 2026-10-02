@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adblock;
+mod favicon;
+mod favicon_parse;
 mod launcher;
 mod launcher_settings;
 mod page_title;
@@ -38,6 +40,12 @@ fn update_app(
     store: State<'_, AppStore>,
 ) -> Result<WebApp, String> {
     store.update_app(&id, name, url, color)
+}
+
+/// Rename an app (name only). Tauri exposes `id`/`name` as-is to JS.
+#[tauri::command]
+fn rename_app(id: String, name: String, store: State<'_, AppStore>) -> Result<WebApp, String> {
+    store.rename_app(&id, name)
 }
 
 #[tauri::command]
@@ -84,6 +92,18 @@ fn remove_account(
 ) -> Result<(), String> {
     windows::close_account_window(&app, &app_id, &account_id);
     store.remove_account(&app_id, &account_id)
+}
+
+/// Rename an account (label only). Tauri exposes the snake_case params as
+/// camelCase to JS: `invoke("rename_account", { appId, accountId, label })`.
+#[tauri::command]
+fn rename_account(
+    app_id: String,
+    account_id: String,
+    label: String,
+    store: State<'_, AppStore>,
+) -> Result<Account, String> {
+    store.rename_account(&app_id, &account_id, label)
 }
 
 /// Opens the account's window. ASYNC ON PURPOSE: on Windows,
@@ -183,6 +203,39 @@ fn fetch_page_title(url: String) -> Result<String, String> {
     page_title::fetch_page_title(&url)
 }
 
+/// Fetch the app's site icon, cache it locally, and store the path on the
+/// app record. Best-effort: resolves to `None` when no usable icon is found,
+/// and the UI keeps its fallbacks. ASYNC ON PURPOSE: the HTTP fetch can
+/// take seconds, and blocking the WebView2 IPC thread of a sync command
+/// would freeze the invoking webview in the meantime.
+#[tauri::command]
+async fn fetch_favicon(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    app_id: String,
+) -> Result<Option<String>, String> {
+    let url = store.get(&app_id).map(|a| a.url)?;
+    let page_url: url::Url = url.parse().map_err(|_| "App URL is not valid.".to_string())?;
+    let favicons_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?
+        .join("favicons");
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        favicon::download_icon(&page_url, &favicons_dir)
+    })
+    .await
+    .map_err(|e| format!("favicon fetch failed: {e}"))?;
+    match path {
+        Some(p) => {
+            let s = p.to_string_lossy().into_owned();
+            store.set_app_icon(&app_id, Some(s.clone()))?;
+            Ok(Some(s))
+        }
+        None => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Preview sign-in commands
 // ---------------------------------------------------------------------------
@@ -208,7 +261,7 @@ fn preview_discard(app: AppHandle, preview_id: String) -> Result<(), String> {
 
 /// Turn a preview into a real app: the signed-in throwaway session becomes
 /// the new app's first account. The frontend sends `label` for the account
-/// (empty = "Default"). Tauri exposes `preview_id` as `previewId` to JS.
+/// (empty = "Main"). Tauri exposes `preview_id` as `previewId` to JS.
 /// Returns whether the app was created or an existing app for the URL was
 /// revealed instead (duplicates are never created).
 #[tauri::command]
@@ -440,9 +493,11 @@ fn main() {
             list_apps,
             add_app,
             update_app,
+            rename_app,
             remove_app,
             update_app_settings,
             add_account,
+            rename_account,
             remove_account,
             open_account,
             suspend_account,
@@ -453,6 +508,7 @@ fn main() {
             hide_library,
             show_library,
             fetch_page_title,
+            fetch_favicon,
             preview_start,
             preview_discard,
             preview_add,

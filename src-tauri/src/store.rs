@@ -220,15 +220,45 @@ impl AppStore {
             Err(e) => return Err(format!("could not read apps.json: {e}")),
         };
 
-        Ok(Self {
+        let store = Self {
             path,
             data_dir: dir,
             apps: Mutex::new(apps),
-        })
+        };
+        // The auto-created first account used to be labeled "Default", which
+        // users found confusing — it is now "Main". Rename it silently on
+        // load (the user can rename any account in the library anyway).
+        store.normalize_default_labels()?;
+        Ok(store)
+    }
+
+    /// Rename legacy "Default" account labels to "Main". Persists only when
+    /// something actually changed.
+    fn normalize_default_labels(&self) -> Result<(), String> {
+        let changed = {
+            let mut apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            let mut changed = false;
+            for app in apps.iter_mut() {
+                for account in app.accounts.iter_mut() {
+                    if account.label == "Default" {
+                        account.label = "Main".to_string();
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        };
+        if changed {
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Give a v0 app (no settings/accounts) the current shape: default
-    /// settings plus one "Default" account with a fresh session directory.
+    /// settings plus one "Main" account with a fresh session directory.
     fn migrate_legacy(legacy: Vec<LegacyWebApp>, data_dir: &Path) -> Result<Vec<WebApp>, String> {
         let now = unix_secs();
         let mut apps = Vec::with_capacity(legacy.len());
@@ -250,7 +280,7 @@ impl AppStore {
                 accounts: vec![Account {
                     id: account_id,
                     app_id: old.id,
-                    label: "Default".to_string(),
+                    label: "Main".to_string(),
                     color: DEFAULT_COLOR.to_string(),
                     session_dir: session_dir.to_string_lossy().into_owned(),
                     last_opened: 0,
@@ -297,7 +327,7 @@ impl AppStore {
             .ok_or_else(|| "App not found.".to_string())
     }
 
-    /// Create the app *and* its first "Default" account in one step, so an app
+    /// Create the app *and* its first "Main" account in one step, so an app
     /// never exists without at least one session to open.
     ///
     /// If an app for the same site already exists (URL-normalized), no
@@ -335,7 +365,7 @@ impl AppStore {
             accounts: vec![Account {
                 id: account_id,
                 app_id,
-                label: "Default".to_string(),
+                label: "Main".to_string(),
                 color: DEFAULT_COLOR.to_string(),
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 last_opened: 0,
@@ -412,7 +442,7 @@ impl AppStore {
                 id: account_id,
                 app_id,
                 label: if label.is_empty() {
-                    "Default".to_string()
+                    "Main".to_string()
                 } else {
                     label
                 },
@@ -464,6 +494,75 @@ impl AppStore {
             app.name = name;
             app.url = url;
             app.color = color;
+            app.clone()
+        };
+        self.save()?;
+        Ok(updated)
+    }
+
+    /// Rename an app (name only — URL/color/settings are untouched).
+    pub fn rename_app(&self, id: &str, name: String) -> Result<WebApp, String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("Name is required.".to_string());
+        }
+        let updated = {
+            let mut apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            let app = apps
+                .iter_mut()
+                .find(|a| a.id == id)
+                .ok_or_else(|| "App not found.".to_string())?;
+            app.name = name;
+            app.clone()
+        };
+        self.save()?;
+        Ok(updated)
+    }
+
+    /// Rename an account (label only — the session dir is untouched).
+    pub fn rename_account(
+        &self,
+        app_id: &str,
+        account_id: &str,
+        label: String,
+    ) -> Result<Account, String> {
+        let label = label.trim().to_string();
+        if label.is_empty() {
+            return Err("Account label is required.".to_string());
+        }
+        let updated = {
+            let mut apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            let account = apps
+                .iter_mut()
+                .find(|a| a.id == app_id)
+                .and_then(|a| a.accounts.iter_mut().find(|ac| ac.id == account_id))
+                .ok_or_else(|| "Account not found.".to_string())?;
+            account.label = label;
+            account.clone()
+        };
+        self.save()?;
+        Ok(updated)
+    }
+
+    /// Set (or clear) the cached favicon path for an app. Written by the
+    /// `fetch_favicon` command after it downloads the site's logo.
+    pub fn set_app_icon(&self, id: &str, icon: Option<String>) -> Result<WebApp, String> {
+        let updated = {
+            let mut apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            let app = apps
+                .iter_mut()
+                .find(|a| a.id == id)
+                .ok_or_else(|| "App not found.".to_string())?;
+            app.icon = icon;
             app.clone()
         };
         self.save()?;
