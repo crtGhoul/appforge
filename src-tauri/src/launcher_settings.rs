@@ -16,10 +16,33 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 pub const DEFAULT_HOTKEY: &str = "Alt+Space";
 
+/// Default translucency of the phone-folder launcher panel (matches the
+/// original hard-coded CSS value). The user can make it more solid in the
+/// launcher settings; 1.0 is fully opaque.
+pub const DEFAULT_PANEL_OPACITY: f32 = 0.55;
+/// Hard floor so the panel can never become unreadably faint.
+pub const MIN_PANEL_OPACITY: f32 = 0.3;
+
+fn default_opacity() -> f32 {
+    DEFAULT_PANEL_OPACITY
+}
+
+/// Clamp to the usable range. NaN (which serde could never produce, but a
+/// hand-edited file might) falls back to the default.
+pub fn clamp_opacity(v: f32) -> f32 {
+    if !v.is_finite() {
+        DEFAULT_PANEL_OPACITY
+    } else {
+        v.clamp(MIN_PANEL_OPACITY, 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherSettings {
     pub hotkey: String,
     pub autostart: bool,
+    #[serde(default = "default_opacity")]
+    pub panel_opacity: f32,
 }
 
 impl Default for LauncherSettings {
@@ -27,6 +50,7 @@ impl Default for LauncherSettings {
         Self {
             hotkey: DEFAULT_HOTKEY.to_string(),
             autostart: false,
+            panel_opacity: DEFAULT_PANEL_OPACITY,
         }
     }
 }
@@ -49,6 +73,7 @@ pub fn load(app: &AppHandle) -> LauncherSettings {
     if s.hotkey.trim().is_empty() {
         s.hotkey = DEFAULT_HOTKEY.to_string();
     }
+    s.panel_opacity = clamp_opacity(s.panel_opacity);
     s
 }
 
@@ -97,6 +122,17 @@ pub fn set_hotkey(
         ));
     }
     settings.hotkey = new_hotkey;
+    save(app, settings)
+}
+
+/// Set the launcher panel translucency (0.3..=1.0). Saved immediately so
+/// the choice survives restarts.
+pub fn set_panel_opacity(
+    app: &AppHandle,
+    settings: &mut LauncherSettings,
+    opacity: f32,
+) -> Result<(), String> {
+    settings.panel_opacity = clamp_opacity(opacity);
     save(app, settings)
 }
 

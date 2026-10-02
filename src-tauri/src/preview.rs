@@ -77,13 +77,17 @@ pub struct PreviewStart {
     pub url: String,
 }
 
-/// Returned by `preview_add`: the app, plus whether it was freshly created
-/// or already existed (duplicates are never created — the UI reveals the
-/// existing entry instead).
+/// Returned by `preview_add`: the app, whether it was freshly created, and
+/// the account that adopted the preview's signed-in session — the first
+/// account for a new app, or a brand-new account when the site was already
+/// in the library (no duplicate app is ever created). Serialized camelCase
+/// for the JS side (`addedAccount`).
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewAddOutcome {
     pub app: crate::store::WebApp,
     pub created: bool,
+    pub added_account: Option<crate::store::Account>,
 }
 
 static PREVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -322,18 +326,22 @@ pub fn add_preview_as_app(
     };
 
     close_preview_windows(app, preview_id);
-    let AddAppOutcome { app: created, created: is_new } =
-        store.add_app_with_session(name, session.url, label, &session.session_dir)?;
-    if !is_new {
-        // Duplicate: the temp session was not adopted — delete it.
-        let _ = std::fs::remove_dir_all(&session.session_dir);
-    }
+    let AddAppOutcome {
+        app: created,
+        created: is_new,
+        added_account,
+    } = store.add_app_with_session(name, session.url, label, &session.session_dir)?;
 
-    // The library window picks the new app up (and opens its first account),
-    // or reveals the already-existing entry.
+    // The temp session is always adopted — never deleted here. A new app
+    // keeps it as the first account; an already-listed site keeps it as a
+    // new account on the existing app.
+
+    // The library window picks the new app up (and opens the adopted
+    // account), or updates the existing entry with its new account.
     let outcome = PreviewAddOutcome {
         app: created,
         created: is_new,
+        added_account,
     };
     let _ = app.emit(PREVIEW_ADDED_EVENT, &outcome);
     let _ = app.emit(PREVIEW_CLOSED_EVENT, preview_id);

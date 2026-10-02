@@ -33,13 +33,13 @@ fn add_app(name: String, url: String, store: State<'_, AppStore>) -> Result<stor
 
 #[tauri::command]
 fn update_app(
-    id: String,
+    app_id: String,
     name: String,
     url: String,
     color: String,
     store: State<'_, AppStore>,
 ) -> Result<WebApp, String> {
-    store.update_app(&id, name, url, color)
+    store.update_app(&app_id, name, url, color)
 }
 
 /// Rename an app (name only). Tauri exposes `id`/`name` as-is to JS.
@@ -74,13 +74,22 @@ fn update_app_settings(
 }
 
 #[tauri::command]
-fn add_account(
+async fn add_account(
+    app: AppHandle,
     app_id: String,
     label: String,
     color: Option<String>,
-    store: State<'_, AppStore>,
 ) -> Result<Account, String> {
-    store.add_account(&app_id, label, color)
+    // ASYNC ON PURPOSE: account creation fetches the site's og:image for
+    // the tile thumbnail — a sync command would block the WebView2 IPC
+    // thread while the HTTP fetch runs.
+    let app_c = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app_c.state::<AppStore>();
+        store.add_account(&app_id, label, color)
+    })
+    .await
+    .map_err(|e| format!("add account failed: {e}"))?
 }
 
 #[tauri::command]
@@ -236,6 +245,69 @@ async fn fetch_favicon(
     }
 }
 
+/// Save a user-uploaded logo for an app. The bytes must sniff as a real
+/// image (PNG/JPEG/GIF/WebP/ICO) and be at most 2 MiB. Stored under
+/// `<app-data>/favicons/` as `custom-<app_id>-<unix_ts>.<ext>` and recorded
+/// on the app via `set_app_icon`, so tiles pick it up immediately.
+/// Sync is fine: the payload is small and the I/O is a single local write.
+#[tauri::command]
+fn set_app_icon_data(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    app_id: String,
+    data: Vec<u8>,
+    ext: String,
+) -> Result<String, String> {
+    const MAX_LOGO: usize = 2 * 1024 * 1024;
+    if data.len() > MAX_LOGO {
+        return Err("That image is too large (2 MiB max).".to_string());
+    }
+    let sniffed = favicon::sniff_extension(&data).ok_or_else(|| {
+        "That file is not a supported image (PNG, JPEG, GIF, WebP, ICO).".to_string()
+    })?;
+    // The claimed extension is only honored when it names a real image
+    // type; otherwise the sniffed type wins, so a renamed executable can
+    // never land with a misleading extension.
+    let ext = match ext.trim().to_lowercase().as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "gif" => "gif",
+        "webp" => "webp",
+        "ico" => "ico",
+        _ => sniffed,
+    };
+    let favicons_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?
+        .join("favicons");
+    std::fs::create_dir_all(&favicons_dir)
+        .map_err(|e| format!("could not create favicons dir: {e}"))?;
+    // App ids are backend-generated ("app-<millis>-<n>"), but sanitize
+    // anyway so the filename can never escape the favicons dir.
+    let safe_id: String = app_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = favicons_dir.join(format!("custom-{safe_id}-{ts}.{ext}"));
+    std::fs::write(&dest, &data).map_err(|e| format!("could not save logo: {e}"))?;
+    let s = dest.to_string_lossy().into_owned();
+    store.set_app_icon(&app_id, Some(s.clone()))?;
+    Ok(s)
+}
+
+/// Remove a custom (or fetched) logo: tiles fall back to the live
+/// /favicon.ico and then the letter tile.
+#[tauri::command]
+fn clear_app_icon(store: State<'_, AppStore>, app_id: String) -> Result<(), String> {
+    store.set_app_icon(&app_id, None)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Preview sign-in commands
 // ---------------------------------------------------------------------------
@@ -269,16 +341,26 @@ fn preview_reload(app: AppHandle, preview_id: String) -> Result<(), String> {
 /// Turn a preview into a real app: the signed-in throwaway session becomes
 /// the new app's first account. The frontend sends `label` for the account
 /// (empty = "Main"). Tauri exposes `preview_id` as `previewId` to JS.
-/// Returns whether the app was created or an existing app for the URL was
-/// revealed instead (duplicates are never created).
+/// When the URL is already in the library, no duplicate app is created —
+/// the session becomes a NEW account on the existing app (user's label, or
+/// "Account N"). The outcome carries `addedAccount` so the UI can open it.
+/// ASYNC ON PURPOSE: adopting the session fetches the site's og:image for
+/// the account thumbnail, and a sync command would block the WebView2 IPC
+/// thread while the HTTP fetch runs (same reason `fetch_favicon` is async).
 #[tauri::command]
-fn preview_add(
+async fn preview_add(
     app: AppHandle,
-    store: State<'_, AppStore>,
     preview_id: String,
     label: Option<String>,
 ) -> Result<preview::PreviewAddOutcome, String> {
-    preview::add_preview_as_app(&app, &store, &preview_id, label)
+    let app_c = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // State<'_, _> is not 'static, so re-resolve it inside the closure.
+        let store = app_c.state::<AppStore>();
+        preview::add_preview_as_app(&app_c, &store, &preview_id, label)
+    })
+    .await
+    .map_err(|e| format!("preview add failed: {e}"))?
 }
 
 /// Show the main window in library (management) view and tell the frontend
@@ -317,6 +399,18 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
         .lock()
         .map_err(|e| format!("settings state poisoned: {e}"))?;
     launcher_settings::set_autostart(&app, &mut settings, enabled)
+}
+
+/// Change the launcher panel translucency. The backend clamps to
+/// 0.3..=1.0; returns the updated settings so the UI paints immediately.
+#[tauri::command]
+fn set_panel_opacity(app: AppHandle, opacity: f32) -> Result<LauncherSettings, String> {
+    let state = app.state::<Mutex<LauncherSettings>>();
+    let mut settings = state
+        .lock()
+        .map_err(|e| format!("settings state poisoned: {e}"))?;
+    launcher_settings::set_panel_opacity(&app, &mut settings, opacity)?;
+    Ok(settings.clone())
 }
 
 /// Alt+Space (or the user's chosen key) toggles the window. Showing always
@@ -516,6 +610,8 @@ fn main() {
             show_library,
             fetch_page_title,
             fetch_favicon,
+            set_app_icon_data,
+            clear_app_icon,
             preview_start,
             preview_discard,
             preview_add,
@@ -523,6 +619,7 @@ fn main() {
             get_launcher_settings,
             set_hotkey,
             set_autostart,
+            set_panel_opacity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

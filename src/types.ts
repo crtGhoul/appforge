@@ -26,6 +26,8 @@ export interface Account {
   label: string;
   color: string;
   session_dir: string;
+  /** Locally cached og:image thumbnail for the account tile (may be null). */
+  thumbnail: string | null;
   last_opened: number;
   created_at: number;
 }
@@ -56,10 +58,12 @@ export interface NativeProgram {
   icon_path: string | null;
 }
 
-/** Summon hotkey + run-at-startup, stored in launcher.json on the backend. */
+/** Summon hotkey + run-at-startup + launcher panel look, stored in launcher.json on the backend. */
 export interface LauncherSettings {
   hotkey: string;
   autostart: boolean;
+  /** Launcher panel translucency, 0.3 (faint) .. 1.0 (solid). Backend always sends it (serde default). */
+  panel_opacity: number;
 }
 
 /** Result of the preview_start command: a signed-in-later throwaway session. */
@@ -70,10 +74,27 @@ export interface PreviewStart {
 
 /**
  * Result of add_app / preview_add. `created` is false when the site was
- * already in the library — the backend never creates duplicates; the UI
- * reveals the existing entry instead.
+ * already in the library — the backend never creates duplicates. For the
+ * preview flow, the signed-in session is always adopted: as the first
+ * account of a new app, or as a brand-new account on the existing app
+ * (`added_account`, never None there). The quick-add form passes no
+ * session, so `added_account` is None when it hits an existing app.
  */
 export interface AddAppOutcome {
   app: WebApp;
   created: boolean;
+  added_account: Account | null;
+}
+
+/**
+ * Result of the preview_add command, delivered on the
+ * `appforge:preview-added` event. Serialized camelCase by the backend:
+ * `addedAccount` is the account that adopted the preview's signed-in
+ * session — the first account for a new app, or a new account when the
+ * site was already in the library.
+ */
+export interface PreviewAddOutcome {
+  app: WebApp;
+  created: boolean;
+  addedAccount: Account | null;
 }

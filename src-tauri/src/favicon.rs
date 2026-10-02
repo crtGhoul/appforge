@@ -16,7 +16,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::favicon_parse::{choose_icon, parse_icon_candidates};
+use crate::favicon_parse::{choose_icon, parse_icon_candidates, parse_og_image};
 
 const MAX_HTML: u64 = 512 * 1024;
 const MAX_ICON: u64 = 2 * 1024 * 1024;
@@ -55,7 +55,8 @@ fn extension_for_content_type(ct: &str) -> Option<&'static str> {
 
 /// Magic-byte sniffing, for servers that send the wrong (or no)
 /// Content-Type. An HTML error page never sniffs as an image.
-fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
+/// Also used by `set_app_icon_data` to validate user-uploaded logos.
+pub(crate) fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         Some("png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -116,6 +117,31 @@ pub(crate) fn download_icon(page_url: &url::Url, favicons_dir: &Path) -> Option<
     let dest = favicons_dir.join(hash_name(&icon_url, ext));
     // Same icon URL → same filename, so a re-fetch refreshes nothing and a
     // changed icon URL naturally gets its own cache entry.
+    if !dest.exists() {
+        std::fs::write(&dest, &bytes).ok()?;
+    }
+    Some(dest)
+}
+
+/// Fetch the page's `og:image` as an account thumbnail, cached under
+/// `favicons/` with a `thumb-` prefix. Best-effort: any failure (no meta
+/// tag, unresolvable URL, download error, non-image bytes) resolves to
+/// `None` — a missing thumbnail must never fail account creation.
+/// Only raster formats (PNG/JPEG/GIF/WebP): no SVG (nothing rasterizes it
+/// here) and no ICO (a multi-size container, poor as a thumbnail).
+pub(crate) fn fetch_og_image(page_url: &url::Url, favicons_dir: &Path) -> Option<PathBuf> {
+    let (body, _) = http_get(page_url.as_str(), MAX_HTML).ok()?;
+    let html = String::from_utf8_lossy(&body);
+    let image_url = parse_og_image(&html, page_url)?;
+    let (bytes, content_type) = http_get(&image_url, MAX_ICON).ok()?;
+    let sniffed = sniff_extension(&bytes);
+    let ext = content_type
+        .as_deref()
+        .and_then(extension_for_content_type)
+        .filter(|e| matches!(*e, "png" | "jpg" | "gif" | "webp"))
+        .or_else(|| sniffed.filter(|e| matches!(*e, "png" | "jpg" | "gif" | "webp")))?;
+    std::fs::create_dir_all(favicons_dir).ok()?;
+    let dest = favicons_dir.join(format!("thumb-{}", hash_name(&image_url, ext)));
     if !dest.exists() {
         std::fs::write(&dest, &bytes).ok()?;
     }

@@ -74,10 +74,15 @@
     border-radius: 8px;
     background: #fff;
     color: #1f2329;
-    width: 150px;
+    width: 200px;
     flex: none;
   }
   input[type="text"]::placeholder { color: #9aa0a8; }
+  label[for="label"] {
+    font-weight: 650;
+    color: #2f3180;
+    flex: none;
+  }
   .spacer { flex: 1 1 auto; }
   button.action {
     font: inherit;
@@ -114,7 +119,8 @@
   <div class="controls">
     <span class="badge">Preview</span>
     <span class="url" id="url"></span>
-    <input id="label" type="text" placeholder="Account label (optional)" maxlength="60" autocomplete="off" />
+    <label for="label">Name this login:</label>
+    <input id="label" type="text" placeholder="e.g. Personal" maxlength="60" autocomplete="off" />
     <span class="spacer"></span>
     <span class="error" id="msg" role="alert"></span>
     <button id="add" class="action primary">Add to the Forge</button>

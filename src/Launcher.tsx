@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type {
   Account,
@@ -281,9 +281,22 @@ export function LauncherSettingsPanel({
 }) {
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [autostart, setAutostart] = useState(settings.autostart);
+  const [opacity, setOpacity] = useState(
+    Math.round((settings.panel_opacity ?? 0.55) * 100)
+  );
   const [saving, setSaving] = useState(false);
   const [rescanning, setRescanning] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  // Debounce slider drags so we save once per pause, not per tick.
+  const opacityTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (opacityTimer.current !== null) {
+        window.clearTimeout(opacityTimer.current);
+      }
+    };
+  }, []);
 
   async function handleHotkeySave(e: React.FormEvent) {
     e.preventDefault();
@@ -314,6 +327,29 @@ export function LauncherSettingsPanel({
       setFormError(msg);
       onError(msg);
     }
+  }
+
+  async function handleOpacity(percent: number) {
+    setOpacity(percent);
+    setFormError(null);
+    if (opacityTimer.current !== null) {
+      window.clearTimeout(opacityTimer.current);
+    }
+    opacityTimer.current = window.setTimeout(() => {
+      opacityTimer.current = null;
+      void (async () => {
+        try {
+          const updated = await invoke<LauncherSettings>("set_panel_opacity", {
+            opacity: percent / 100,
+          });
+          onSaved(updated);
+        } catch (err) {
+          const msg = errMsg(err);
+          setFormError(msg);
+          onError(msg);
+        }
+      })();
+    }, 300);
   }
 
   async function handleRescan() {
@@ -361,6 +397,24 @@ export function LauncherSettingsPanel({
           onChange={(e) => void handleAutostart(e.target.checked)}
         />
         <span>Run AppForge when I sign in</span>
+      </label>
+
+      <label className="slider-row">
+        <span>
+          Panel solidity <strong>{opacity}%</strong>
+        </span>
+        <input
+          type="range"
+          min={30}
+          max={100}
+          step={1}
+          value={opacity}
+          onChange={(e) => void handleOpacity(Number(e.target.value))}
+          aria-label="Launcher panel solidity"
+        />
+        <span className="help">
+          How solid the launcher panel looks. Lower is more see-through.
+        </span>
       </label>
 
       <div className="inline-form">

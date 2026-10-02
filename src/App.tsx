@@ -21,6 +21,7 @@ import type {
   LauncherSettings,
   NativeProgram,
   PlatformInfo,
+  PreviewAddOutcome,
   PreviewStart,
   WebApp,
 } from "./types";
@@ -362,14 +363,56 @@ function AppIcon({ app }: { app: WebApp }) {
   );
 }
 
+/**
+ * Account tile thumbnail: the self-generated og:image when the backend
+ * managed to fetch one, else the app's cached logo, else a letter tile.
+ * Each failed stage falls through to the next.
+ */
+function AccountThumb({ account, app }: { account: Account; app: WebApp }) {
+  const [thumbFailed, setThumbFailed] = useState(false);
+  const [iconFailed, setIconFailed] = useState(false);
+  const thumbSrc =
+    !thumbFailed && account.thumbnail ? convertFileSrc(account.thumbnail) : null;
+  const appIconSrc = !iconFailed && app.icon ? convertFileSrc(app.icon) : null;
+  const src = thumbSrc ?? appIconSrc;
+  if (!src) {
+    return (
+      <span
+        className="account-thumb-fallback"
+        aria-hidden="true"
+        style={{
+          backgroundColor: `${safeColor(app.color)}22`,
+          color: safeColor(app.color),
+        }}
+      >
+        {account.label.charAt(0).toUpperCase() || "?"}
+      </span>
+    );
+  }
+  return (
+    <img
+      className="account-thumb"
+      src={src}
+      alt=""
+      loading="lazy"
+      onError={() => {
+        if (thumbSrc) setThumbFailed(true);
+        else setIconFailed(true);
+      }}
+    />
+  );
+}
+
 function AccountRow({
   account,
+  app,
   onOpen,
   onSuspend,
   onRemove,
   onRename,
 }: {
   account: Account;
+  app: WebApp;
   onOpen: () => void;
   onSuspend: () => void;
   onRemove: () => void;
@@ -377,11 +420,7 @@ function AccountRow({
 }) {
   return (
     <li className="account-row">
-      <span
-        className="dot"
-        aria-hidden="true"
-        style={{ backgroundColor: safeColor(account.color) }}
-      />
+      <AccountThumb account={account} app={app} />
       <div className="account-meta">
         <InlineEdit
           value={account.label}
@@ -530,7 +569,7 @@ function AppSettingsForm({
     setSaving(true);
     try {
       const updated = await invoke<WebApp>("update_app", {
-        id: app.id,
+        appId: app.id,
         name: cleanName,
         url: cleanUrl,
         color: safeColor(color),
@@ -637,6 +676,233 @@ function AppSettingsForm({
   );
 }
 
+/**
+ * Edit-app dialog: rename, change the URL/color, and manage the logo —
+ * upload a custom image, fetch the site's icon, or remove it.
+ */
+function EditAppDialog({
+  app,
+  onClose,
+  onSaved,
+}: {
+  app: WebApp;
+  onClose: () => void;
+  onSaved: (app: WebApp) => void;
+}) {
+  const [name, setName] = useState(app.name);
+  const [url, setUrl] = useState(app.url);
+  const [color, setColor] = useState(safeColor(app.color));
+  const [icon, setIcon] = useState<string | null>(app.icon);
+  const [saving, setSaving] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // Escape closes the dialog.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setFormError(null);
+    const cleanName = name.trim();
+    if (!cleanName) {
+      setFormError("Give the app a name.");
+      return;
+    }
+    if (!isValidHexColor(color)) {
+      setFormError("Color must look like #6366f1.");
+      return;
+    }
+    const cleanUrl = normalizeUrl(url);
+    if (!cleanUrl) {
+      setFormError("Enter a valid URL, e.g. https://example.com");
+      return;
+    }
+    setSaving(true);
+    try {
+      const updated = await invoke<WebApp>("update_app", {
+        appId: app.id,
+        name: cleanName,
+        url: cleanUrl,
+        color,
+      });
+      onSaved(updated);
+    } catch (err) {
+      setFormError(errMsg(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleFile(file: File) {
+    setFormError(null);
+    setWorking(true);
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const ext = (file.name.split(".").pop() ?? "").toLowerCase();
+      const path = await invoke<string>("set_app_icon_data", {
+        appId: app.id,
+        data: Array.from(buf),
+        ext,
+      });
+      setIcon(path);
+    } catch (err) {
+      setFormError(errMsg(err));
+    } finally {
+      setWorking(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  async function handleFetchIcon() {
+    setFormError(null);
+    setWorking(true);
+    try {
+      const path = await invoke<string | null>("fetch_favicon", {
+        appId: app.id,
+      });
+      if (path) {
+        setIcon(path);
+      } else {
+        setFormError("Couldn't find a logo on that site.");
+      }
+    } catch (err) {
+      setFormError(errMsg(err));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function handleRemoveIcon() {
+    setFormError(null);
+    setWorking(true);
+    try {
+      await invoke("clear_app_icon", { appId: app.id });
+      setIcon(null);
+    } catch (err) {
+      setFormError(errMsg(err));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  return (
+    <div
+      className="dialog-overlay"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Edit ${app.name}`}
+    >
+      <div className="dialog" onClick={(e) => e.stopPropagation()}>
+        <h3>Edit app</h3>
+        <form onSubmit={(e) => void handleSave(e)}>
+          <label>
+            <span>Name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={80}
+              autoComplete="off"
+            />
+          </label>
+          <label>
+            <span>Website URL</span>
+            <input
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              inputMode="url"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            <span>Color</span>
+            <span className="color-row">
+              <input
+                type="color"
+                value={safeColor(color)}
+                onChange={(e) => setColor(e.target.value)}
+                aria-label="App color"
+              />
+              <input
+                value={color}
+                onChange={(e) => setColor(e.target.value)}
+                maxLength={7}
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="Color hex value"
+              />
+            </span>
+          </label>
+          <div className="logo-section">
+            <span className="field-label">Logo</span>
+            <div className="logo-row">
+              <span className="logo-preview">
+                <AppIcon app={{ ...app, icon }} />
+              </span>
+              <div className="logo-actions">
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp,.ico"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void handleFile(f);
+                  }}
+                  aria-label="Upload a logo"
+                />
+                <div className="logo-buttons">
+                  <button
+                    type="button"
+                    onClick={() => void handleFetchIcon()}
+                    disabled={working}
+                  >
+                    {working ? "Working…" : "Fetch from site"}
+                  </button>
+                  {icon && (
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => void handleRemoveIcon()}
+                      disabled={working}
+                    >
+                      Remove logo
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+            <span className="help">
+              PNG, JPEG, GIF, WebP or ICO, up to 2 MiB. Without a logo the
+              tile shows the site's icon, then a letter.
+            </span>
+          </div>
+          {formError && (
+            <p className="form-error" role="alert">
+              {formError}
+            </p>
+          )}
+          <div className="dialog-actions">
+            <button type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" disabled={saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [apps, setApps] = useState<WebApp[]>([]);
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
@@ -645,6 +911,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [settingsOpen, setSettingsOpen] = useState<Set<string>>(new Set());
+  const [editingApp, setEditingApp] = useState<WebApp | null>(null);
 
   // Launcher: hotkey-summoned search over apps, accounts, and programs.
   const [programs, setPrograms] = useState<NativeProgram[]>([]);
@@ -768,26 +1035,49 @@ export default function App() {
   }, []);
 
   // A preview that was added as an app: pick it up in the library and open
-  // its first account, which carries the session the user signed in to.
-  // If the site was already in the library (no duplicate was created),
-  // reveal the existing entry instead.
+  // the account that adopted the signed-in session. When the site was
+  // already in the library, no duplicate app is created — the session
+  // becomes a new account on the existing app instead.
   useEffect(() => {
     let off: (() => void) | undefined;
-    listen<AddAppOutcome>("appforge:preview-added", (event) => {
+    listen<PreviewAddOutcome>("appforge:preview-added", (event) => {
       const created = {
         ...event.payload.app,
         accounts: event.payload.app.accounts ?? [],
         settings: event.payload.app.settings ?? DEFAULT_SETTINGS,
       };
+      // The account carrying the fresh session: the backend names it, with
+      // the newest account on the card as fallback.
+      const adopted =
+        event.payload.addedAccount ??
+        created.accounts[created.accounts.length - 1];
       if (!event.payload.created) {
-        revealApp(created, `"${created.name}" is already in your library — showing it instead of adding a duplicate.`);
+        setApps((prev) => prev.map((a) => (a.id === created.id ? created : a)));
+        setExpanded((prev) => {
+          const next = new Set(prev);
+          next.add(created.id);
+          return next;
+        });
+        setError(null);
+        setNotice(`Added as another account under "${created.name}".`);
+        if (adopted) {
+          invoke("open_account", { appId: created.id, accountId: adopted.id }).catch(
+            (err) => setError(`Could not open "${created.name}". ${errMsg(err)}`)
+          );
+        }
         return;
       }
       setApps((prev) => [...prev, created]);
-      const first = created.accounts[0];
-      if (first) {
+      // Expand the new card so the rename affordance and the new account
+      // are visible right away.
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        next.add(created.id);
+        return next;
+      });
+      if (adopted) {
         setError(null);
-        invoke("open_account", { appId: created.id, accountId: first.id }).catch(
+        invoke("open_account", { appId: created.id, accountId: adopted.id }).catch(
           (err) => setError(`Could not open "${created.name}". ${errMsg(err)}`)
         );
       }
@@ -1121,6 +1411,8 @@ export default function App() {
 
   function renderResultIcon(r: SearchResult): React.ReactNode {
     if (r.kind === "program") return <ProgramIcon program={r.program} />;
+    if (r.kind === "account")
+      return <AccountThumb account={r.account} app={r.app} />;
     return <AppIcon app={r.app} />;
   }
 
@@ -1170,7 +1462,11 @@ export default function App() {
   if (view === "launcher") {
     return (
       <div className="launcher-shell">
-        <div className="folder-panel" key={summonCount}>
+        <div
+          className="folder-panel"
+          key={summonCount}
+          style={{ "--folder-alpha": String(launcherSettings?.panel_opacity ?? 0.55) } as React.CSSProperties}
+        >
           <SearchBar
             query={query}
             onQuery={setQuery}
@@ -1312,6 +1608,12 @@ export default function App() {
                           ? "Hide"
                           : `Accounts (${app.accounts.length})`}
                       </button>
+                      <button
+                        className="text-button"
+                        onClick={() => setEditingApp(app)}
+                      >
+                        Edit
+                      </button>
                       <button className="danger" onClick={() => void handleRemoveApp(app)}>
                         Remove
                       </button>
@@ -1328,6 +1630,7 @@ export default function App() {
                             <AccountRow
                               key={account.id}
                               account={account}
+                              app={app}
                               onOpen={() => void handleOpenAccount(app, account)}
                               onSuspend={() => void handleSuspendAccount(app, account)}
                               onRemove={() => void handleRemoveAccount(app, account)}
@@ -1408,6 +1711,17 @@ export default function App() {
           : "checking…"}
         .
       </footer>
+
+      {editingApp && (
+        <EditAppDialog
+          app={editingApp}
+          onClose={() => setEditingApp(null)}
+          onSaved={(updated) => {
+            replaceApp(updated);
+            setEditingApp(null);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -14,7 +14,7 @@ serde_json = "1"
 # (wry#583). Window-creating commands (open_account, preview_start) are
 # `async fn`, and the OAuth modal builds on a dedicated spawned thread.
 # Only the stable WebviewWindowBuilder API is used anywhere.
-tauri = { features = ["tray-icon"], version = "2" }
+tauri = { features = ["tray-icon", "protocol-asset"], version = "2" }
 tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
 # Filter-list downloads. rustls ("tls") only; no native-tls dependency.

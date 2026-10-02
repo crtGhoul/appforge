@@ -213,6 +213,79 @@ pub fn parse_icon_candidates(html: &str, base: &url::Url) -> Vec<IconCandidate> 
     out
 }
 
+/// Find `<meta …>` tag spans (byte ranges), case-insensitively. Same
+/// quote-aware scan as `link_tag_spans`.
+fn meta_tag_spans(html: &str) -> Vec<(usize, usize)> {
+    let lower = html.to_lowercase();
+    let bytes = html.as_bytes();
+    let mut spans = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<meta") {
+        let start = pos + rel;
+        // "meta" must be followed by whitespace, '/' or '>' — not "<metadata".
+        let valid = matches!(
+            lower.as_bytes().get(start + 5),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'/') | Some(b'>')
+        );
+        if !valid {
+            pos = start + 5;
+            continue;
+        }
+        let mut i = start + 5;
+        let mut quote: Option<u8> = None;
+        let mut end: Option<usize> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+            } else if b == b'"' || b == b'\'' {
+                quote = Some(b);
+            } else if b == b'>' {
+                end = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        match end {
+            Some(e) => {
+                spans.push((start, e + 1));
+                pos = e + 1;
+            }
+            None => break,
+        }
+    }
+    spans
+}
+
+/// Find `<meta property="og:image" content="…">` and resolve the URL
+/// against `base`. First usable absolute URL wins; data: URLs are skipped.
+pub fn parse_og_image(html: &str, base: &url::Url) -> Option<String> {
+    for (start, end) in meta_tag_spans(html) {
+        let attrs = parse_attrs(&html[start..end]);
+        let get = |n: &str| attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        match get("property") {
+            Some(p) if p.trim().eq_ignore_ascii_case("og:image") => {}
+            _ => continue,
+        }
+        let content = match get("content") {
+            Some(c) if !c.trim().is_empty() => c.trim(),
+            _ => continue,
+        };
+        if content.to_lowercase().starts_with("data:") {
+            continue;
+        }
+        if let Ok(u) = base.join(content) {
+            let s = u.to_string();
+            if s.starts_with("http://") || s.starts_with("https://") {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -76,6 +76,10 @@ pub struct Account {
     pub label: String,
     pub color: String,
     pub session_dir: String,
+    /// Locally cached site thumbnail (og:image), shown on account tiles.
+    /// Old records without it migrate via the serde default.
+    #[serde(default)]
+    pub thumbnail: Option<String>,
     pub last_opened: u64,
     pub created_at: u64,
 }
@@ -142,13 +146,28 @@ pub(crate) fn is_valid_url(url: &str) -> bool {
     !host.is_empty() && (host.contains('.') || host == "localhost")
 }
 
+/// Normalize a user-supplied color to lowercase `#rrggbb`. Accepts the
+/// leading `#` with or without it; rejects anything that is not exactly six
+/// hex digits.
+pub(crate) fn normalize_hex_color(raw: &str) -> Option<String> {
+    let s = raw.trim().strip_prefix('#').unwrap_or(raw.trim());
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(format!("#{}", s.to_lowercase()))
+    } else {
+        None
+    }
+}
+
 /// Result of adding an app: either a fresh app, or the already-existing app
-/// for the same site. Duplicates are never created — the frontend reveals
-/// the existing entry instead.
+/// for the same site. Duplicates are never created. `added_account` is the
+/// account that adopted the caller's session, when one was involved (the
+/// preview flow); the quick-add form passes no session, so it is `None`
+/// when the app already existed there.
 #[derive(Debug, Clone, Serialize)]
 pub struct AddAppOutcome {
     pub app: WebApp,
     pub created: bool,
+    pub added_account: Option<Account>,
 }
 
 /// Canonical key for duplicate detection: lowercase scheme + host, default
@@ -283,6 +302,7 @@ impl AppStore {
                     label: "Main".to_string(),
                     color: DEFAULT_COLOR.to_string(),
                     session_dir: session_dir.to_string_lossy().into_owned(),
+                    thumbnail: None,
                     last_opened: 0,
                     created_at: now,
                 }],
@@ -308,6 +328,19 @@ impl AppStore {
 
     fn sessions_root(&self) -> PathBuf {
         self.data_dir.join("sessions")
+    }
+
+    fn favicons_dir(&self) -> PathBuf {
+        self.data_dir.join("favicons")
+    }
+
+    /// Best-effort account thumbnail: the site's og:image, cached locally.
+    /// Never fails — returns None when anything goes wrong, and the tiles
+    /// keep their fallbacks. Called without the apps lock held.
+    fn fetch_thumbnail(&self, url: &str) -> Option<String> {
+        let page_url: url::Url = url.parse().ok()?;
+        let path = crate::favicon::fetch_og_image(&page_url, &self.favicons_dir())?;
+        Some(path.to_string_lossy().into_owned())
     }
 
     pub fn list(&self) -> Result<Vec<WebApp>, String> {
@@ -346,6 +379,7 @@ impl AppStore {
             return Ok(AddAppOutcome {
                 app: existing,
                 created: false,
+                added_account: None,
             });
         }
         let now = unix_secs();
@@ -368,6 +402,7 @@ impl AppStore {
                 label: "Main".to_string(),
                 color: DEFAULT_COLOR.to_string(),
                 session_dir: session_dir.to_string_lossy().into_owned(),
+                thumbnail: None,
                 last_opened: 0,
                 created_at: now,
             }],
@@ -381,7 +416,7 @@ impl AppStore {
             apps.push(app.clone());
         }
         self.save()?;
-        Ok(AddAppOutcome { app, created: true })
+        Ok(AddAppOutcome { added_account: app.accounts.first().cloned(), app, created: true })
     }
 
     /// Find an app by normalized URL. Used to refuse duplicates.
@@ -416,13 +451,50 @@ impl AppStore {
         if !is_valid_url(&url) {
             return Err("URL must start with http:// or https://.".to_string());
         }
-        // A preview of a site that's already in the library must not create
-        // a duplicate — the caller discards the preview and reveals the
-        // existing app instead.
+        // A preview of a site that's already in the library becomes another
+        // account on the existing app: the signed-in temp dir is adopted as
+        // the new account's session dir, never destroyed. (The quick-add
+        // form keeps its old reveal-the-existing-app behavior — no session
+        // is involved there.)
         if let Some(existing) = self.find_by_url(&url) {
+            let now = unix_secs();
+            let app_id = existing.id.clone();
+            let account_id = new_id("acct");
+            let session_dir = self.sessions_root().join(&app_id).join(&account_id);
+            crate::preview::move_session_dir(temp_dir, &session_dir)?;
+            // Best-effort thumbnail, fetched before the write lock.
+            let thumbnail = self.fetch_thumbnail(&url);
+            let account = Account {
+                id: account_id,
+                app_id: app_id.clone(),
+                label: if label.is_empty() {
+                    format!("Account {}", existing.accounts.len() + 1)
+                } else {
+                    label
+                },
+                color: DEFAULT_COLOR.to_string(),
+                session_dir: session_dir.to_string_lossy().into_owned(),
+                thumbnail,
+                last_opened: 0,
+                created_at: now,
+            };
+            let updated = {
+                let mut apps = self
+                    .apps
+                    .lock()
+                    .map_err(|e| format!("store lock poisoned: {e}"))?;
+                let app = apps
+                    .iter_mut()
+                    .find(|a| a.id == app_id)
+                    .ok_or_else(|| "App not found.".to_string())?;
+                app.accounts.push(account.clone());
+                app.clone()
+            };
+            self.save()?;
             return Ok(AddAppOutcome {
-                app: existing,
+                app: updated,
                 created: false,
+                added_account: Some(account),
             });
         }
         let now = unix_secs();
@@ -430,6 +502,8 @@ impl AppStore {
         let account_id = new_id("acct");
         let session_dir = self.sessions_root().join(&app_id).join(&account_id);
         crate::preview::move_session_dir(temp_dir, &session_dir)?;
+        // Best-effort thumbnail, fetched before the write lock.
+        let thumbnail = self.fetch_thumbnail(&url);
 
         let app = WebApp {
             id: app_id.clone(),
@@ -448,6 +522,7 @@ impl AppStore {
                 },
                 color: DEFAULT_COLOR.to_string(),
                 session_dir: session_dir.to_string_lossy().into_owned(),
+                thumbnail,
                 last_opened: 0,
                 created_at: now,
             }],
@@ -461,7 +536,7 @@ impl AppStore {
             apps.push(app.clone());
         }
         self.save()?;
-        Ok(AddAppOutcome { app, created: true })
+        Ok(AddAppOutcome { added_account: app.accounts.first().cloned(), app, created: true })
     }
 
     pub fn update_app(        &self,
@@ -472,15 +547,16 @@ impl AppStore {
     ) -> Result<WebApp, String> {
         let name = name.trim().to_string();
         let url = url.trim().to_string();
-        let color = color.trim().to_string();
+        let color = normalize_hex_color(&color)
+            .ok_or_else(|| "Color must be a hex color like #6366f1.".to_string())?;
         if name.is_empty() {
             return Err("Name is required.".to_string());
         }
+        if name.chars().count() > 80 {
+            return Err("Name is too long (80 characters max).".to_string());
+        }
         if !is_valid_url(&url) {
             return Err("URL must start with http:// or https://.".to_string());
-        }
-        if color.is_empty() {
-            return Err("Color is required.".to_string());
         }
         let updated = {
             let mut apps = self
@@ -619,6 +695,21 @@ impl AppStore {
         if label.is_empty() {
             return Err("Account label is required.".to_string());
         }
+        // Best-effort thumbnail: resolve the URL and fetch before the write
+        // lock, so a slow site can't hold it.
+        let app_url = {
+            let apps = self
+                .apps
+                .lock()
+                .map_err(|e| format!("store lock poisoned: {e}"))?;
+            apps
+                .iter()
+                .find(|a| a.id == app_id)
+                .map(|a| a.url.clone())
+                .ok_or_else(|| "App not found.".to_string())?
+        };
+        let thumbnail = self.fetch_thumbnail(&app_url);
+
         let now = unix_secs();
         let account_id = new_id("acct");
         let session_dir = self.sessions_root().join(app_id).join(&account_id);
@@ -643,6 +734,7 @@ impl AppStore {
                     .filter(|c| !c.is_empty())
                     .unwrap_or_else(|| app.color.clone()),
                 session_dir: session_dir.to_string_lossy().into_owned(),
+                thumbnail,
                 last_opened: 0,
                 created_at: now,
             };
