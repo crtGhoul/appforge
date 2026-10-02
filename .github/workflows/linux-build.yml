@@ -1,0 +1,64 @@
+name: linux-build
+
+# AppForge — Linux packaging pipeline.
+# Produces AppImage + .deb on ubuntu-24.04.
+# Windows-only features (network ad-blocking, window suspend) are labeled
+# honestly in the app and gracefully degrade on Linux.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust target
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Typecheck + build frontend
+        run: npm run build
+
+      - name: Build Tauri bundles (AppImage + deb)
+        run: npm run tauri build
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: appforge-linux-packages
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
