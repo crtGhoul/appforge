@@ -56,7 +56,28 @@ export type SearchResult =
   | { kind: "account"; id: string; title: string; context: string; score: number; app: WebApp; account: Account }
   | { kind: "app"; id: string; title: string; context: string; score: number; app: WebApp }
   | { kind: "program"; id: string; title: string; context: string; score: number; program: NativeProgram }
-  | { kind: "routine"; id: string; title: string; context: string; score: number; routine: Routine };
+  | { kind: "routine"; id: string; title: string; context: string; score: number; routine: Routine }
+  | { kind: "search"; id: string; title: string; context: string; score: number; query: string };
+
+/**
+ * v0.9.3: pinned web searches. The tag is `search:<url-encoded query>` —
+ * it rides the same pinned-id machinery as app:/account:/program: tags
+ * (pin order, usage ranking, toggle_pin), and the tile re-runs the query
+ * in the shared in-app search window.
+ */
+export function searchTag(query: string): string {
+  return `search:${encodeURIComponent(query)}`;
+}
+
+/** Inverse of `searchTag`; null when the id is not a search tag. */
+export function parseSearchTag(id: string): string | null {
+  if (!id.startsWith("search:")) return null;
+  try {
+    return decodeURIComponent(id.slice("search:".length));
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Columns in the launcher folder grid. Must match `grid-template-columns`
@@ -211,6 +232,21 @@ export function browseAll(
       program,
     });
   }
+  // v0.9.3: pinned web searches have no app/program behind them — their
+  // only existence is the pinned tag, so they are materialized here.
+  for (const pid of opts?.pinned ?? []) {
+    const q = parseSearchTag(pid);
+    if (q !== null && q.trim() !== "") {
+      items.push({
+        kind: "search",
+        id: pid,
+        title: q,
+        context: "Web search",
+        score: 0,
+        query: q,
+      });
+    }
+  }
   return sortLauncherItems(items, opts).slice(0, BROWSE_LIMIT);
 }
 
@@ -286,6 +322,23 @@ export function buildResults(
         context: "Routine — Enter to run",
         score,
         routine,
+      });
+    }
+  }
+
+  // v0.9.3: pinned web searches stay discoverable while typing.
+  for (const pid of opts?.pinned ?? []) {
+    const sq = parseSearchTag(pid);
+    if (sq === null || sq.trim() === "") continue;
+    const sScore = fuzzyScore(q, sq);
+    if (sScore > 0) {
+      results.push({
+        kind: "search",
+        id: pid,
+        title: sq,
+        context: "Web search",
+        score: sScore,
+        query: sq,
       });
     }
   }
@@ -369,6 +422,29 @@ export function ProgramIcon({ program }: { program: NativeProgram }) {
       loading="lazy"
       onError={() => setFailed(true)}
     />
+  );
+}
+
+/**
+ * v0.9.3: magnifier tile icon for pinned web searches. Inline SVG, quiet
+ * stroke style matching the tile aesthetic — no emoji, one accent family.
+ */
+export function SearchTileIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      focusable="false"
+      width="34"
+      height="34"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+    >
+      <circle cx="11" cy="11" r="7" />
+      <line x1="16.5" y1="16.5" x2="21" y2="21" />
+    </svg>
   );
 }
 
@@ -913,6 +989,14 @@ export function buildTileMenuEntries(
   if (r.kind === "routine") {
     return [{ key: "run", label: "Run", onSelect: () => a.onOpen(r) }];
   }
+  if (r.kind === "search") {
+    // v0.9.3: pinned web search — re-run it, or unpin. Nothing else
+    // applies (no app to edit, no file to reveal).
+    return [
+      { key: "open", label: "Search again", onSelect: () => a.onOpen(r) },
+      pin,
+    ];
+  }
   const prog = r.program;
   const entries: MenuEntry[] = [
     { key: "launch", label: "Launch", onSelect: () => a.onOpen(r) },
@@ -1385,23 +1469,13 @@ export async function runSystemCommand(action: SystemAction): Promise<void> {
 }
 
 /**
- * invoke("open_url_in_browser", { url }) — web search with the engine from
- * the launcher settings (DuckDuckGo default, Google selectable). Read at
- * call time so a settings change applies to the next search.
+ * invoke("open_web_search", { query }) — v0.9.3: the search opens in the
+ * shared in-app webview window ("web app"), not the external browser.
+ * The backend picks the engine from the launcher settings (DuckDuckGo
+ * default, Google selectable) and reuses the single search window.
  */
 export async function openWebSearch(query: string): Promise<void> {
-  let engine: string = "duckduckgo";
-  try {
-    const settings = await invoke<LauncherSettings>("get_launcher_settings");
-    if (settings.search_engine === "google") engine = "google";
-  } catch {
-    /* fall back to DuckDuckGo */
-  }
-  const url =
-    engine === "google"
-      ? `https://www.google.com/search?q=${encodeURIComponent(query)}`
-      : `https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
-  await invoke("open_url_in_browser", { url });
+  await invoke("open_web_search", { query });
 }
 
 /** invoke("preview_start", { url }) — the existing preview/sign-in flow takes over. */
@@ -1443,8 +1517,12 @@ export const LauncherCommandRows = forwardRef<
     /** Dismiss the overlay after a command ran (e.g. clear query + hide). */
     onDone: () => void;
     onError: (msg: string) => void;
+    /** v0.9.3: pin the `?query` row as a launcher tile. */
+    onPinSearch?: (query: string) => void;
+    /** v0.9.3: true when this exact query is already pinned. */
+    searchPinned?: boolean;
   }
->(function LauncherCommandRows({ command, onDone, onError }, ref) {
+>(function LauncherCommandRows({ command, onDone, onError, onPinSearch, searchPinned }, ref) {
   const [confirming, setConfirming] = useState(false);
   const confirmBtnRef = useRef<HTMLButtonElement | null>(null);
 
@@ -1570,10 +1648,22 @@ export const LauncherCommandRows = forwardRef<
         );
       case "web-search":
         return (
-          <button type="button" className="cmd-row" onClick={activate}>
-            <span className="cmd-title">Search the web for &lsquo;{command.query}&rsquo;</span>
-            <span className="cmd-sub">Opens in your browser</span>
-          </button>
+          <div className="cmd-row-split">
+            <button type="button" className="cmd-row" onClick={activate}>
+              <span className="cmd-title">Search the web for &lsquo;{command.query}&rsquo;</span>
+              <span className="cmd-sub">Opens as a web app</span>
+            </button>
+            {!searchPinned && onPinSearch && (
+              <button
+                type="button"
+                className="cmd-pin-btn"
+                onClick={() => onPinSearch(command.query)}
+                title="Pin this search to the launcher"
+              >
+                Pin
+              </button>
+            )}
+          </div>
         );
       case "quick-add":
         return (

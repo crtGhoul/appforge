@@ -335,7 +335,7 @@ static OAUTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// treatment. Modified clicks (Ctrl/Cmd/Shift/Alt, middle button) are left
 /// alone. Runs in the page's main world but touches no page state and
 /// exposes no IPC; `withGlobalTauri` stays false.
-const TARGET_BLANK_SHIM_JS: &str = r#"(function () {
+pub(crate) const TARGET_BLANK_SHIM_JS: &str = r#"(function () {
   document.addEventListener('click', function (e) {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     var t = e.target;
@@ -354,7 +354,7 @@ const TARGET_BLANK_SHIM_JS: &str = r#"(function () {
 /// preventDefault matches browser behavior (the browser consumes the keys
 /// before the page even when focus is in a text field). Pure page JS: no
 /// page state touched, no IPC, `withGlobalTauri` stays false.
-const NAV_KEYS_JS: &str = r#"(function () {
+pub(crate) const NAV_KEYS_JS: &str = r#"(function () {
   document.addEventListener('keydown', function (e) {
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopPropagation(); history.back(); }

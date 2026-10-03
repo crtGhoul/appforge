@@ -362,6 +362,39 @@ button.cmd-row:focus-visible {
   text-overflow: ellipsis;
 }
 
+/* v0.9.3: web-search row with its Pin action side by side. */
+.cmd-row-split {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.cmd-row-split .cmd-row {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+
+.cmd-pin-btn {
+  flex: none;
+  padding: 10px 16px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  color: #c7cbff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cmd-pin-btn:hover,
+.cmd-pin-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+  outline: none;
+  border-color: rgba(129, 140, 248, 0.6);
+}
+
 .cmd-hint {
   cursor: default;
 }

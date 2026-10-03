@@ -18,6 +18,7 @@ mod preview;
 mod routines;
 mod store;
 mod syscmd;
+mod websearch;
 mod windows;
 /// Bare-Windows-key tap summon for the clipboard popup (v0.9.2).
 /// The tap classifier is pure logic and compiles everywhere (unit-tested
@@ -895,6 +896,8 @@ fn main() {
             // v0.7.0: launcher system commands + open-in-browser
             syscmd::system_command,
             syscmd::open_url_in_browser,
+            // v0.9.3: `?query` web search opens as an in-app web app window
+            websearch::open_web_search,
             // v0.7.0: in-app download manager
             downloads::list_downloads,
             downloads::open_download,
@@ -920,6 +923,8 @@ fn main() {
             // v0.9.0: clipboard history (local; v0.9.1 added images)
             clipboard::list_clipboard,
             clipboard::copy_clipboard_entry,
+            // v0.9.3: multi-select — several text entries, one payload
+            clipboard::copy_clipboard_entries,
             clipboard::hide_clipboard_popup,
             clipboard::clear_clipboard,
             clipboard::get_clipboard_settings,

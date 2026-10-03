@@ -848,6 +848,51 @@ pub fn copy_clipboard_entry(app: AppHandle, entry_id: String) -> Result<(), Stri
     Ok(())
 }
 
+/// Merge several text entries into one clipboard payload (v0.9.3
+/// multi-select). Pure: ids arrive in display order (newest first) and the
+/// join preserves it. Images are excluded — the OS clipboard holds one
+/// image via write_image, so combining them is meaningless; the UI keeps
+/// images out of multi-select mode. Unknown ids are skipped (an entry can
+/// be evicted between list and copy).
+fn merge_selected_texts(
+    entries: &VecDeque<ClipboardEntry>,
+    ids: &[String],
+) -> Result<(String, usize), String> {
+    let texts: Vec<&str> = ids
+        .iter()
+        .filter_map(|id| entries.iter().find(|e| &e.id == id))
+        .filter(|e| e.kind == EntryKind::Text)
+        .map(|e| e.text.as_str())
+        .collect();
+    if texts.is_empty() {
+        return Err("Nothing to copy.".to_string());
+    }
+    let count = texts.len();
+    Ok((texts.join("\n\n"), count))
+}
+
+/// Copy several text entries as ONE clipboard payload (v0.9.3 multi-select).
+/// `entry_ids` arrive in display order (newest first); texts are joined
+/// with blank lines. Images are skipped — see `merge_selected_texts`.
+/// JS: `invoke("copy_clipboard_entries", { entryIds })`.
+#[tauri::command]
+pub fn copy_clipboard_entries(
+    app: AppHandle,
+    entry_ids: Vec<String>,
+) -> Result<usize, String> {
+    let (joined, count) =
+        with_state(&app, |data| merge_selected_texts(&data.entries, &entry_ids))??;
+    app.clipboard()
+        .write_text(joined.clone())
+        .map_err(|e| format!("Couldn't write to the clipboard: {e}"))?;
+    // Remember what we just wrote so the watcher doesn't re-record the
+    // merged payload as a new copy.
+    let _ = with_state(&app, |data| {
+        data.last_seen = Some(joined);
+    });
+    Ok(count)
+}
+
 /// Empty the history (text + images, including the saved PNGs). The OS
 /// clipboard is untouched.
 /// JS: `invoke("clear_clipboard")`.
@@ -1191,5 +1236,52 @@ mod tests {
         assert_eq!(decoded.cap, 50);
         assert_eq!(decoded.hotkey, "Ctrl+Shift+X");
         assert!(decoded.win_tap);
+    }
+
+    #[test]
+    fn merge_selected_preserves_order_and_joins_with_blank_lines() {
+        let mut entries = VecDeque::new();
+        // Display order is newest first; ids arrive in that order.
+        for (id, text) in [("c1", "first"), ("c2", "second"), ("c3", "third")] {
+            let mut e = text_entry(id);
+            e.text = text.to_string();
+            entries.push_back(e);
+        }
+        let ids = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
+        let (joined, count) = merge_selected_texts(&entries, &ids).unwrap();
+        assert_eq!(joined, "first\n\nsecond\n\nthird");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn merge_selected_excludes_images_and_skips_unknown_ids() {
+        let mut entries = VecDeque::new();
+        let mut t1 = text_entry("t1");
+        t1.text = "keep me".to_string();
+        entries.push_back(t1);
+        entries.push_back(image_entry("i1"));
+        let mut t2 = text_entry("t2");
+        t2.text = "me too".to_string();
+        entries.push_back(t2);
+        // Image id + unknown id are skipped, not errors.
+        let ids = vec![
+            "t1".to_string(),
+            "i1".to_string(),
+            "gone".to_string(),
+            "t2".to_string(),
+        ];
+        let (joined, count) = merge_selected_texts(&entries, &ids).unwrap();
+        assert_eq!(joined, "keep me\n\nme too");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn merge_selected_empty_is_an_error() {
+        let entries = VecDeque::new();
+        assert!(merge_selected_texts(&entries, &[]).is_err());
+        // Images alone are not copyable as a merge.
+        let mut only_image = VecDeque::new();
+        only_image.push_back(image_entry("i1"));
+        assert!(merge_selected_texts(&only_image, &["i1".to_string()]).is_err());
     }
 }

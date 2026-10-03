@@ -139,7 +139,10 @@ impl Default for LauncherSettings {
 }
 
 impl LauncherSettings {
-    /// Pin or unpin a tagged tile id (`app:<id>`, `account:<id>`, `program:<id>`).
+    /// Pin or unpin a tagged tile id (`app:<id>`, `account:<id>`,
+    /// `program:<id>` — and v0.9.3's `search:<url-encoded query>` for
+    /// pinned web searches). Any string tag round-trips; the UI only
+    /// offers tags it can render.
     pub fn toggle_pin(&mut self, item_id: &str) {
         if let Some(pos) = self.pinned.iter().position(|p| p == item_id) {
             self.pinned.remove(pos);
@@ -364,5 +367,19 @@ mod tests {
         assert_eq!(s.hotkey, "Ctrl+Alt+A");
         assert!(!s.autostart);
         assert!(s.seen_intro);
+    }
+
+    #[test]
+    fn toggle_pin_round_trips_search_tags() {
+        let mut s = LauncherSettings::default();
+        // v0.9.3: pinned web searches ride the same tagged-id machinery.
+        s.toggle_pin("search:weather%20houston");
+        assert_eq!(s.pinned, vec!["search:weather%20houston".to_string()]);
+        s.toggle_pin("search:weather%20houston");
+        assert!(s.pinned.is_empty());
+        // Other kinds are untouched by the same machinery.
+        s.toggle_pin("app:abc");
+        s.toggle_pin("search:x");
+        assert_eq!(s.pinned.len(), 2);
     }
 }

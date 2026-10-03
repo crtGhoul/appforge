@@ -35,10 +35,12 @@ import {
   ProgramIcon,
   RescanButton,
   SearchBar,
+  SearchTileIcon,
   browseAll,
   buildResults,
   matchLauncherCommand,
   recordLaunch,
+  searchTag,
   useProgramsScannedRefresh,
   useTileMenu,
 } from "./Launcher";
@@ -2507,6 +2509,10 @@ export default function App() {
       } else if (r.kind === "account") {
         const ok = await handleOpenAccount(r.app, r.account);
         if (!ok) return;
+      } else if (r.kind === "search") {
+        // v0.9.3: pinned web search — re-run the query in the shared
+        // in-app search window.
+        await invoke("open_web_search", { query: r.query });
       } else {
         // Web app row: open the most recently used account.
         const acct = mostRecentAccount(r.app) ?? r.app.accounts[0];
@@ -2514,8 +2520,8 @@ export default function App() {
         const ok = await handleOpenAccount(r.app, acct);
         if (!ok) return;
       }
-      // Usage ranking: the tile's tagged id (app:/account:/program:) feeds
-      // the pinned-first, usage-ranked sort. Fire-and-forget.
+      // Usage ranking: the tile's tagged id (app:/account:/program:/
+      // search:) feeds the pinned-first, usage-ranked sort. Fire-and-forget.
       recordLaunch(r.id);
       // Spotlight behavior: a successful activation dismisses the overlay.
       setQuery("");
@@ -2558,6 +2564,7 @@ export default function App() {
 
   function renderResultIcon(r: SearchResult): React.ReactNode {
     if (r.kind === "program") return <ProgramIcon program={r.program} />;
+    if (r.kind === "search") return <SearchTileIcon />;
     if (r.kind === "routine")
       return (
         <span className="app-icon-fallback" aria-hidden="true">
@@ -2684,6 +2691,19 @@ export default function App() {
                   );
                 }}
                 onError={setError}
+                onPinSearch={(q) => {
+                  // v0.9.3: pin this `?query` as a launcher tile. Same
+                  // toggle_pin machinery as every other tile.
+                  invoke<LauncherSettings>("toggle_pin", {
+                    itemId: searchTag(q),
+                  })
+                    .then(setLauncherSettings)
+                    .catch((err) => setError(errMsg(err)));
+                }}
+                searchPinned={
+                  command.kind === "web-search" &&
+                  (launcherSettings?.pinned?.includes(searchTag(command.query)) ?? false)
+                }
               />
             )}
             {loading ? (
