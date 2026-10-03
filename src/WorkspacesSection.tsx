@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Account, WebApp } from "./types";
+import { HotkeyCapture } from "./HotkeyCapture";
 
 /**
  * Workspaces: named groups of apps/accounts ("Work", "Personal").
@@ -383,11 +384,12 @@ export default function WorkspacesSection({
           </label>
           <label>
             <span>Hotkey (optional)</span>
-            <input
+            <HotkeyCapture
               value={hotkey}
-              onChange={(e) => setHotkey(e.target.value)}
-              placeholder="e.g. Ctrl+Alt+W"
-              autoComplete="off"
+              onChange={setHotkey}
+              ariaLabel="Workspace hotkey"
+              placeholder="Click to set…"
+              allowClear
             />
           </label>
           <p className="muted small">

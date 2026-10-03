@@ -91,6 +91,14 @@ fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
     })
 }
 
+/// Syntax-check a hotkey string against the global-shortcut parser without
+/// registering anything. Used by the HotkeyCapture component for immediate
+/// inline validation while the user is still editing — a combination the
+/// parser rejects here would fail the same way at save time.
+pub fn validate_hotkey_syntax(hotkey: &str) -> Result<(), String> {
+    parse_hotkey(hotkey).map(|_| ())
+}
+
 /// The launcher summon hotkey, for naming conflicts against it. Read from
 /// the already-managed launcher settings; absent -> no summon comparison.
 fn summon_shortcut_id(app: &AppHandle) -> Option<u32> {
@@ -706,11 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_kind_serializes_to_fired_payload_shape() {
+    fn hotkey_fired_payload_matches_frontend_contract() {
+        // The v0.8.0 integration fix: the payload is { binding_id, kind,
+        // target } with kind as a plain string (useHotkeyDispatch.ts).
         let payload = HotkeyFiredPayload {
             binding_id: "cmd:gmail:work".to_string(),
-            kind: HotkeyKind::Command {
-                app_id: "gmail".to_string(),
+            kind: "command",
+            target: HotkeyTarget {
+                routine_id: None,
+                workspace_id: None,
+                app_id: Some("gmail".to_string()),
                 account_id: Some("work".to_string()),
             },
         };
@@ -722,8 +735,12 @@ mod tests {
 
         let payload = HotkeyFiredPayload {
             binding_id: "routine:r1".to_string(),
-            kind: HotkeyKind::Routine {
-                routine_id: "r1".to_string(),
+            kind: "routine",
+            target: HotkeyTarget {
+                routine_id: Some("r1".to_string()),
+                workspace_id: None,
+                app_id: None,
+                account_id: None,
             },
         };
         let v = serde_json::to_value(&payload).unwrap();

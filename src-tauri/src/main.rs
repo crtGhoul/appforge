@@ -129,16 +129,44 @@ fn rename_account(
 /// `invoke("update_account", { appId, accountId, label, color, popupPolicy })`
 /// — `popupPolicy` is `null` for "use app setting", `"block"` or `"allow"`
 /// for an override.
+/// Per-account edit: label, color, popup-policy override, idle-timer
+/// overrides, adblock override. Params stay flat (1:1 with the JS invoke
+/// args) — hence the arity allow.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn update_account(
+    app: AppHandle,
     app_id: String,
     account_id: String,
     label: String,
     color: String,
     popup_policy: Option<String>,
+    auto_suspend_minutes: Option<u64>,
+    auto_close_minutes: Option<u32>,
+    adblock_enabled: Option<bool>,
     store: State<'_, AppStore>,
 ) -> Result<WebApp, String> {
-    store.update_account(&app_id, &account_id, label, color, popup_policy)
+    let updated = store.update_account(
+        &app_id,
+        &account_id,
+        label,
+        color,
+        popup_policy,
+        auto_suspend_minutes,
+        auto_close_minutes,
+        adblock_enabled,
+    )?;
+    // Push the account's effective adblock value to its open window, if
+    // any — the per-account mirror of the app-level push in
+    // update_app_settings. Timers need no push: the watchdog re-reads the
+    // store every minute.
+    windows::set_account_adblock_enabled(
+        &app,
+        &app_id,
+        &account_id,
+        updated.effective_adblock_enabled(&account_id),
+    );
+    Ok(updated)
 }
 
 /// Opens the account's window. ASYNC ON PURPOSE: on Windows,
@@ -420,6 +448,14 @@ fn get_hotkey_status(state: State<'_, Mutex<HotkeyStatus>>) -> Result<HotkeyStat
         .lock()
         .map(|s| s.clone())
         .map_err(|e| format!("hotkey state poisoned: {e}"))
+}
+
+/// v0.8.1: syntax-check a hotkey string without registering it. Lets the
+/// HotkeyCapture component reject a bad combination inline, right after the
+/// user presses it, instead of waiting for save.
+#[tauri::command]
+fn validate_hotkey(hotkey: String) -> Result<(), String> {
+    hotkeys::validate_hotkey_syntax(&hotkey)
 }
 
 #[tauri::command]
@@ -784,6 +820,7 @@ fn main() {
             get_launcher_settings,
             get_hotkey_status,
             set_hotkey,
+            validate_hotkey,
             set_autostart,
             set_panel_opacity,
             launcher_ext::toggle_pin,

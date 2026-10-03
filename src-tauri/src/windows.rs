@@ -310,7 +310,13 @@ pub fn open_account(
         .build()
         .map_err(|e| format!("could not open account window: {e}"))?;
 
-    let adblock_flag = Arc::new(AtomicBool::new(web_app.settings.adblock_enabled));
+    // Per-account adblock override wins; None means "inherit the app setting"
+    // (v0.8.1). This seeds the flag the Windows network blocker reads; the
+    // app-level Settings push skips overridden accounts, and per-account
+    // edits push via set_account_adblock_enabled.
+    let adblock_flag = Arc::new(AtomicBool::new(
+        web_app.effective_adblock_enabled(account_id),
+    ));
     {
         let mut tracked = winstate
             .inner
@@ -670,7 +676,8 @@ pub fn start_suspend_watcher(app: AppHandle) {
 fn suspend_idle_windows(app: &AppHandle) {
     let now = unix_secs();
     // Snapshot under the lock; the actual suspend calls happen outside it.
-    let tracked: Vec<(String, String, u64, bool)> = match app.try_state::<WindowState>() {
+    // account_id rides along so per-account timer overrides (v0.8.1) resolve.
+    let tracked: Vec<(String, String, String, u64, bool)> = match app.try_state::<WindowState>() {
         Some(winstate) => match winstate.inner.lock() {
             Ok(map) => map
                 .iter()
@@ -678,6 +685,7 @@ fn suspend_idle_windows(app: &AppHandle) {
                     (
                         label.clone(),
                         t.app_id.clone(),
+                        t.account_id.clone(),
                         t.last_active,
                         t.suspended,
                     )
@@ -690,12 +698,12 @@ fn suspend_idle_windows(app: &AppHandle) {
     let Some(store) = app.try_state::<AppStore>() else {
         return;
     };
-    for (label, app_id, last_active, suspended) in tracked {
+    for (label, app_id, account_id, last_active, suspended) in tracked {
         if suspended {
             continue;
         }
         let minutes = match store.get(&app_id) {
-            Ok(a) => a.settings.auto_suspend_minutes,
+            Ok(a) => a.effective_auto_suspend_minutes(&account_id),
             Err(_) => continue, // app deleted under us; its windows are being closed
         };
         if minutes == 0 {
@@ -722,11 +730,18 @@ fn suspend_idle_windows(app: &AppHandle) {
 /// state) are never auto-closed.
 fn close_idle_windows(app: &AppHandle) {
     let now = unix_secs();
-    let tracked: Vec<(String, String, u64)> = match app.try_state::<WindowState>() {
+    let tracked: Vec<(String, String, String, u64)> = match app.try_state::<WindowState>() {
         Some(winstate) => match winstate.inner.lock() {
             Ok(map) => map
                 .iter()
-                .map(|(label, t)| (label.clone(), t.app_id.clone(), t.last_active))
+                .map(|(label, t)| {
+                    (
+                        label.clone(),
+                        t.app_id.clone(),
+                        t.account_id.clone(),
+                        t.last_active,
+                    )
+                })
                 .collect(),
             Err(_) => return,
         },
@@ -735,9 +750,9 @@ fn close_idle_windows(app: &AppHandle) {
     let Some(store) = app.try_state::<AppStore>() else {
         return;
     };
-    for (label, app_id, last_active) in tracked {
+    for (label, app_id, account_id, last_active) in tracked {
         let minutes = match store.get(&app_id) {
-            Ok(a) => a.settings.auto_close_minutes,
+            Ok(a) => a.effective_auto_close_minutes(&account_id),
             Err(_) => continue, // app deleted under us; its windows are being closed
         };
         if minutes == 0 {
@@ -997,10 +1012,45 @@ pub fn close_account_window(app: &AppHandle, app_id: &str, account_id: &str) {
 }
 
 /// Push a settings change to already-open windows of an app without rebuilds.
+/// Windows whose account overrides adblock (v0.8.1) keep their override —
+/// only inheriting accounts get the app-level push.
 pub fn set_app_adblock_enabled(app: &AppHandle, app_id: &str, enabled: bool) {
+    let overridden: std::collections::HashSet<String> = app
+        .try_state::<AppStore>()
+        .and_then(|s| s.get(app_id).ok())
+        .map(|web_app| {
+            web_app
+                .accounts
+                .iter()
+                .filter(|a| a.adblock_enabled.is_some())
+                .map(|a| account_window_label(app_id, &a.id))
+                .collect()
+        })
+        .unwrap_or_default();
     if let Some(winstate) = app.try_state::<WindowState>() {
         if let Ok(tracked) = winstate.inner.lock() {
-            for t in tracked.values().filter(|t| t.app_id == app_id) {
+            for (label, t) in tracked.iter() {
+                if t.app_id == app_id && !overridden.contains(label) {
+                    t.adblock_enabled.store(enabled, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Push one account's effective adblock value to its open window, if any.
+/// Called after per-account edits in `update_account` — the per-account
+/// mirror of `set_app_adblock_enabled`.
+pub fn set_account_adblock_enabled(
+    app: &AppHandle,
+    app_id: &str,
+    account_id: &str,
+    enabled: bool,
+) {
+    let label = account_window_label(app_id, account_id);
+    if let Some(winstate) = app.try_state::<WindowState>() {
+        if let Ok(tracked) = winstate.inner.lock() {
+            if let Some(t) = tracked.get(&label) {
                 t.adblock_enabled.store(enabled, Ordering::Relaxed);
             }
         }

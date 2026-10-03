@@ -2,6 +2,7 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffec
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { evaluateExpression, formatCalcResult } from "./calc";
+import { HotkeyCapture } from "./HotkeyCapture";
 import type {
   Account,
   HotkeyStatus,
@@ -579,20 +580,18 @@ export function LauncherSettingsPanel({
       <form className="inline-form" onSubmit={(e) => void handleHotkeySave(e)}>
         <label>
           <span>Summon hotkey</span>
-          <input
+          <HotkeyCapture
             value={hotkey}
-            onChange={(e) => setHotkey(e.target.value)}
+            onChange={setHotkey}
+            ariaLabel="Summon hotkey"
             placeholder="Alt+Space"
-            maxLength={40}
-            autoComplete="off"
-            spellCheck={false}
           />
         </label>
         <button type="submit" disabled={saving}>
           {saving ? "Saving…" : "Set hotkey"}
         </button>
         <span className="help">
-          Press it anywhere to show or hide AppMaka. Examples: Alt+Space, Ctrl+Alt+A.
+          Press it anywhere to show or hide AppMaka. Click the field, then press the keys you want.
         </span>
       </form>
 

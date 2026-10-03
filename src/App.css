@@ -1200,3 +1200,47 @@ input[type="color"] {
 .cmd-hotkey-row .danger:hover {
   background: #fdecec;
 }
+
+/* --- v0.8.1 HotkeyCapture: "press it, don't type it" hotkey field --- */
+.hotkey-capture {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  vertical-align: middle;
+}
+.hotkey-capture-field {
+  font: inherit;
+  padding: 6px 10px;
+  border: 1px solid #c9ccd2;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+  cursor: pointer;
+  min-width: 150px;
+  text-align: left;
+  white-space: nowrap;
+}
+.hotkey-capture-field.empty {
+  color: #8a8f98;
+}
+.hotkey-capture-field.capturing {
+  border-color: #4f46e5;
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.22);
+  color: #4f46e5;
+  font-weight: 600;
+}
+.hotkey-capture-field:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.hotkey-clear {
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.hotkey-hint {
+  display: block;
+  margin-top: 4px;
+}

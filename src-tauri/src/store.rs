@@ -114,6 +114,19 @@ pub struct Account {
     /// without it migrate via the serde default.
     #[serde(default)]
     pub popup_policy: Option<String>,
+    /// Per-account idle-suspend override, in minutes (0 = never).
+    /// `None` = inherit the app's `settings.auto_suspend_minutes`. Old
+    /// records without it migrate via the serde default (no behavior change).
+    #[serde(default)]
+    pub auto_suspend_minutes: Option<u64>,
+    /// Per-account idle-close override, in minutes (0 = never).
+    /// `None` = inherit the app's `settings.auto_close_minutes`.
+    #[serde(default)]
+    pub auto_close_minutes: Option<u32>,
+    /// Per-account adblock override. `None` = inherit the app's
+    /// `settings.adblock_enabled`.
+    #[serde(default)]
+    pub adblock_enabled: Option<bool>,
     /// Old records without it migrate to 0 (treated as "long ago").
     #[serde(default)]
     pub last_opened: u64,
@@ -134,6 +147,36 @@ pub struct WebApp {
     pub accounts: Vec<Account>,
     #[serde(default)]
     pub created_at: u64,
+}
+
+impl WebApp {
+    /// Effective idle-suspend minutes for one account: the account's
+    /// override wins when `Some`, otherwise the app's setting. 0 = never.
+    pub fn effective_auto_suspend_minutes(&self, account_id: &str) -> u64 {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .and_then(|a| a.auto_suspend_minutes)
+            .unwrap_or(self.settings.auto_suspend_minutes)
+    }
+
+    /// Effective idle-close minutes for one account (0 = never).
+    pub fn effective_auto_close_minutes(&self, account_id: &str) -> u32 {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .and_then(|a| a.auto_close_minutes)
+            .unwrap_or(self.settings.auto_close_minutes)
+    }
+
+    /// Effective adblock flag for one account's window.
+    pub fn effective_adblock_enabled(&self, account_id: &str) -> bool {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .and_then(|a| a.adblock_enabled)
+            .unwrap_or(self.settings.adblock_enabled)
+    }
 }
 
 /// The v0 shape (before accounts/settings existed). Kept only so old
@@ -344,6 +387,9 @@ impl AppStore {
                     session_dir: session_dir.to_string_lossy().into_owned(),
                     thumbnail: None,
                     popup_policy: None,
+                    auto_suspend_minutes: None,
+                    auto_close_minutes: None,
+                    adblock_enabled: None,
                     last_opened: 0,
                     created_at: now,
                 }],
@@ -445,6 +491,9 @@ impl AppStore {
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail: None,
                 popup_policy: None,
+                auto_suspend_minutes: None,
+                auto_close_minutes: None,
+                adblock_enabled: None,
                 last_opened: 0,
                 created_at: now,
             }],
@@ -518,6 +567,9 @@ impl AppStore {
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail,
                 popup_policy: None,
+                auto_suspend_minutes: None,
+                auto_close_minutes: None,
+                adblock_enabled: None,
                 last_opened: 0,
                 created_at: now,
             };
@@ -567,6 +619,9 @@ impl AppStore {
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail,
                 popup_policy: None,
+                auto_suspend_minutes: None,
+                auto_close_minutes: None,
+                adblock_enabled: None,
                 last_opened: 0,
                 created_at: now,
             }],
@@ -670,10 +725,14 @@ impl AppStore {
         Ok(updated)
     }
 
-    /// Edit an account's label, color, and per-account popup policy override.
+    /// Edit an account's label, color, and per-account overrides.
     /// `popup_policy` is `None` = inherit the app's setting, `Some("block")`
     /// or `Some("allow")` = override. Anything else is rejected so a bad
     /// value can never be persisted even if invoked directly.
+    /// `auto_suspend_minutes` / `auto_close_minutes` are `None` = inherit
+    /// (minutes, 0 = never); `adblock_enabled` is `None` = inherit.
+    // Tauri command params map 1:1 to JS invoke args, so they stay flat.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_account(
         &self,
         app_id: &str,
@@ -681,6 +740,9 @@ impl AppStore {
         label: String,
         color: String,
         popup_policy: Option<String>,
+        auto_suspend_minutes: Option<u64>,
+        auto_close_minutes: Option<u32>,
+        adblock_enabled: Option<bool>,
     ) -> Result<WebApp, String> {
         let label = label.trim().to_string();
         if label.is_empty() {
@@ -718,6 +780,9 @@ impl AppStore {
             account.label = label;
             account.color = color;
             account.popup_policy = popup_policy;
+            account.auto_suspend_minutes = auto_suspend_minutes;
+            account.auto_close_minutes = auto_close_minutes;
+            account.adblock_enabled = adblock_enabled;
             app.clone()
         };
         self.save()?;
@@ -834,6 +899,9 @@ impl AppStore {
                 session_dir: session_dir.to_string_lossy().into_owned(),
                 thumbnail,
                 popup_policy: None,
+                auto_suspend_minutes: None,
+                auto_close_minutes: None,
+                adblock_enabled: None,
                 last_opened: 0,
                 created_at: now,
             };
@@ -960,8 +1028,48 @@ mod tests {
         let acct: Account = serde_json::from_str(json).unwrap();
         assert!(acct.thumbnail.is_none());
         assert!(acct.popup_policy.is_none());
+        // v0.8.1 overrides: old records migrate to None = inherit.
+        assert!(acct.auto_suspend_minutes.is_none());
+        assert!(acct.auto_close_minutes.is_none());
+        assert!(acct.adblock_enabled.is_none());
         assert_eq!(acct.last_opened, 0);
         assert_eq!(acct.created_at, 0);
+    }
+
+    #[test]
+    fn effective_account_settings_prefer_override_then_inherit() {
+        let mut app = WebApp {
+            id: "app-1".to_string(),
+            name: "Test".to_string(),
+            url: "https://example.com".to_string(),
+            icon: None,
+            color: "#ffffff".to_string(),
+            settings: AppSettings {
+                adblock_enabled: true,
+                auto_suspend_minutes: 30,
+                auto_close_minutes: 30,
+                ..AppSettings::default()
+            },
+            accounts: vec![],
+            created_at: 0,
+        };
+        // Unknown account id -> app settings (fail safe).
+        assert_eq!(app.effective_auto_suspend_minutes("nope"), 30);
+        assert_eq!(app.effective_auto_close_minutes("nope"), 30);
+        assert!(app.effective_adblock_enabled("nope"));
+
+        let json = r##"{
+            "id": "acct-1", "app_id": "app-1", "label": "Main",
+            "color": "#ffffff", "session_dir": "/tmp/sess",
+            "auto_suspend_minutes": 5, "auto_close_minutes": 0,
+            "adblock_enabled": false
+        }"##;
+        let acct: Account = serde_json::from_str(json).unwrap();
+        app.accounts.push(acct);
+        // Overrides win, including explicit 0 ("never").
+        assert_eq!(app.effective_auto_suspend_minutes("acct-1"), 5);
+        assert_eq!(app.effective_auto_close_minutes("acct-1"), 0);
+        assert!(!app.effective_adblock_enabled("acct-1"));
     }
 
     #[test]

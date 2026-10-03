@@ -35,6 +35,21 @@ export interface Account {
    * `null` (or missing on old records) = inherit the app's setting.
    */
   popup_policy?: "block" | "allow" | null;
+  /**
+   * Per-account idle-suspend override in minutes (0 = never).
+   * `null`/missing = inherit the app's `auto_suspend_minutes`.
+   */
+  auto_suspend_minutes?: number | null;
+  /**
+   * Per-account idle-close override in minutes (0 = never).
+   * `null`/missing = inherit the app's `auto_close_minutes`.
+   */
+  auto_close_minutes?: number | null;
+  /**
+   * Per-account adblock override. `null`/missing = inherit the app's
+   * `adblock_enabled`.
+   */
+  adblock_enabled?: boolean | null;
   last_opened: number;
   created_at: number;
 }

@@ -63,4 +63,4 @@ authors = ["AppMaka"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
 name = "appmaka"
-version = "0.8.0"
+version = "0.8.1"

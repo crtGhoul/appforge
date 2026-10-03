@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { NativeProgram, WebApp } from "./types";
+import { HotkeyCapture } from "./HotkeyCapture";
 
 /**
  * Routines ("morning stack"): one keystroke opens a chosen set of apps AND
@@ -219,13 +220,15 @@ function RoutineForm({
       </label>
       <label style={{ display: "block", fontSize: 14, marginBottom: 4 }}>
         <span className="field-label">Hotkey (optional)</span>
-        <input
-          type="text"
-          value={hotkey}
-          onChange={(e) => setHotkey(e.target.value)}
-          placeholder="Ctrl+Alt+M"
-          style={{ width: "100%", marginTop: 4 }}
-        />
+        <div style={{ marginTop: 4 }}>
+          <HotkeyCapture
+            value={hotkey}
+            onChange={setHotkey}
+            ariaLabel="Routine hotkey"
+            placeholder="Click to set…"
+            allowClear
+          />
+        </div>
       </label>
       <p className="muted small" style={{ margin: "0 0 4px" }}>
         Pressing it runs the routine from anywhere. If another shortcut

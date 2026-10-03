@@ -494,8 +494,9 @@ function AccountRow({
 }
 
 /**
- * Per-account edit dialog: label, color, and a three-way popup policy
- * choice — inherit the app's setting, allow, or block popups.
+ * Per-account edit dialog: label, color, a three-way popup policy choice,
+ * and per-account overrides for the idle timers and ad blocking — each
+ * defaulting to "use the app setting" (inherit), exactly like popups.
  */
 function EditAccountDialog({
   app,
@@ -512,6 +513,25 @@ function EditAccountDialog({
   const [color, setColor] = useState(safeColor(account.color));
   const [popupChoice, setPopupChoice] = useState<"inherit" | "block" | "allow">(
     account.popup_policy ?? "inherit"
+  );
+  const [suspendChoice, setSuspendChoice] = useState<"inherit" | "custom">(
+    account.auto_suspend_minutes == null ? "inherit" : "custom"
+  );
+  const [suspendCustom, setSuspendCustom] = useState(
+    String(account.auto_suspend_minutes ?? app.settings.auto_suspend_minutes)
+  );
+  const [closeChoice, setCloseChoice] = useState<"inherit" | "custom">(
+    account.auto_close_minutes == null ? "inherit" : "custom"
+  );
+  const [closeCustom, setCloseCustom] = useState(
+    String(account.auto_close_minutes ?? app.settings.auto_close_minutes)
+  );
+  const [adblockChoice, setAdblockChoice] = useState<"inherit" | "on" | "off">(
+    account.adblock_enabled == null
+      ? "inherit"
+      : account.adblock_enabled
+        ? "on"
+        : "off"
   );
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -547,6 +567,16 @@ function EditAccountDialog({
         label: cleanLabel,
         color,
         popupPolicy: popupChoice === "inherit" ? null : popupChoice,
+        autoSuspendMinutes:
+          suspendChoice === "inherit"
+            ? null
+            : Math.max(0, parseInt(suspendCustom, 10) || 0),
+        autoCloseMinutes:
+          closeChoice === "inherit"
+            ? null
+            : Math.max(0, parseInt(closeCustom, 10) || 0),
+        adblockEnabled:
+          adblockChoice === "inherit" ? null : adblockChoice === "on",
       });
       onSaved(updated);
     } catch (err) {
@@ -626,6 +656,126 @@ function EditAccountDialog({
             </label>
             <span className="help">
               Close and reopen the account window for this change to take effect.
+            </span>
+          </fieldset>
+          <fieldset className="radio-group">
+            <legend>Suspend when idle</legend>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-suspend"
+                checked={suspendChoice === "inherit"}
+                onChange={() => setSuspendChoice("inherit")}
+              />
+              <span>
+                Use app setting (currently {app.settings.auto_suspend_minutes}{" "}
+                min)
+              </span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-suspend"
+                checked={suspendChoice === "custom"}
+                onChange={() => setSuspendChoice("custom")}
+              />
+              <span>
+                Custom:{" "}
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={suspendCustom}
+                  onChange={(e) => setSuspendCustom(e.target.value)}
+                  onFocus={() => setSuspendChoice("custom")}
+                  disabled={suspendChoice !== "custom"}
+                  aria-label="Custom idle suspend minutes"
+                  style={{ width: 80 }}
+                />{" "}
+                min
+              </span>
+            </label>
+            <span className="help">
+              Suspended windows stay signed in and wake when focused. 0 =
+              never suspend.
+            </span>
+          </fieldset>
+          <fieldset className="radio-group">
+            <legend>Close when idle</legend>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-close"
+                checked={closeChoice === "inherit"}
+                onChange={() => setCloseChoice("inherit")}
+              />
+              <span>
+                Use app setting (currently {app.settings.auto_close_minutes}{" "}
+                min)
+              </span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-close"
+                checked={closeChoice === "custom"}
+                onChange={() => setCloseChoice("custom")}
+              />
+              <span>
+                Custom:{" "}
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={closeCustom}
+                  onChange={(e) => setCloseCustom(e.target.value)}
+                  onFocus={() => setCloseChoice("custom")}
+                  disabled={closeChoice !== "custom"}
+                  aria-label="Custom idle close minutes"
+                  style={{ width: 80 }}
+                />{" "}
+                min
+              </span>
+            </label>
+            <span className="help">
+              Closed windows free the most memory; reopening restores your
+              login. 0 = never close.
+            </span>
+          </fieldset>
+          <fieldset className="radio-group">
+            <legend>Ad blocking</legend>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-adblock"
+                checked={adblockChoice === "inherit"}
+                onChange={() => setAdblockChoice("inherit")}
+              />
+              <span>
+                Use app setting (currently{" "}
+                {app.settings.adblock_enabled ? "on" : "off"})
+              </span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-adblock"
+                checked={adblockChoice === "on"}
+                onChange={() => setAdblockChoice("on")}
+              />
+              <span>On for this account</span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="account-adblock"
+                checked={adblockChoice === "off"}
+                onChange={() => setAdblockChoice("off")}
+              />
+              <span>Off for this account</span>
+            </label>
+            <span className="help">
+              Takes effect right away, even if the account window is open.
             </span>
           </fieldset>
           {formError && (

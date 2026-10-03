@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { WebApp } from "./types";
+import { HotkeyCapture } from "./HotkeyCapture";
 
 /**
  * Per-command hotkeys: bind a global hotkey straight to an app or an
@@ -152,7 +153,7 @@ export function CmdHotkeysSection({
       return;
     }
     if (!newHotkey.trim()) {
-      setAddError("Type a hotkey, e.g. Ctrl+Alt+G.");
+      setAddError("Click the hotkey field and press the keys you want first.");
       return;
     }
     setAdding(true);
@@ -208,15 +209,11 @@ export function CmdHotkeysSection({
           return (
             <li key={row.id} className="cmd-hotkey-row">
               <span className="cmd-hotkey-target">{describeRow(row)}</span>
-              <input
-                type="text"
+              <HotkeyCapture
                 value={drafts[row.id] ?? ""}
-                onChange={(e) =>
-                  setDrafts((d) => ({ ...d, [row.id]: e.target.value }))
-                }
-                placeholder="Ctrl+Alt+G"
-                aria-label={`Hotkey for ${describeRow(row)}`}
-                spellCheck={false}
+                onChange={(v) => setDrafts((d) => ({ ...d, [row.id]: v }))}
+                ariaLabel={`Hotkey for ${describeRow(row)}`}
+                placeholder="Click to set…"
               />
               <button
                 type="button"
@@ -283,12 +280,11 @@ export function CmdHotkeysSection({
         </label>
         <label>
           <span>Hotkey</span>
-          <input
-            type="text"
+          <HotkeyCapture
             value={newHotkey}
-            onChange={(e) => setNewHotkey(e.target.value)}
-            placeholder="Ctrl+Alt+G"
-            spellCheck={false}
+            onChange={setNewHotkey}
+            ariaLabel="New app hotkey"
+            placeholder="Click to set…"
           />
         </label>
         <button type="submit" disabled={adding}>
