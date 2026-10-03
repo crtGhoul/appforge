@@ -1274,3 +1274,17 @@ input[type="color"] {
   display: block;
   margin-top: 4px;
 }
+
+/* Downloads toolbar button (v0.9.8): quiet icon in the launcher footer,
+   with a small live status while downloads are active. */
+.dl-toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dl-toolbar-status {
+  font-size: 12px;
+  font-weight: 600;
+  color: inherit;
+}

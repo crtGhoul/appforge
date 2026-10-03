@@ -922,7 +922,13 @@ mod imp {
                     if esc_gesture_closes(g) {
                         if let Some(label) = label {
                             CHROME.with(|c| {
-                                if let Some(ch) = c.borrow().as_ref() {
+                                // try_borrow, never borrow: on contention
+                                // the gesture just passes through instead
+                                // of panicking inside the hook proc.
+                                let guard = c.try_borrow().ok();
+                                if let Some(ch) =
+                                    guard.as_ref().and_then(|g| g.as_ref())
+                                {
                                     let _ = ch.tx.send(ChromeCmd::ClosePage { label });
                                     let _ = SetEvent(ch.wake);
                                 }
@@ -1185,5 +1191,14 @@ mod tests {
         // Fullscreen keeps the page in the foreground, so the gesture
         // applies there too — documented, not special-cased.
         assert!(esc_gesture_closes(gesture(true, true, true)));
+    }
+
+    #[test]
+    fn every_other_combination_passes_through() {
+        // The classifier is a three-input AND: exhaust the remaining
+        // non-closing combos so a future edit can't silently widen it.
+        assert!(!esc_gesture_closes(gesture(true, false, false)));
+        assert!(!esc_gesture_closes(gesture(false, true, false)));
+        assert!(!esc_gesture_closes(gesture(false, false, true)));
     }
 }

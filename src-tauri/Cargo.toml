@@ -22,6 +22,9 @@ tauri-plugin-autostart = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
+# v0.9.8: rfd is declared in the target-specific sections at the bottom of
+# this file (it must not sit mid-[dependencies]: a [target...] header there
+# would swallow every dependency listed after it).
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-process = "2"
@@ -90,4 +93,27 @@ authors = ["AppMaka"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
 name = "appmaka"
-version = "0.9.7"
+version = "0.9.8"
+
+# v0.9.8: native save dialog inside the download `Requested` handler.
+# The download callback runs on the main thread on both platforms (WebView2's
+# DownloadStarting fires on the COM UI thread; WebKitGTK's
+# decide-destination is a GTK signal), so tauri-plugin-dialog's blocking
+# wrappers are unusable here: they post dialog creation to the main thread
+# via run_on_main_thread, then block it waiting — instant deadlock.
+# Windows: rfd's sync api (IFileSaveDialog::Show runs its own modal loop
+# with balanced COM init; never touches Tauri's event loop). Same rfd
+# version as the plugin so cargo unifies.
+# Linux: the gtk crate directly (FileChooserNative + nested event pump),
+# because rfd's second-GTK-thread design hangs against tao's main loop
+# (verified 2026-10-03: save_file() never returns, no dialog appears).
+# NOTE: these sections must stay at the end of the file — a [target...]
+# header in the middle of [dependencies] would swallow every dependency
+# listed after it (this exact mistake dropped five plugins in v0.9.8 dev).
+[target.'cfg(windows)'.dependencies.rfd]
+version = "0.16"
+default-features = false
+features = ["common-controls-v6"]
+
+[target.'cfg(target_os = "linux")'.dependencies.gtk]
+version = "0.18"

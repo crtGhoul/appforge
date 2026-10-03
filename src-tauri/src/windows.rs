@@ -586,7 +586,11 @@ fn spawn_contained_window(
             // Nested popups inside the contained window are denied outright:
             // an OAuth flow that needs a second popup is rare, and this
             // prevents modal loops.
-            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
+            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+            // Popup downloads go through the same in-app manager as every
+            // other window (v0.9.8): without this they silently bypassed
+            // the download folder, the history, and Mark of the Web.
+            .on_download(crate::downloads::make_download_handler(window_app.clone()));
             if let Some(script) = initialization_script {
                 builder = builder.initialization_script(script);
             }

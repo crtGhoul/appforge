@@ -34,7 +34,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const REPO = "crtGhoul/appforge";
+const REPO = "crtGhoul/appmaka";
 
 const PLATFORMS = [
   {

@@ -990,8 +990,14 @@ fn main() {
             downloads::show_in_folder,
             downloads::remove_download,
             downloads::clear_finished,
+            downloads::rename_download,
+            downloads::retry_download,
             downloads::get_download_dir,
             downloads::set_download_dir,
+            downloads::pick_download_dir,
+            downloads::get_download_settings,
+            downloads::set_ask_where_to_save,
+            downloads::set_show_completion_notice,
             // v0.7.0: launcher search-engine setting
             launcher_settings::set_search_engine,
             // v0.8.0: hidden-programs collapse state (polish)

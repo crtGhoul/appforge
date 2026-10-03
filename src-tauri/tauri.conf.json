@@ -46,7 +46,7 @@
   },
   "identifier": "com.appforge.app",
   "productName": "AppMaka",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "plugins": {
     "deep-link": {
       "desktop": {
@@ -57,7 +57,7 @@
       "active": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZDOEY5QzAzMjI1Q0M4QjkKUldTNXlGd2lBNXlQYkpHSCtNaDVSc2tXd094VmwrcGpNbVpZSlltZzBWQ2tidHoxWCtHMjlDNnkK",
       "endpoints": [
-        "https://github.com/crtGhoul/appforge/releases/latest/download/latest.json"
+        "https://github.com/crtGhoul/appmaka/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

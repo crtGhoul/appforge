@@ -57,7 +57,7 @@ and then asserts, aborting loudly before writing anything:
 Upload the resulting `latest.json` to the release, then curl-verify:
 
 ```sh
-curl -sL https://github.com/crtGhoul/appforge/releases/latest/download/latest.json
+curl -sL https://github.com/crtGhoul/appmaka/releases/latest/download/latest.json
 ```
 
 Confirm it serves the new version and each signature is 436 chars that

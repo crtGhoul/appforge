@@ -14,7 +14,12 @@ import { ForgetLoginDialog, forgetLogin } from "./ForgetLoginDialog";
 import LinkPicker from "./LinkPicker";
 import type { LinkPickerAccount } from "./LinkPicker";
 import LinkRules from "./LinkRules";
-import { DownloadsList } from "./DownloadsList";
+import {
+  DownloadsProvider,
+  useDownloads,
+  DownloadsPage,
+  DownloadToolbarButton,
+} from "./downloads";
 import { RoutinesSection } from "./RoutinesSection";
 import { ClipboardSection } from "./ClipboardSection";
 import WorkspacesSection from "./WorkspacesSection";
@@ -1800,12 +1805,32 @@ function UpdaterSection({
 }
 
 export default function App() {
+  return (
+    <DownloadsProvider>
+      <AppShell />
+    </DownloadsProvider>
+  );
+}
+
+// v0.9.8: the whole app lives inside DownloadsProvider so download
+// progress keeps flowing when the downloads page is closed.
+function AppShell() {
   const [apps, setApps] = useState<WebApp[]>([]);
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // v0.9.8: quiet "Download finished" notice, toggleable in Downloads.
+  const { lastCompleted, settings: downloadSettings } = useDownloads();
+  useEffect(() => {
+    if (
+      lastCompleted &&
+      downloadSettings?.showCompletionNotice !== false
+    ) {
+      setNotice(`Download finished: ${lastCompleted.filename}`);
+    }
+  }, [lastCompleted, downloadSettings]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [settingsOpen, setSettingsOpen] = useState<Set<string>>(new Set());
   const [editingApp, setEditingApp] = useState<WebApp | null>(null);
@@ -1820,9 +1845,8 @@ export default function App() {
   } | null>(null);
   // v0.7.0: link-dispatcher picker target (URL with no matching rule).
   const [linkPickerUrl, setLinkPickerUrl] = useState<string | null>(null);
-  // v0.7.0: RAM dashboard + Downloads list visibility.
+  // v0.7.0: RAM dashboard visibility.
   const [ramOpen, setRamOpen] = useState(false);
-  const [downloadsOpen, setDownloadsOpen] = useState(false);
 
   // Launcher: hotkey-summoned search over apps, accounts, and programs.
   const [programs, setPrograms] = useState<NativeProgram[]>([]);
@@ -1880,7 +1904,10 @@ export default function App() {
   // Two views: the hotkey-summoned spotlight overlay ("launcher") and the
   // full management window ("library"). The hotkey always lands on the
   // launcher; the tray menu and the in-overlay button open the library.
-  const [view, setView] = useState<"launcher" | "library">("launcher");
+  // v0.9.8: "downloads" is the full-page downloads view (Ctrl+J).
+  const [view, setView] = useState<"launcher" | "library" | "downloads">(
+    "launcher"
+  );
   // Bumped on every hotkey summon so the panel entrance animation replays
   // (the React tree stays mounted while the window just hides/shows).
   const [summonCount, setSummonCount] = useState(0);
@@ -2057,9 +2084,17 @@ export default function App() {
 
   // View-switch events from the backend: tray "Show library" and the hotkey
   // summon (which always resets to the spotlight view).
+  // v0.9.8: Ctrl+J opens the downloads page (standard everywhere).
   useEffect(() => {
     let offLibrary: (() => void) | undefined;
     let offLauncher: (() => void) | undefined;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        setView("downloads");
+      }
+    };
+    window.addEventListener("keydown", onKey);
     listen("appmaka:show-library", () => setView("library"))
       .then((off) => {
         offLibrary = off;
@@ -2076,6 +2111,7 @@ export default function App() {
     return () => {
       offLibrary?.();
       offLauncher?.();
+      window.removeEventListener("keydown", onKey);
     };
   }, []);
 
@@ -2866,6 +2902,7 @@ export default function App() {
               Manage apps →
             </button>
             <span className="launcher-foot-actions">
+              <DownloadToolbarButton onOpen={() => setView("downloads")} />
               <AddProgramButton
                 onAdded={() =>
                   invoke<NativeProgram[]>("list_programs")
@@ -2884,6 +2921,34 @@ export default function App() {
             </span>
           </footer>
         </div>
+      </div>
+    );
+  }
+
+  // v0.9.8: full-page downloads view (Ctrl+J, Settings → Downloads,
+  // or the launcher toolbar button).
+  if (view === "downloads") {
+    return (
+      <div className="shell">
+        <ContextMenuGuard />
+        <button className="text-button library-back" onClick={() => setView("launcher")}>
+          ← Launcher
+        </button>
+        <header className="header">
+          <div className="header-row">
+            <div>
+              <h1>Downloads</h1>
+              <p className="subtitle">
+                Files you downloaded in AppMaka, with progress while they
+                download.
+              </p>
+            </div>
+          </div>
+        </header>
+
+        {banners}
+
+        <DownloadsPage />
       </div>
     );
   }
@@ -3110,7 +3175,7 @@ export default function App() {
           <h2>Downloads</h2>
           <button
             className="text-button"
-            onClick={() => setDownloadsOpen(true)}
+            onClick={() => setView("downloads")}
           >
             Open downloads
           </button>
@@ -3256,13 +3321,6 @@ export default function App() {
 
       {ramOpen && (
         <RamDashboard open={ramOpen} onClose={() => setRamOpen(false)} />
-      )}
-
-      {downloadsOpen && (
-        <DownloadsList
-          open={downloadsOpen}
-          onClose={() => setDownloadsOpen(false)}
-        />
       )}
     </div>
   );
