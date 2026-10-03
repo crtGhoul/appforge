@@ -29,6 +29,9 @@ mod windows;
 /// dead item still warns on Windows and in tests.
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 mod winkey;
+/// Slim native caption strips + the Esc+LMB close gesture for page windows
+/// (v0.9.6, Windows only; no-op stubs elsewhere).
+mod caption;
 /// Clipboard image reading beyond the plugin's format list (v0.9.2):
 /// direct DIB reads on Windows, image/bmp fallback on Linux.
 mod clipboard_img;

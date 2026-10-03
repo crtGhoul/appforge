@@ -738,6 +738,19 @@ input[type="color"] {
   color: rgba(255, 255, 255, 0.5);
 }
 
+/* v0.9.6: the Restore-session button lives with the pinned tiles now,
+   not in the footer — a quiet right-aligned row above the grid. */
+.restore-row {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 4px 2px;
+}
+
+.restore-row .text-button {
+  color: #c7c9f5;
+  font-size: 12px;
+}
+
 /* --- Library view --- */
 
 .library-back {

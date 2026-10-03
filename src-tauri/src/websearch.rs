@@ -144,6 +144,12 @@ fn build_search_window(
     let mut builder = WebviewWindowBuilder::new(app, SEARCH_WINDOW_LABEL, WebviewUrl::External(url.clone()))
         .data_directory(data_dir.to_path_buf())
         .title(title);
+    // v0.9.6 (Windows): frameless + our caption strip, like account
+    // windows. Linux keeps native decorations.
+    #[cfg(windows)]
+    {
+        builder = builder.decorations(false);
+    }
     // v0.9.5: session restore builds the window at its saved geometry so
     // there is no visible jump; normal opens keep the classic centered
     // 1200x800.
@@ -174,6 +180,11 @@ fn build_search_window(
         Ok(window) => {
             #[cfg(windows)]
             crate::adblock::attach_network_blocking(&window, adblock, adblock_flag);
+            // v0.9.6: DWM shadow on the frameless window + caption strip
+            // (no-ops off Windows).
+            #[cfg(windows)]
+            let _ = window.set_shadow(true);
+            crate::caption::page_window_opened(app, SEARCH_WINDOW_LABEL, &window);
             // The window truly exists now: record it for the session and
             // persist (v0.9.5).
             crate::session::note_search_opened(app, title);
@@ -190,6 +201,8 @@ fn build_search_window(
                         // data-dir wipe below is delayed.
                         crate::session::note_search_closed(&wipe_app);
                         crate::session::write_session(&wipe_app);
+                        // v0.9.6: drop the caption strip with the window.
+                        crate::caption::page_window_closed(SEARCH_WINDOW_LABEL);
                         // Cloned per event: the handler is Fn, called for every
                         // window event, so nothing may move out of it.
                         let wipe_app = wipe_app.clone();
@@ -204,6 +217,8 @@ fn build_search_window(
                     // Geometry changes feed the session, debounced.
                     WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
                         crate::session::schedule_session_write(&wipe_app);
+                        // v0.9.6: keep the caption strip above the window.
+                        crate::caption::page_window_moved(SEARCH_WINDOW_LABEL);
                     }
                     _ => {}
                 }

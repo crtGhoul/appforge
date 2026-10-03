@@ -234,6 +234,13 @@ pub fn open_account_placed(
     let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(page_url))
         .data_directory(session_dir.clone())
         .title(&title);
+    // v0.9.6 (Windows): frameless — the native title bar and its X go away,
+    // replaced by our own slim caption strip (caption.rs). tao keeps border
+    // resizing working on frameless windows. Linux keeps native decorations.
+    #[cfg(windows)]
+    {
+        builder = builder.decorations(false);
+    }
     // v0.9.0: tiled routines place the window at build time (no visible
     // jump); untiled opens keep the classic centered 1200x800.
     // WebviewWindowBuilder::position takes logical pixels directly.
@@ -271,6 +278,12 @@ pub fn open_account_placed(
     let window = builder
         .build()
         .map_err(|e| format!("could not open account window: {e}"))?;
+    // v0.9.6: on Windows keep the DWM drop shadow on the frameless window
+    // and attach our caption strip. On other platforms the caption calls
+    // are no-ops.
+    #[cfg(windows)]
+    let _ = window.set_shadow(true);
+    crate::caption::page_window_opened(app, &label, &window);
 
     // Per-account adblock override wins; None means "inherit the app setting"
     // (v0.8.1). This seeds the flag the Windows network blocker reads; the
@@ -319,11 +332,16 @@ pub fn open_account_placed(
                     }
                 }
                 crate::session::write_session(&track_app);
+                // v0.9.6: the caption strip dies with its window (no-op
+                // off Windows).
+                crate::caption::page_window_closed(&track_label);
             }
             // Geometry changes feed the session (v0.9.5), debounced so a
             // drag doesn't hammer the disk.
             WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
                 crate::session::schedule_session_write(&track_app);
+                // v0.9.6: keep the caption strip seated above the window.
+                crate::caption::page_window_moved(&track_label);
             }
             _ => {}
         }

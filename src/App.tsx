@@ -36,11 +36,13 @@ import {
   RescanButton,
   SearchBar,
   SearchTileIcon,
+  WorkspaceTileIcon,
   browseAll,
   buildResults,
   matchLauncherCommand,
   recordLaunch,
   searchTag,
+  resolveWorkspaceTargets,
   useProgramsScannedRefresh,
   useTileMenu,
 } from "./Launcher";
@@ -2444,8 +2446,13 @@ export default function App() {
       pinned: launcherSettings?.pinned,
       usage: launcherSettings?.usage,
       hiddenProgramIds: launcherSettings?.hidden_programs,
+      // v0.9.6: pinned workspace tiles materialize from these.
+      workspaces: workspaceList?.workspaces.map((w) => ({
+        id: w.id,
+        name: w.name,
+      })),
     }),
-    [launcherSettings]
+    [launcherSettings, workspaceList]
   );
   // v0.8.0 workspaces: filter apps/accounts to the active workspace.
   // Programs and launcher commands stay visible (programs can't be
@@ -2474,21 +2481,24 @@ export default function App() {
   const cmdRef = useRef<LauncherCommandRowsHandle>(null);
 
   // Right-click tile menu (Open / Pin / Hide / Edit / Remove).
+  // v0.9.6: handleTogglePin is shared with the Workspaces section's
+  // Pin/Unpin buttons.
+  async function handleTogglePin(itemId: string) {
+    try {
+      const updated = await invoke<LauncherSettings>("toggle_pin", {
+        itemId,
+      });
+      setLauncherSettings(updated);
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
   const { tileMenuNode, openTileMenu } = useTileMenu({
     isPinned: (id) => launcherSettings?.pinned?.includes(id) ?? false,
     actions: {
       onOpen: (r) => void activateResult(r),
       onOpenAccount: (app, acct) => void handleOpenAccount(app, acct),
-      onTogglePin: async (itemId) => {
-        try {
-          const updated = await invoke<LauncherSettings>("toggle_pin", {
-            itemId,
-          });
-          setLauncherSettings(updated);
-        } catch (err) {
-          setError(errMsg(err));
-        }
-      },
+      onTogglePin: (itemId) => void handleTogglePin(itemId),
       onEditApp: (app) => {
         // The Edit dialog lives in the library view: switch there first,
         // then open it. Both state updates batch into one render.
@@ -2567,6 +2577,21 @@ export default function App() {
         // v0.9.3: pinned web search — re-run the query in the shared
         // in-app search window.
         await invoke("open_web_search", { query: r.query });
+      } else if (r.kind === "workspace") {
+        // v0.9.6: pinned workspace tile — open every member window at
+        // once through the normal open-account path (default placement;
+        // session restore handles exact geometry). One failure doesn't
+        // stop the rest.
+        const ws = workspaceList?.workspaces.find(
+          (w) => w.id === r.workspaceId
+        );
+        if (ws) {
+          for (const { app, account } of resolveWorkspaceTargets(
+            ws.members,
+            apps
+          ))
+            await handleOpenAccount(app, account);
+        }
       } else {
         // Web app row: open the most recently used account.
         const acct = mostRecentAccount(r.app) ?? r.app.accounts[0];
@@ -2619,6 +2644,7 @@ export default function App() {
   function renderResultIcon(r: SearchResult): React.ReactNode {
     if (r.kind === "program") return <ProgramIcon program={r.program} />;
     if (r.kind === "search") return <SearchTileIcon />;
+    if (r.kind === "workspace") return <WorkspaceTileIcon />;
     if (r.kind === "routine")
       return (
         <span className="app-icon-fallback" aria-hidden="true">
@@ -2767,6 +2793,16 @@ export default function App() {
             </div>
           )}
           {banners}
+          <div className="restore-row">
+            <button
+              type="button"
+              className="text-button"
+              title="Reopen windows from your last session"
+              onClick={() => void handleRestoreSession()}
+            >
+              Restore session
+            </button>
+          </div>
           <div className="folder-grid-wrap">
             {command && (
               <LauncherCommandRows
@@ -2823,14 +2859,6 @@ export default function App() {
               Manage apps →
             </button>
             <span className="launcher-foot-actions">
-              <button
-                type="button"
-                className="text-button"
-                title="Reopen windows from your last session"
-                onClick={() => void handleRestoreSession()}
-              >
-                Restore session
-              </button>
               <AddProgramButton
                 onAdded={() =>
                   invoke<NativeProgram[]>("list_programs")
@@ -3049,6 +3077,8 @@ export default function App() {
           list={workspaceList}
           onList={setWorkspaceList}
           onError={setError}
+          pinned={launcherSettings?.pinned ?? []}
+          onTogglePin={(itemId) => void handleTogglePin(itemId)}
         />
       </section>
 
@@ -3111,6 +3141,7 @@ export default function App() {
                 programsCount={programs.length}
                 onProgramsRefreshed={setPrograms}
                 onError={setError}
+                isWindows={platform?.os === "windows"}
               />
               <LauncherExtras
                 settings={launcherSettings}

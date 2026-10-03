@@ -159,9 +159,9 @@ impl Default for LauncherSettings {
 
 impl LauncherSettings {
     /// Pin or unpin a tagged tile id (`app:<id>`, `account:<id>`,
-    /// `program:<id>` — and v0.9.3's `search:<url-encoded query>` for
-    /// pinned web searches). Any string tag round-trips; the UI only
-    /// offers tags it can render.
+    /// `program:<id>` — v0.9.3's `search:<url-encoded query>` for pinned web
+    /// searches, v0.9.6's `workspace:<id>` for pinned workspaces). Any string
+    /// tag round-trips; the UI only offers tags it can render.
     pub fn toggle_pin(&mut self, item_id: &str) {
         if let Some(pos) = self.pinned.iter().position(|p| p == item_id) {
             self.pinned.remove(pos);
@@ -386,6 +386,28 @@ mod tests {
         assert_eq!(s.hotkey, "Ctrl+Alt+A");
         assert!(!s.autostart);
         assert!(s.seen_intro);
+    }
+
+    #[test]
+    fn toggle_pin_round_trips_workspace_tags() {
+        let mut s = LauncherSettings::default();
+        // v0.9.6: pinned workspaces ride the same tagged-id machinery.
+        s.toggle_pin("workspace:abc123");
+        assert_eq!(s.pinned, vec!["workspace:abc123".to_string()]);
+        s.toggle_pin("workspace:abc123");
+        assert!(s.pinned.is_empty());
+        // Pin order is preserved across kinds.
+        s.toggle_pin("app:abc");
+        s.toggle_pin("workspace:abc123");
+        s.toggle_pin("search:x");
+        assert_eq!(
+            s.pinned,
+            vec![
+                "app:abc".to_string(),
+                "workspace:abc123".to_string(),
+                "search:x".to_string()
+            ]
+        );
     }
 
     #[test]

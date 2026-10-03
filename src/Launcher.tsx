@@ -57,7 +57,8 @@ export type SearchResult =
   | { kind: "app"; id: string; title: string; context: string; score: number; app: WebApp }
   | { kind: "program"; id: string; title: string; context: string; score: number; program: NativeProgram }
   | { kind: "routine"; id: string; title: string; context: string; score: number; routine: Routine }
-  | { kind: "search"; id: string; title: string; context: string; score: number; query: string };
+  | { kind: "search"; id: string; title: string; context: string; score: number; query: string }
+  | { kind: "workspace"; id: string; title: string; context: string; score: number; workspaceId: string };
 
 /**
  * v0.9.3: pinned web searches. The tag is `search:<url-encoded query>` —
@@ -77,6 +78,47 @@ export function parseSearchTag(id: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * v0.9.6: pinned workspaces. The tag is `workspace:<id>` — it rides the same
+ * pinned-id machinery as app:/account:/program:/search: (pin order, usage
+ * ranking, toggle_pin), and the tile opens every member window at once.
+ */
+export function workspaceTag(id: string): string {
+  return `workspace:${id}`;
+}
+
+/** Inverse of `workspaceTag`; null when the id is not a workspace tag. */
+export function parseWorkspaceTag(id: string): string | null {
+  if (!id.startsWith("workspace:")) return null;
+  return id.slice("workspace:".length);
+}
+
+/**
+ * v0.9.6: resolve a pinned workspace's members to concrete (app, account)
+ * open targets. A member naming an account opens just that account; a
+ * whole-app member (`account_id` null) opens every account the app
+ * currently has. Missing apps or accounts are skipped silently.
+ */
+export function resolveWorkspaceTargets<
+  A extends { id: string; accounts: Array<{ id: string }> },
+>(
+  members: ReadonlyArray<{ app_id: string; account_id: string | null }>,
+  apps: ReadonlyArray<A>
+): Array<{ app: A; account: A["accounts"][number] }> {
+  const targets: Array<{ app: A; account: A["accounts"][number] }> = [];
+  for (const m of members) {
+    const app = apps.find((a) => a.id === m.app_id);
+    if (!app) continue;
+    if (m.account_id) {
+      const account = app.accounts.find((a) => a.id === m.account_id);
+      if (account) targets.push({ app, account });
+    } else {
+      for (const account of app.accounts) targets.push({ app, account });
+    }
+  }
+  return targets;
 }
 
 /**
@@ -112,6 +154,12 @@ export interface LauncherSortOpts {
   usage?: Record<string, UsageEntry>;
   /** Program ids the user hid from the launcher. */
   hiddenProgramIds?: string[];
+  /**
+   * v0.9.6: workspaces for materializing pinned workspace tiles. Minimal
+   * shape on purpose — the full Workspace type lives in
+   * WorkspacesSection.tsx and importing it here would cycle.
+   */
+  workspaces?: Array<{ id: string; name: string }>;
 }
 
 /** A program the user added manually (add_custom_program result). */
@@ -247,6 +295,23 @@ export function browseAll(
       });
     }
   }
+  // v0.9.6: pinned workspaces, same treatment. A workspace deleted after
+  // pinning drops silently instead of breaking the launcher.
+  const wsById = new Map((opts?.workspaces ?? []).map((w) => [w.id, w]));
+  for (const pid of opts?.pinned ?? []) {
+    const wid = parseWorkspaceTag(pid);
+    if (wid === null) continue;
+    const ws = wsById.get(wid);
+    if (!ws) continue;
+    items.push({
+      kind: "workspace",
+      id: pid,
+      title: ws.name,
+      context: "Workspace",
+      score: 0,
+      workspaceId: ws.id,
+    });
+  }
   return sortLauncherItems(items, opts).slice(0, BROWSE_LIMIT);
 }
 
@@ -339,6 +404,25 @@ export function buildResults(
         context: "Web search",
         score: sScore,
         query: sq,
+      });
+    }
+  }
+  // v0.9.6: pinned workspaces stay discoverable while typing too.
+  const wsById = new Map((opts?.workspaces ?? []).map((w) => [w.id, w]));
+  for (const pid of opts?.pinned ?? []) {
+    const wid = parseWorkspaceTag(pid);
+    if (wid === null) continue;
+    const ws = wsById.get(wid);
+    if (!ws) continue;
+    const wScore = fuzzyScore(q, ws.name);
+    if (wScore > 0) {
+      results.push({
+        kind: "workspace",
+        id: pid,
+        title: ws.name,
+        context: "Workspace",
+        score: wScore,
+        workspaceId: ws.id,
       });
     }
   }
@@ -448,6 +532,31 @@ export function SearchTileIcon() {
   );
 }
 
+/**
+ * v0.9.6: grid/stack tile icon for pinned workspaces. Inline SVG, quiet
+ * stroke style matching the tile aesthetic — no emoji, one accent family.
+ */
+export function WorkspaceTileIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      focusable="false"
+      width="34"
+      height="34"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+    >
+      <rect x="3" y="3" width="8" height="8" rx="1.5" />
+      <rect x="13" y="3" width="8" height="8" rx="1.5" />
+      <rect x="3" y="13" width="8" height="8" rx="1.5" />
+      <rect x="13" y="13" width="8" height="8" rx="1.5" />
+    </svg>
+  );
+}
+
 export function SearchBar({
   query,
   onQuery,
@@ -494,12 +603,15 @@ export function LauncherSettingsPanel({
   programsCount,
   onProgramsRefreshed,
   onError,
+  isWindows,
 }: {
   settings: LauncherSettings;
   onSaved: (s: LauncherSettings) => void;
   programsCount: number;
   onProgramsRefreshed: (programs: NativeProgram[]) => void;
   onError: (msg: string) => void;
+  /** v0.9.6: the frameless page windows + Esc gesture are Windows-only. */
+  isWindows: boolean;
 }) {
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [autostart, setAutostart] = useState(settings.autostart);
@@ -735,6 +847,12 @@ export function LauncherSettingsPanel({
         window. Your auto-suspend and auto-close settings still apply to
         them.
       </span>
+      {isWindows && (
+        <span className="help">
+          Page windows have no close button: hold the left mouse button and
+          press Esc to close one. Alt+F4 works too.
+        </span>
+      )}
 
       <label className="inline-form">
         <span>Web search for launcher commands</span>
@@ -1050,6 +1168,15 @@ export function buildTileMenuEntries(
     // applies (no app to edit, no file to reveal).
     return [
       { key: "open", label: "Search again", onSelect: () => a.onOpen(r) },
+      pin,
+    ];
+  }
+  if (r.kind === "workspace") {
+    // v0.9.6: pinned workspace — open every member window at once, or
+    // unpin. Nothing else applies (managed in the library's Workspaces
+    // section).
+    return [
+      { key: "open", label: "Open all", onSelect: () => a.onOpen(r) },
       pin,
     ];
   }

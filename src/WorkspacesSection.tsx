@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Account, WebApp } from "./types";
 import { HotkeyCapture } from "./HotkeyCapture";
+import { workspaceTag } from "./Launcher";
 
 /**
  * Workspaces: named groups of apps/accounts ("Work", "Personal").
@@ -150,12 +151,17 @@ export default function WorkspacesSection({
   list,
   onList,
   onError,
+  pinned,
+  onTogglePin,
 }: {
   apps: WebApp[];
   /** Workspace state, owned by App.tsx so the launcher filter can use it. */
   list: WorkspaceList | null;
   onList: (list: WorkspaceList) => void;
   onError: (msg: string) => void;
+  /** v0.9.6: pinned tile ids, for the Pin/Unpin toggle per workspace. */
+  pinned: string[];
+  onTogglePin: (itemId: string) => void;
 }) {
   const [formError, setFormError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
@@ -333,6 +339,17 @@ export default function WorkspacesSection({
                   Use
                 </button>
               )}
+              <button
+                className="text-button"
+                title={
+                  pinned.includes(workspaceTag(ws.id))
+                    ? "Remove the workspace tile from the launcher"
+                    : "Pin the workspace as a launcher tile"
+                }
+                onClick={() => onTogglePin(workspaceTag(ws.id))}
+              >
+                {pinned.includes(workspaceTag(ws.id)) ? "Unpin" : "Pin to top"}
+              </button>
               <button className="text-button" onClick={() => openEdit(ws)}>
                 Edit
               </button>
