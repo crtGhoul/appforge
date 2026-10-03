@@ -78,6 +78,20 @@ export function RamDashboard({
     }
   }
 
+  // v0.9.10: close one window by its exact row label. The row key IS the
+  // window label, so the mapping can't drift. A pinned window is diverted
+  // to the standard confirm by the backend (same flow as every other
+  // close path); unpinned windows close at once.
+  async function closeWindow(w: OpenAccountWindow) {
+    setError(null);
+    try {
+      await invoke("close_open_window", { label: w.label });
+      await refresh();
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
+
   // v0.9.9: "Don't close this window" toggle. Optimistic update; a failure
   // rolls the checkbox back via refresh().
   async function togglePin(w: OpenAccountWindow) {
@@ -167,6 +181,15 @@ export function RamDashboard({
                   />
                   <span>Don't close this window</span>
                 </label>
+                <button
+                  type="button"
+                  className="ram-row-close"
+                  title="Close this window"
+                  aria-label={`Close ${w.appName} window`}
+                  onClick={() => void closeWindow(w)}
+                >
+                  ×
+                </button>
               </li>
             ))}
           </ul>

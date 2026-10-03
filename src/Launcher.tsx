@@ -1108,6 +1108,11 @@ export interface TileMenuActions {
    * window state don't have to provide it.
    */
   onToggleWindowPin?: (label: string) => void | Promise<void>;
+  /**
+   * v0.9.10: "Close window" for an open account window, by window label
+   * (`acct-<appId>-<accountId>`). Optional like onToggleWindowPin.
+   */
+  onCloseWindow?: (label: string) => void | Promise<void>;
   onEditApp: (app: WebApp) => void;
   onRemoveApp: (app: WebApp) => void;
   onForgetLogin: (app: WebApp, account: Account) => void;
@@ -1158,6 +1163,22 @@ export function buildTileMenuEntries(
       },
     };
   };
+  // v0.9.10: "Close window" for an open account window. Same open-window
+  // lookup as the "Don't close this window" entry above; pinned windows
+  // get the standard confirm from the backend.
+  const closeWindowEntry = (appId: string, accountId: string): MenuEntry | null => {
+    if (!a.onCloseWindow) return null;
+    const label = `acct-${appId}-${accountId}`;
+    const state = ctx.windowPin?.(label);
+    if (!state?.open) return null;
+    return {
+      key: "close-window",
+      label: "Close window",
+      onSelect: () => {
+        void a.onCloseWindow?.(label);
+      },
+    };
+  };
   if (r.kind === "app") {
     const entries: MenuEntry[] = [
       { key: "open", label: "Open", onSelect: () => a.onOpen(r) },
@@ -1196,6 +1217,8 @@ export function buildTileMenuEntries(
     if (acct) {
       const dontClose = dontCloseEntry(r.app.id, acct.id);
       if (dontClose) entries.push(dontClose);
+      const closeWindow = closeWindowEntry(r.app.id, acct.id);
+      if (closeWindow) entries.push(closeWindow);
       entries.push({
         key: "forget-login",
         label: "Forget this login",

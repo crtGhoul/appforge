@@ -548,6 +548,31 @@ button.cmd-row:focus-visible {
   cursor: pointer;
 }
 
+/* v0.9.10: per-row close button. Quiet — a plain × that darkens on hover. */
+.ram-row-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ram-row-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #f2f3f5;
+}
+
+.ram-row-close:focus-visible {
+  outline: 2px solid #818cf8;
+  outline-offset: 1px;
+}
+
 .ram-close-all {
   padding: 9px 16px;
   background: rgba(255, 255, 255, 0.1);

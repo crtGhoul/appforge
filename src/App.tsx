@@ -1960,6 +1960,17 @@ function AppShell() {
     }
   }
 
+  // v0.9.10: tile-menu "Close window" — the backend closes the exact
+  // label; pinned windows get the standard confirm there.
+  async function handleCloseWindow(label: string) {
+    try {
+      await invoke("close_open_window", { label });
+      await refreshWindowPins();
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
+
   async function handleRestoreSession() {
     if (restoring) return;
     setRestoring(true);
@@ -2574,6 +2585,7 @@ function AppShell() {
       onOpenAccount: (app, acct) => void handleOpenAccount(app, acct),
       onTogglePin: (itemId) => void handleTogglePin(itemId),
       onToggleWindowPin: (label) => void handleToggleWindowPin(label),
+      onCloseWindow: (label) => void handleCloseWindow(label),
       onEditApp: (app) => {
         // The Edit dialog lives in the library view: switch there first,
         // then open it. Both state updates batch into one render.

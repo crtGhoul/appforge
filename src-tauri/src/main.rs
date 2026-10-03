@@ -1003,6 +1003,7 @@ fn main() {
             custom_programs::pick_executable,
             // v0.7.0: RAM dashboard + forget-login
             windows::close_all_account_windows,
+            windows::close_open_window,
             windows::list_open_account_windows,
             windows::memory_snapshot,
             windows::forget_login,

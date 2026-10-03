@@ -1188,6 +1188,32 @@ pub fn close_all_account_windows(app: AppHandle) -> Result<usize, String> {
     Ok(closed)
 }
 
+/// Whether a dashboard close request may address this label. The RAM
+/// dashboard only lists account windows (`acct-*`) and the search window,
+/// so the close command refuses anything else — a wrong label must never
+/// be able to close the launcher itself. Pure for unit tests.
+pub(crate) fn close_label_allowed(label: &str) -> bool {
+    label.starts_with("acct-") || label == crate::websearch::SEARCH_WINDOW_LABEL
+}
+
+/// Close one open window by its exact label (v0.9.10: the RAM dashboard's
+/// per-row close button, and the launcher tile menu's "Close window"
+/// entry). The caller passes the label straight from
+/// `list_open_account_windows`, so the mapping is exact by construction —
+/// the row key IS the window label. Pin handling reuses the standard
+/// User-intent flow: pinned windows get the one native confirm
+/// ("This window is pinned. Close it anyway?"), unpinned close at once.
+/// Sync command, same as close_all_account_windows: guard_close may block
+/// this thread on the confirm dialog, which is safe on command threads.
+#[tauri::command]
+pub fn close_open_window(app: AppHandle, label: String) -> Result<(), String> {
+    if !close_label_allowed(&label) {
+        return Err(format!("not a closeable window: {label}"));
+    }
+    close_tracked_window(&app, &label, CloseIntent::User);
+    Ok(())
+}
+
 /// List every open account window with its app/account names and focus
 /// state, for the RAM dashboard.
 #[tauri::command]
@@ -1367,4 +1393,27 @@ pub fn forget_login(
 ) -> Result<(), String> {
     close_account_window(&app, &app_id, &account_id);
     store.forget_account_session(&app_id, &account_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dashboard close button passes the row's exact label; the
+    /// command must accept exactly the windows the dashboard can list
+    /// (account windows + the search window) and refuse everything else.
+    /// Refusing "main" is the critical case: a wrong-label close must
+    /// never be able to kill the launcher itself.
+    #[test]
+    fn close_label_allows_only_dashboard_windows() {
+        assert!(close_label_allowed("acct-app1-acct1"));
+        assert!(close_label_allowed("acct-a-b"));
+        assert!(close_label_allowed(crate::websearch::SEARCH_WINDOW_LABEL));
+        assert!(!close_label_allowed("main"));
+        assert!(!close_label_allowed(""));
+        assert!(!close_label_allowed("popup-acct-app1-acct1"));
+        assert!(!close_label_allowed("oauth-acct-app1-acct1"));
+        assert!(!close_label_allowed("xacct-app1-acct1"));
+        assert!(!close_label_allowed("ACCT-app1-acct1"));
+    }
 }
