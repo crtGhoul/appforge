@@ -196,6 +196,8 @@ export interface OpenAccountWindow {
   appName: string;
   accountLabel: string;
   focused: boolean;
+  /** v0.9.9: "Don't close this window" state. */
+  pinned: boolean;
 }
 
 /**

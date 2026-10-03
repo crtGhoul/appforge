@@ -137,6 +137,10 @@ fn enforce_account_window_cap(app: &AppHandle, winstate: &WindowState) {
         if labels.len() < MAX_OPEN_ACCOUNT_WINDOWS {
             return;
         }
+        // Pinned windows ("Don't close this window", v0.9.9) are never
+        // evicted to make room; the next-oldest unpinned window goes. If
+        // every window is pinned, the cap yields and the open proceeds.
+        labels.retain(|(label, _)| !crate::pin::is_pinned(app, label));
         labels.sort_by_key(|(_, t)| t.last_active);
         labels.into_iter().map(|(l, _)| l.clone()).next()
     };
@@ -149,7 +153,7 @@ fn enforce_account_window_cap(app: &AppHandle, winstate: &WindowState) {
             return;
         }
     }
-    close_tracked_window(app, &label);
+    close_tracked_window(app, &label, CloseIntent::Background);
 }
 
 /// Move/resize an already-open window to a tiled placement (v0.9.0).
@@ -648,22 +652,6 @@ fn resume_window(app: &AppHandle, label: &str) {
     });
 }
 
-/// Background watchdog: every 60s, suspend account windows idle longer than
-/// their app's `auto_suspend_minutes` (0 = never), then close account windows
-/// idle longer than their app's `auto_close_minutes` (default 30, 0 = never).
-/// Suspended windows keep their session directory, so reopening/focusing
-/// resumes the session. Closed windows are fully destroyed (renderer freed —
-/// the real RAM win, and the only automatic reclaim on Linux); the session
-/// directory on disk preserves the login, so reopening restores it.
-pub fn start_suspend_watcher(app: AppHandle) {
-    let _ = std::thread::Builder::new()
-        .name("appmaka-suspend".to_string())
-        .spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(60));
-            suspend_idle_windows(&app);
-            close_idle_windows(&app);
-        });
-}
 
 fn suspend_idle_windows(app: &AppHandle) {
     let now = unix_secs();
@@ -760,8 +748,33 @@ fn close_idle_windows(app: &AppHandle) {
         if window.is_focused().unwrap_or(true) {
             continue;
         }
-        close_tracked_window(app, &label);
+        close_tracked_window(app, &label, CloseIntent::Background);
     }
+}
+
+/// Background watchdog: every 60s, suspend account windows idle longer than
+/// their app's `auto_suspend_minutes` (0 = never), then close account windows
+/// idle longer than their app's `auto_close_minutes` (default 30, 0 = never).
+/// Suspended windows keep their session directory, so reopening/focusing
+/// resumes the session. Closed windows are fully destroyed (renderer freed —
+/// the real RAM win, and the only automatic reclaim on Linux); the session
+/// directory on disk preserves the login, so reopening restores it.
+///
+/// NOTE (v0.9.9): an idle-window discard-to-blank ("Memory Saver") was
+/// prototyped and then CUT before release. It could not meet the safety bar
+/// — media playback, focused inputs, and unsaved form state are not
+/// detectable from Rust without a JS bridge, and Tauri IPC is never exposed
+/// to site windows — so it shipped as nothing rather than as a half-working
+/// memory saver. The git history holds the prototype if a future release
+/// finds a safe detection path.
+pub fn start_suspend_watcher(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("appmaka-suspend".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            suspend_idle_windows(&app);
+            close_idle_windows(&app);
+        });
 }
 
 /// Suspend one window immediately (the `suspend_account` command path).
@@ -855,7 +868,30 @@ fn try_suspend_webview(window: &WebviewWindow) -> bool {
 // Window lifecycle helpers for the commands
 // ---------------------------------------------------------------------------
 
-fn close_tracked_window(app: &AppHandle, label: &str) {
+/// Who is asking for a tracked window to close. The pin ("Don't close this
+/// window", v0.9.9) treats them differently: Background reclaims skip
+/// pinned windows silently (unattended — they cannot ask), while User
+/// closes divert to the confirm.
+/// Close-intent lives in pin.rs next to the plan it drives.
+use crate::pin::{CloseIntent, ClosePlan};
+
+fn close_tracked_window(app: &AppHandle, label: &str, intent: CloseIntent) {
+    // Pinned windows (v0.9.9): the plan is pure and unit-tested —
+    // background reclaims skip silently, user closes ask first, and
+    // shutdown always proceeds.
+    match crate::pin::plan_close(
+        intent,
+        crate::pin::is_pinned(app, label),
+        crate::pin::is_shutting_down(),
+    ) {
+        ClosePlan::Skip => return,
+        ClosePlan::Proceed => {}
+        ClosePlan::Confirm => {
+            if !crate::pin::guard_close(app, label) {
+                return;
+            }
+        }
+    }
     if let Some(window) = app.get_webview_window(label) {
         let _ = window.close();
     }
@@ -929,8 +965,14 @@ const SIGTERM: i32 = 15;
 /// (popup child, preview) is still alive. With any webview alive, a network
 /// process could still belong to it, so the reaper does nothing
 /// (fail closed).
+///
+/// Also called once at startup (v0.9.9): the launcher's own spare ~55 MB
+/// network process has zero webview-side consumers (no fetch/XHR/WebSocket
+/// and no remote images in the launcher bundle; updater, favicons, and
+/// adblock lists all go through Rust), and WebKitGTK respawns the network
+/// process on demand if a future launcher feature ever needs it.
 #[cfg(target_os = "linux")]
-fn schedule_network_process_reap(app: AppHandle) {
+pub(crate) fn schedule_network_process_reap(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("appmaka-netproc-reap".to_string())
         .spawn(move || {
@@ -1007,6 +1049,7 @@ fn reap_orphan_network_processes() {
 }
 
 /// Close every open window belonging to an app (used before remove_app).
+/// User intent: pinned windows ask first (v0.9.9).
 pub fn close_account_windows(app: &AppHandle, app_id: &str) {
     let prefix = format!("acct-{app_id}-");
     let labels: Vec<String> = app
@@ -1016,13 +1059,18 @@ pub fn close_account_windows(app: &AppHandle, app_id: &str) {
         .cloned()
         .collect();
     for label in labels {
-        close_tracked_window(app, &label);
+        close_tracked_window(app, &label, CloseIntent::User);
     }
 }
 
 /// Close one account's window if open (used before remove_account).
+/// User intent: a pinned window asks first (v0.9.9).
 pub fn close_account_window(app: &AppHandle, app_id: &str, account_id: &str) {
-    close_tracked_window(app, &account_window_label(app_id, account_id));
+    close_tracked_window(
+        app,
+        &account_window_label(app_id, account_id),
+        CloseIntent::User,
+    );
 }
 
 /// Push a settings change to already-open windows of an app without rebuilds.
@@ -1089,6 +1137,9 @@ pub struct OpenAccountInfo {
     pub app_name: String,
     pub account_label: String,
     pub focused: bool,
+    /// v0.9.9: "Don't close this window" state, so the dashboard can
+    /// render the toggle without a second round-trip.
+    pub pinned: bool,
 }
 
 /// Close every open account window. Returns how many were closed. Sessions
@@ -1097,6 +1148,10 @@ pub struct OpenAccountInfo {
 /// leaving them open would defeat the RAM dashboard's "close all". Sync is
 /// fine: closing windows never deadlocks; only *creating* them is
 /// restricted.
+///
+/// Pinned windows (v0.9.9, "Don't close this window") get ONE batch confirm
+/// for the whole call, not one per window. "Keep open" (or dismiss) closes
+/// the unpinned windows and leaves the pinned ones alone.
 #[tauri::command]
 #[allow(dead_code)]
 pub fn close_all_account_windows(app: AppHandle) -> Result<usize, String> {
@@ -1111,9 +1166,17 @@ pub fn close_all_account_windows(app: AppHandle) -> Result<usize, String> {
         },
         None => Vec::new(),
     };
-    let count = labels.len();
+    // One-shot approvals land in ConfirmedCloses, so the per-window guard
+    // inside close_tracked_window lets approved labels through without
+    // re-asking.
+    let approved = crate::pin::confirm_batch_close(&app, &labels);
+    let mut closed = 0usize;
     for label in &labels {
-        close_tracked_window(&app, label);
+        if crate::pin::is_pinned(&app, label) && !approved.contains(label) {
+            continue;
+        }
+        close_tracked_window(&app, label, CloseIntent::User);
+        closed += 1;
     }
     // Popups are not tracked in WindowState; sweep them by live-window
     // label so no account-related webview survives a close-all.
@@ -1122,7 +1185,7 @@ pub fn close_all_account_windows(app: AppHandle) -> Result<usize, String> {
             let _ = window.close();
         }
     }
-    Ok(count)
+    Ok(closed)
 }
 
 /// List every open account window with its app/account names and focus
@@ -1164,6 +1227,7 @@ pub fn list_open_account_windows(
                 .and_then(|w| w.is_focused().ok())
                 .unwrap_or(false);
             OpenAccountInfo {
+                pinned: crate::pin::is_pinned(&app, &label),
                 label,
                 app_id,
                 account_id,
@@ -1172,6 +1236,32 @@ pub fn list_open_account_windows(
                 focused,
             }
         })
+        // The search window has no tile, so the dashboard is its only
+        // home for the "Don't close this window" toggle (v0.9.9).
+        .chain(
+            app.get_webview_window(crate::websearch::SEARCH_WINDOW_LABEL)
+                .map(|w| {
+                    let query =
+                        crate::session::search_live_query(&app).unwrap_or_default();
+                    let account_label = if query.trim().is_empty() {
+                        "Web search".to_string()
+                    } else {
+                        query
+                    };
+                    OpenAccountInfo {
+                        label: crate::websearch::SEARCH_WINDOW_LABEL.to_string(),
+                        app_id: "websearch".to_string(),
+                        account_id: String::new(),
+                        app_name: "Web search".to_string(),
+                        account_label,
+                        focused: w.is_focused().unwrap_or(false),
+                        pinned: crate::pin::is_pinned(
+                            &app,
+                            crate::websearch::SEARCH_WINDOW_LABEL,
+                        ),
+                    }
+                }),
+        )
         .collect()
 }
 

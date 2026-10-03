@@ -58,6 +58,7 @@ import type {
   AppSettings,
   LauncherSettings,
   NativeProgram,
+  OpenAccountWindow,
   PlatformInfo,
   PreviewAddOutcome,
   PreviewStart,
@@ -1930,6 +1931,35 @@ function AppShell() {
     }
   }
 
+  // v0.9.9: "Don't close this window" — which account windows are open and
+  // which are pinned, refreshed on mount and every summon so the tile-menu
+  // checkmarks are current. Labels are `acct-<appId>-<accountId>`.
+  const [openLabels, setOpenLabels] = useState<Set<string>>(new Set());
+  const [pinnedLabels, setPinnedLabels] = useState<Set<string>>(new Set());
+  const refreshWindowPins = useCallback(async () => {
+    try {
+      const wins = await invoke<OpenAccountWindow[]>(
+        "list_open_account_windows"
+      );
+      setOpenLabels(new Set(wins.map((w) => w.label)));
+      setPinnedLabels(
+        new Set(wins.filter((w) => w.pinned).map((w) => w.label))
+      );
+    } catch {
+      /* older backend without the command; the menu entry stays hidden */
+    }
+  }, []);
+
+  async function handleToggleWindowPin(label: string) {
+    const next = !pinnedLabels.has(label);
+    try {
+      await invoke("set_window_pinned", { label, pinned: next });
+      await refreshWindowPins();
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  }
+
   async function handleRestoreSession() {
     if (restoring) return;
     setRestoring(true);
@@ -1955,8 +1985,12 @@ function AppShell() {
 
   useEffect(() => {
     void checkRestoreOffer();
+    void refreshWindowPins();
     let off: (() => void) | undefined;
-    listen("appmaka:show-launcher", () => void checkRestoreOffer())
+    listen("appmaka:show-launcher", () => {
+      void checkRestoreOffer();
+      void refreshWindowPins();
+    })
       .then((f) => {
         off = f;
       })
@@ -2531,10 +2565,15 @@ function AppShell() {
   }
   const { tileMenuNode, openTileMenu } = useTileMenu({
     isPinned: (id) => launcherSettings?.pinned?.includes(id) ?? false,
+    windowPin: (label) =>
+      openLabels.has(label)
+        ? { open: true, pinned: pinnedLabels.has(label) }
+        : null,
     actions: {
       onOpen: (r) => void activateResult(r),
       onOpenAccount: (app, acct) => void handleOpenAccount(app, acct),
       onTogglePin: (itemId) => void handleTogglePin(itemId),
+      onToggleWindowPin: (label) => void handleToggleWindowPin(label),
       onEditApp: (app) => {
         // The Edit dialog lives in the library view: switch there first,
         // then open it. Both state updates batch into one render.

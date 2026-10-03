@@ -78,6 +78,21 @@ export function RamDashboard({
     }
   }
 
+  // v0.9.9: "Don't close this window" toggle. Optimistic update; a failure
+  // rolls the checkbox back via refresh().
+  async function togglePin(w: OpenAccountWindow) {
+    const next = !w.pinned;
+    setWindows((prev) =>
+      prev.map((x) => (x.label === w.label ? { ...x, pinned: next } : x))
+    );
+    try {
+      await invoke("set_window_pinned", { label: w.label, pinned: next });
+    } catch (err) {
+      setError(errMsg(err));
+      await refresh();
+    }
+  }
+
   // Even estimate per window; guarded against a zero count and backends
   // whose main-process number exceeds the total.
   const webviewTotalKb = Math.max(
@@ -128,7 +143,7 @@ export function RamDashboard({
         {snapshot?.supported && windows.length > 0 && (
           <ul className="ram-list">
             {windows.map((w) => (
-              <li key={`${w.appId}:${w.accountId}`} className="ram-row">
+              <li key={w.label} className="ram-row ram-row-wrap">
                 <span className="ram-row-main">
                   <span className="ram-row-title">{w.appName}</span>
                   <span className="ram-row-sub">{w.accountLabel}</span>
@@ -141,6 +156,17 @@ export function RamDashboard({
                 <span className="ram-row-mem muted" title="Estimated share of memory">
                   {aboutMb(perWindowKb)} (estimated)
                 </span>
+                <label
+                  className="ram-pin-toggle"
+                  title="Asks before this window can be closed."
+                >
+                  <input
+                    type="checkbox"
+                    checked={w.pinned}
+                    onChange={() => void togglePin(w)}
+                  />
+                  <span>Don't close this window</span>
+                </label>
               </li>
             ))}
           </ul>

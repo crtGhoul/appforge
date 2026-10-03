@@ -43,9 +43,145 @@ pub fn esc_gesture_closes(g: EscGesture) -> bool {
     g.esc_down && g.lmb_held && g.foreground_is_page
 }
 
+// ---------------------------------------------------------------------------
+// Maximize/restore + snap: pure, cross-platform, unit-tested on every
+// platform (only the Win32 machinery is cfg(windows)).
+// ---------------------------------------------------------------------------
+
+/// Snap zones for the strip's own right-click snap menu (v0.9.9). The
+/// native Windows 11 snap-layouts flyout is not reachable from our
+/// architecture — the shell only offers it to a window answering
+/// WM_NCHITTEST with HTMAXBUTTON, and our maximize button lives in an
+/// owned WS_POPUP strip above the page, not in the page window itself —
+/// so right-clicking the maximize button opens this minimal native menu
+/// instead. (Win+Z and Win+Arrow keep working on the page directly.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub enum SnapZone {
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+impl SnapZone {
+    /// Menu order, matching the native flyout's most-used layouts first.
+    pub fn menu_order() -> [SnapZone; 6] {
+        use SnapZone::*;
+        [Left, Right, TopLeft, TopRight, BottomLeft, BottomRight]
+    }
+
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            SnapZone::Left => "Snap left",
+            SnapZone::Right => "Snap right",
+            SnapZone::TopLeft => "Snap top left",
+            SnapZone::TopRight => "Snap top right",
+            SnapZone::BottomLeft => "Snap bottom left",
+            SnapZone::BottomRight => "Snap bottom right",
+        }
+    }
+}
+
+/// Pure: monitor work-area (left, top, right, bottom) -> window rect
+/// (x, y, w, h) for a snap zone. Halves split the work area; quadrants
+/// split it into four.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub fn snap_zone_rect(work: (i32, i32, i32, i32), zone: SnapZone) -> (i32, i32, i32, i32) {
+    let (l, t, r, b) = work;
+    let w = r - l;
+    let h = b - t;
+    let hw = w / 2;
+    let hh = h / 2;
+    match zone {
+        SnapZone::Left => (l, t, hw, h),
+        SnapZone::Right => (l + hw, t, w - hw, h),
+        SnapZone::TopLeft => (l, t, hw, hh),
+        SnapZone::TopRight => (l + hw, t, w - hw, hh),
+        SnapZone::BottomLeft => (l, t + hh, hw, h - hh),
+        SnapZone::BottomRight => (l + hw, t + hh, w - hw, h - hh),
+    }
+}
+
+/// Pure: which system command a maximize-button click should send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub enum MaxToggle {
+    Maximize,
+    Restore,
+}
+
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub fn max_toggle(is_zoomed: bool) -> MaxToggle {
+    if is_zoomed {
+        MaxToggle::Restore
+    } else {
+        MaxToggle::Maximize
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+
+    #[test]
+    fn halves_split_work_area() {
+        let work = (0, 0, 1920, 1040);
+        assert_eq!(snap_zone_rect(work, SnapZone::Left), (0, 0, 960, 1040));
+        assert_eq!(snap_zone_rect(work, SnapZone::Right), (960, 0, 960, 1040));
+    }
+
+    #[test]
+    fn quadrants_tile_without_gaps() {
+        let work = (0, 0, 1920, 1040);
+        assert_eq!(snap_zone_rect(work, SnapZone::TopLeft), (0, 0, 960, 520));
+        assert_eq!(snap_zone_rect(work, SnapZone::TopRight), (960, 0, 960, 520));
+        assert_eq!(
+            snap_zone_rect(work, SnapZone::BottomLeft),
+            (0, 520, 960, 520)
+        );
+        assert_eq!(
+            snap_zone_rect(work, SnapZone::BottomRight),
+            (960, 520, 960, 520)
+        );
+    }
+
+    #[test]
+    fn odd_sizes_dont_overlap_or_gap() {
+        // Integer division must not drop or double-count a pixel column.
+        let work = (0, 0, 1919, 1039);
+        let (lx, _, lw, _) = snap_zone_rect(work, SnapZone::Left);
+        let (rx, _, rw, _) = snap_zone_rect(work, SnapZone::Right);
+        assert_eq!((lx, lw, rx, rw), (0, 959, 959, 960));
+        let (_, ty, _, th) = snap_zone_rect(work, SnapZone::TopLeft);
+        let (_, by, _, bh) = snap_zone_rect(work, SnapZone::BottomLeft);
+        assert_eq!((ty, th, by, bh), (0, 519, 519, 520));
+    }
+
+    #[test]
+    fn toggle_follows_zoom_state() {
+        assert_eq!(max_toggle(false), MaxToggle::Maximize);
+        assert_eq!(max_toggle(true), MaxToggle::Restore);
+    }
+
+    #[test]
+    fn menu_covers_six_labeled_zones() {
+        let order = SnapZone::menu_order();
+        assert_eq!(order.len(), 6);
+        for zone in order {
+            assert!(!zone.menu_label().is_empty());
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::{esc_gesture_closes, EscGesture};
+    use super::{
+        esc_gesture_closes, max_toggle, snap_zone_rect, EscGesture, MaxToggle, SnapZone,
+    };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -120,6 +256,8 @@ mod imp {
         scale: f64,
         hover_min: bool,
         pressed_min: bool,
+        hover_max: bool,
+        pressed_max: bool,
         mouse_in: bool,
         /// True while we are moving the caption ourselves (from the owner's
         /// Moved/Resized events): WM_WINDOWPOSCHANGED must not echo the move
@@ -156,15 +294,26 @@ mod imp {
         CHROME.with(|c| c.borrow_mut().as_mut().and_then(f))
     }
 
+    /// Minimize button: rightmost slot. The maximize/restore button
+    /// (v0.9.9) takes the slot to its left; both are BTN_W_LOGICAL wide.
     fn button_rect(hwnd: HWND, scale: f64) -> Option<RECT> {
+        button_rect_at(hwnd, scale, 0)
+    }
+
+    /// Maximize/restore button: one slot left of minimize.
+    fn max_button_rect(hwnd: HWND, scale: f64) -> Option<RECT> {
+        button_rect_at(hwnd, scale, 1)
+    }
+
+    fn button_rect_at(hwnd: HWND, scale: f64, slot: i32) -> Option<RECT> {
         unsafe {
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).ok()?;
             let bw = (BTN_W_LOGICAL * scale).round() as i32;
             Some(RECT {
-                left: rc.right - bw,
+                left: rc.right - bw * (slot + 1),
                 top: rc.top,
-                right: rc.right,
+                right: rc.right - bw * slot,
                 bottom: rc.bottom,
             })
         }
@@ -195,12 +344,20 @@ mod imp {
         if hdc.is_invalid() {
             return;
         }
-        let (scale, hover, pressed) = with_chrome(|ch| {
-            let label = ch.by_hwnd.get(&(hwnd.0 as isize))?;
-            let cp = ch.captions.get(label)?;
-            Some((cp.scale, cp.hover_min, cp.pressed_min))
-        })
-        .unwrap_or((1.0, false, false));
+        let (scale, owner, hover_min, pressed_min, hover_max, pressed_max) =
+            with_chrome(|ch| {
+                let label = ch.by_hwnd.get(&(hwnd.0 as isize))?;
+                let cp = ch.captions.get(label)?;
+                Some((
+                    cp.scale,
+                    cp.owner,
+                    cp.hover_min,
+                    cp.pressed_min,
+                    cp.hover_max,
+                    cp.pressed_max,
+                ))
+            })
+            .unwrap_or((1.0, HWND::default(), false, false, false, false));
 
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
@@ -208,9 +365,60 @@ mod imp {
         FillRect(hdc, &rc, bg);
         let _ = DeleteObject(hbrush_to_obj(bg));
 
+        // Maximize/restore button (v0.9.9): one slot left of minimize,
+        // same dark styling. Glyph follows the owner's zoom state — a
+        // pure query, no messages, safe under the borrow above.
+        let zoomed = !owner.is_invalid() && IsZoomed(owner).as_bool();
+        if let Some(btn) = max_button_rect(hwnd, scale) {
+            if hover_max || pressed_max {
+                let bbg = CreateSolidBrush(if pressed_max {
+                    rgb(46, 46, 46)
+                } else {
+                    rgb(58, 58, 58)
+                });
+                FillRect(hdc, &btn, bbg);
+                let _ = DeleteObject(hbrush_to_obj(bbg));
+            }
+            let glyph = CreateSolidBrush(if hover_max || pressed_max {
+                rgb(255, 255, 255)
+            } else {
+                rgb(204, 204, 204)
+            });
+            // Outline squares drawn as four bars so no background
+            // punch-out is needed (works over the hover highlight).
+            let s = (10.0 * scale).round() as i32; // square size
+            let t = (2.0 * scale).max(1.0).round() as i32; // bar thickness
+            let bw = btn.right - btn.left;
+            let bh = btn.bottom - btn.top;
+            let square = |left: i32, top: i32| {
+                let bars = [
+                    RECT { left, top, right: left + s, bottom: top + t },
+                    RECT { left, top: top + s - t, right: left + s, bottom: top + s },
+                    RECT { left, top: top + t, right: left + t, bottom: top + s - t },
+                    RECT { left: left + s - t, top: top + t, right: left + s, bottom: top + s - t },
+                ];
+                for b in bars {
+                    FillRect(hdc, &b, glyph);
+                }
+            };
+            if zoomed {
+                // Restore glyph: front square bottom-left, back square
+                // peeking top-right.
+                let off = (3.0 * scale).round() as i32;
+                let cx = btn.left + (bw - s) / 2;
+                let cy = btn.top + (bh - s) / 2;
+                square(cx + off, cy - off);
+                square(cx - off / 2, cy + off / 2);
+            } else {
+                // Maximize glyph: single square outline, centered.
+                square(btn.left + (bw - s) / 2, btn.top + (bh - s) / 2);
+            }
+            let _ = DeleteObject(hbrush_to_obj(glyph));
+        }
+
         if let Some(btn) = button_rect(hwnd, scale) {
-            if hover || pressed {
-                let bbg = CreateSolidBrush(if pressed {
+            if hover_min || pressed_min {
+                let bbg = CreateSolidBrush(if pressed_min {
                     rgb(46, 46, 46)
                 } else {
                     rgb(58, 58, 58)
@@ -229,7 +437,7 @@ mod imp {
                 right: btn.left + (bw - gw) / 2 + gw,
                 bottom: btn.top + (bh - gh) / 2 + gh,
             };
-            let glyph = CreateSolidBrush(if hover || pressed {
+            let glyph = CreateSolidBrush(if hover_min || pressed_min {
                 rgb(255, 255, 255)
             } else {
                 rgb(204, 204, 204)
@@ -245,27 +453,60 @@ mod imp {
         // Decide under the borrow; the HTCAPTION drag starts a modal loop
         // that re-enters caption_proc, so SendMessageW must run AFTER the
         // RefCell borrow is released — never inside it.
-        let drag = with_chrome(|ch| {
+        //
+        // When the owner is maximized, starting a drag would fight the
+        // maximized state: restore first instead (no drag). IsZoomed is a
+        // pure query — no messages — so it is safe under the borrow.
+        enum Down {
+            Drag,
+            Restore(HWND),
+            None,
+        }
+        let down = with_chrome(|ch| {
             let label = ch.by_hwnd.get(&(hwnd.0 as isize))?.clone();
             let cp = ch.captions.get_mut(&label)?;
-            let over_button =
+            let over_max =
+                max_button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
+            let over_min =
                 button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
-            if over_button {
+            if over_max {
+                cp.pressed_max = true;
+                SetCapture(hwnd);
+            } else if over_min {
                 cp.pressed_min = true;
                 SetCapture(hwnd);
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
-            Some(!over_button)
+            if over_max || over_min {
+                Some(Down::None)
+            } else if IsZoomed(cp.owner).as_bool() {
+                Some(Down::Restore(cp.owner))
+            } else {
+                Some(Down::Drag)
+            }
         })
-        .unwrap_or(false);
-        if drag {
-            let _ = ReleaseCapture();
-            let _ = SendMessageW(
-                hwnd,
-                WM_NCLBUTTONDOWN,
-                Some(WPARAM(HTCAPTION as usize)),
-                Some(LPARAM(0)),
-            );
+        .unwrap_or(Down::None);
+        match down {
+            Down::Drag => {
+                let _ = ReleaseCapture();
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_NCLBUTTONDOWN,
+                    Some(WPARAM(HTCAPTION as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            // Async like the minimize path: no synchronous re-entrancy,
+            // so the two-phase rule is satisfied trivially.
+            Down::Restore(owner) if !owner.is_invalid() => {
+                let _ = PostMessageW(
+                    Some(owner),
+                    WM_SYSCOMMAND,
+                    WPARAM(SC_RESTORE as usize),
+                    LPARAM(0),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -274,6 +515,30 @@ mod imp {
         with_chrome(|ch| {
             let label = ch.by_hwnd.get(&(hwnd.0 as isize))?.clone();
             let cp = ch.captions.get_mut(&label)?;
+            if cp.pressed_max {
+                cp.pressed_max = false;
+                if GetCapture() == hwnd {
+                    let _ = ReleaseCapture();
+                }
+                let over_max =
+                    max_button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
+                if over_max {
+                    // Toggle maximize/restore. PostMessageW is async — like
+                    // the minimize path it cannot synchronously re-enter
+                    // caption_proc, so the two-phase rule holds without a
+                    // second phase. IsZoomed is a pure query (no messages).
+                    let cmd = match max_toggle(IsZoomed(cp.owner).as_bool()) {
+                        MaxToggle::Maximize => SC_MAXIMIZE,
+                        MaxToggle::Restore => SC_RESTORE,
+                    };
+                    let _ = PostMessageW(
+                        Some(cp.owner),
+                        WM_SYSCOMMAND,
+                        WPARAM(cmd as usize),
+                        LPARAM(0),
+                    );
+                }
+            }
             if cp.pressed_min {
                 cp.pressed_min = false;
                 if GetCapture() == hwnd {
@@ -296,6 +561,105 @@ mod imp {
         });
     }
 
+    /// Right-click on the maximize/restore button: our own minimal snap
+    /// menu (v0.9.9). The native Windows 11 snap-layouts flyout is not
+    /// reachable from our architecture (see SnapZone docs), so this native
+    /// popup menu is the honest fallback.
+    ///
+    /// Two-phase: TrackPopupMenu runs a modal loop that synchronously
+    /// dispatches to caption_proc, so phase 1 only snapshots (owner +
+    /// monitor work rect — pure queries, no messages) under a short
+    /// borrow, and phase 2 builds the menu, runs it, and moves the owner
+    /// with no borrow held.
+    unsafe fn on_rbutton_up(hwnd: HWND, lparam: LPARAM) {
+        let (x, y) = mouse_xy(lparam);
+        struct SnapPlan {
+            owner: HWND,
+            work: RECT,
+        }
+        let plan = with_chrome(|ch| {
+            let label = ch.by_hwnd.get(&(hwnd.0 as isize))?.clone();
+            let cp = ch.captions.get(&label)?;
+            let over_max =
+                max_button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
+            if !over_max || !IsWindow(Some(cp.owner)).as_bool() {
+                return None;
+            }
+            let hmon = MonitorFromWindow(cp.owner, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                return None;
+            }
+            Some(SnapPlan {
+                owner: cp.owner,
+                work: mi.rcWork,
+            })
+        });
+        let Some(plan) = plan else {
+            return;
+        };
+        // Phase 2: no borrow held from here on.
+        let menu = CreatePopupMenu().unwrap_or_default();
+        if menu.is_invalid() {
+            return;
+        }
+        for (i, zone) in SnapZone::menu_order().into_iter().enumerate() {
+            let mut wide: Vec<u16> = OsStr::new(zone.menu_label())
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // AppendMenuW copies the string synchronously; `wide` only
+            // needs to live for the call.
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                i + 1,
+                PWSTR(wide.as_mut_ptr()),
+            );
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD, pt.x, pt.y, Some(0), hwnd, None);
+        let _ = DestroyMenu(menu);
+        // With TPM_RETURNCMD the BOOL carries the chosen item id; 0/false
+        // means dismissed.
+        if !cmd.as_bool() {
+            return;
+        }
+        let Some(zone) = SnapZone::menu_order()
+            .get(cmd.0 as usize - 1)
+            .copied()
+        else {
+            return;
+        };
+        let (zx, zy, zw, zh) = snap_zone_rect(
+            (
+                plan.work.left,
+                plan.work.top,
+                plan.work.right,
+                plan.work.bottom,
+            ),
+            zone,
+        );
+        // A maximized window keeps its maximized state across SetWindowPos;
+        // restore first so the zone rect takes effect. No borrow held.
+        if IsZoomed(plan.owner).as_bool() {
+            let _ = ShowWindow(plan.owner, SW_RESTORE);
+        }
+        let _ = SetWindowPos(
+            plan.owner,
+            None,
+            zx,
+            zy,
+            zw,
+            zh,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+
     unsafe fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
         let (x, y) = mouse_xy(lparam);
         with_chrome(|ch| {
@@ -311,10 +675,13 @@ mod imp {
                 };
                 let _ = TrackMouseEvent(&mut tme);
             }
-            let hover =
+            let hover_min =
                 button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
-            if hover != cp.hover_min {
-                cp.hover_min = hover;
+            let hover_max =
+                max_button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
+            if hover_min != cp.hover_min || hover_max != cp.hover_max {
+                cp.hover_min = hover_min;
+                cp.hover_max = hover_max;
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             Some(())
@@ -327,6 +694,7 @@ mod imp {
             let cp = ch.captions.get_mut(&label)?;
             cp.mouse_in = false;
             cp.hover_min = false;
+            cp.hover_max = false;
             let _ = InvalidateRect(Some(hwnd), None, false);
             Some(())
         });
@@ -334,7 +702,7 @@ mod imp {
 
     /// The caption moved (user drag): move the owner by the same delta,
     /// keeping the strip pinned on-screen (it is the window's only drag
-    /// handle and its only minimize button).
+    /// handle and its caption buttons).
     ///
     /// Two phases: SetWindowPos on our OWN window delivers
     /// WM_WINDOWPOSCHANGED synchronously (re-entrant caption_proc), so no
@@ -544,6 +912,10 @@ mod imp {
                 on_lbutton_up(hwnd, lparam);
                 LRESULT(0)
             }
+            WM_RBUTTONUP => {
+                on_rbutton_up(hwnd, lparam);
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 on_mouse_move(hwnd, lparam);
                 LRESULT(0)
@@ -610,7 +982,7 @@ mod imp {
             Ok(h) => h,
             Err(_) => return,
         };
-        let text = "Hold the left mouse button and press Esc to close this window.";
+        let text = "Hold the left mouse button and press Esc to close this window. Right-click the maximize button for snap layouts.";
         let mut wide: Vec<u16> = OsStr::new(text).encode_wide().chain(std::iter::once(0)).collect();
         let mut rc = RECT::default();
         let _ = GetClientRect(parent, &mut rc);
@@ -634,15 +1006,17 @@ mod imp {
         SendMessageW(tip, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(320)));
     }
 
-    /// Place the strip directly above its owner. A maximized owner gets no
-    /// strip (it would sit off-screen); it reappears on restore.
+    /// Place the strip directly above its owner. A maximized owner keeps
+    /// the strip, pinned to the top of the monitor work area, so the
+    /// restore button stays clickable — hiding it would make maximize a
+    /// one-way trap for the mouse.
     ///
     /// Two-phase throughout: ShowWindow/SetWindowPos deliver messages
     /// synchronously and re-enter caption_proc, so no borrow is held
     /// across them. Phase 1 snapshots under a short borrow (IsWindow /
-    /// IsZoomed / GetWindowRect are pure queries — they deliver no
-    /// messages); phase 2 acts with the borrow released; phase 3 records
-    /// the result under a short borrow.
+    /// IsZoomed / GetWindowRect / MonitorFromWindow / GetMonitorInfoW are
+    /// pure queries — they deliver no messages); phase 2 acts with the
+    /// borrow released; phase 3 records the result under a short borrow.
     unsafe fn reposition_caption(label: &str) {
         struct Snap {
             hwnd: HWND,
@@ -650,7 +1024,6 @@ mod imp {
         }
         enum Plan {
             Skip,
-            Hide(HWND),
             Place {
                 snap: Snap,
                 tx: i32,
@@ -664,14 +1037,34 @@ mod imp {
             if !IsWindow(Some(cp.owner)).as_bool() {
                 return Some(Plan::Skip);
             }
+            let h = (BAR_H_LOGICAL * cp.scale).round() as i32;
             if IsZoomed(cp.owner).as_bool() {
-                return Some(Plan::Hide(cp.hwnd));
+                // Maximized: GetWindowRect bleeds past the monitor by the
+                // (hidden) border size, so anchor to the work area instead.
+                let hmon = MonitorFromWindow(cp.owner, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                    return Some(Plan::Skip);
+                }
+                let w = mi.rcWork.right - mi.rcWork.left;
+                return Some(Plan::Place {
+                    snap: Snap {
+                        hwnd: cp.hwnd,
+                        owner: cp.owner,
+                    },
+                    tx: mi.rcWork.left,
+                    ty: mi.rcWork.top,
+                    w,
+                    h,
+                });
             }
             let mut orc = RECT::default();
             if GetWindowRect(cp.owner, &mut orc).is_err() {
                 return Some(Plan::Skip);
             }
-            let h = (BAR_H_LOGICAL * cp.scale).round() as i32;
             let w = orc.right - orc.left;
             Some(Plan::Place {
                 snap: Snap {
@@ -690,9 +1083,6 @@ mod imp {
         };
         match plan {
             Plan::Skip => {}
-            Plan::Hide(hwnd) => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
             Plan::Place { snap, tx, ty, w, h } => {
                 let _ = ShowWindow(snap.hwnd, SW_SHOWNOACTIVATE);
                 // Never strand the strip off the top of the screen: nudge
@@ -803,6 +1193,8 @@ mod imp {
                     scale,
                     hover_min: false,
                     pressed_min: false,
+                    hover_max: false,
+                    pressed_max: false,
                     mouse_in: false,
                     syncing: false,
                     last_x: 0,
@@ -964,17 +1356,26 @@ mod imp {
                 reposition_caption(&label);
             }
             ChromeCmd::ClosePage { label } => {
-                // Borrow only to fetch the window: close() can
-                // synchronously destroy the owned caption (WM_DESTROY
+                // Borrow only to fetch the app handle and window: close()
+                // can synchronously destroy the owned caption (WM_DESTROY
                 // runs on this thread), which must not happen under our
-                // borrow.
-                let win = CHROME.with(|c| {
-                    c.borrow()
-                        .as_ref()
-                        .and_then(|ch| ch.app.get_webview_window(&label))
+                // borrow. The v0.9.9 pin check takes only a short mutex
+                // lock — no Win32 call under it (v0.9.7 rules).
+                let ctx = CHROME.with(|c| {
+                    c.borrow().as_ref().map(|ch| {
+                        (ch.app.clone(), ch.app.get_webview_window(&label))
+                    })
                 });
-                if let Some(w) = win {
-                    let _ = w.close();
+                if let Some((app, Some(w))) = ctx {
+                    if crate::pin::is_pinned(&app, &label) {
+                        // Pinned ("Don't close this window"): the
+                        // hold-LEFT+Esc gesture asks instead of closing.
+                        // ask_then_close shows the native dialog on its own
+                        // thread — safe from this worker thread.
+                        crate::pin::ask_then_close(&app, &label);
+                    } else {
+                        let _ = w.close();
+                    }
                 }
             }
         }

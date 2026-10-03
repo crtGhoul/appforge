@@ -121,6 +121,11 @@ body {
   color: #fca5a5;
 }
 
+/* v0.9.9: checkmark for checkable rows ("Don't close this window"). */
+.tile-menu-check {
+  color: #818cf8;
+}
+
 .tile-menu-item.is-danger:hover,
 .tile-menu-item.is-danger:focus-visible {
   background: rgba(248, 113, 113, 0.14);
@@ -517,6 +522,30 @@ button.cmd-row:focus-visible {
 .ram-row-mem {
   flex: none;
   font-size: 12px;
+}
+
+/* v0.9.9: "Don't close this window" toggle sits under each window row. */
+.ram-row-wrap {
+  flex-wrap: wrap;
+}
+
+.ram-pin-toggle {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  user-select: none;
+}
+
+.ram-pin-toggle input {
+  accent-color: #818cf8;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
 }
 
 .ram-close-all {

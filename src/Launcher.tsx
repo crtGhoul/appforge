@@ -948,6 +948,8 @@ export interface MenuEntry {
   label: string;
   /** Destructive action (Remove) — styled in red. */
   danger?: boolean;
+  /** Checkable row (v0.9.9): renders a ✓ when true. */
+  checked?: boolean;
   submenu?: MenuEntry[];
   onSelect?: () => void | Promise<void>;
 }
@@ -1053,7 +1055,16 @@ export function TileMenu({
                 if (entry.submenu) setOpenSub(entry.key);
               }}
             >
-              <span>{entry.label}</span>
+              {entry.checked ? (
+                <span>
+                  <span className="tile-menu-check" aria-hidden="true">
+                    ✓{" "}
+                  </span>
+                  {entry.label}
+                </span>
+              ) : (
+                <span>{entry.label}</span>
+              )}
               {entry.submenu && (
                 <span className="tile-menu-caret" aria-hidden="true">
                   ▸
@@ -1091,6 +1102,12 @@ export interface TileMenuActions {
   onOpen: (r: SearchResult) => void;
   onOpenAccount: (app: WebApp, account: Account) => void;
   onTogglePin: (itemId: string) => void | Promise<void>;
+  /**
+   * v0.9.9: "Don't close this window" for an open account window, by
+   * window label (`acct-<appId>-<accountId>`). Optional so hosts without
+   * window state don't have to provide it.
+   */
+  onToggleWindowPin?: (label: string) => void | Promise<void>;
   onEditApp: (app: WebApp) => void;
   onRemoveApp: (app: WebApp) => void;
   onForgetLogin: (app: WebApp, account: Account) => void;
@@ -1107,13 +1124,39 @@ export interface TileMenuActions {
  */
 export function buildTileMenuEntries(
   r: SearchResult,
-  ctx: { isPinned: boolean; actions: TileMenuActions }
+  ctx: {
+    isPinned: boolean;
+    actions: TileMenuActions;
+    /**
+     * v0.9.9: open-window state for the "Don't close this window" entry,
+     * by window label. Null/absent = window not open (or unknown) → the
+     * entry is hidden.
+     */
+    windowPin?: (label: string) => { open: boolean; pinned: boolean } | null;
+  }
 ): MenuEntry[] {
   const a = ctx.actions;
   const pin: MenuEntry = {
     key: "pin",
     label: ctx.isPinned ? "Unpin" : "Pin to top",
     onSelect: () => a.onTogglePin(r.id),
+  };
+  // v0.9.9: checkable "Don't close this window" for an open account
+  // window. The word "pin" never appears in the UI for this feature —
+  // it is a different concept from the tile "Pin to top" above.
+  const dontCloseEntry = (appId: string, accountId: string): MenuEntry | null => {
+    if (!a.onToggleWindowPin) return null;
+    const label = `acct-${appId}-${accountId}`;
+    const state = ctx.windowPin?.(label);
+    if (!state?.open) return null;
+    return {
+      key: "dont-close",
+      label: "Don't close this window",
+      checked: state.pinned,
+      onSelect: () => {
+        void a.onToggleWindowPin?.(label);
+      },
+    };
   };
   if (r.kind === "app") {
     const entries: MenuEntry[] = [
@@ -1151,6 +1194,8 @@ export function buildTileMenuEntries(
       pin,
     ];
     if (acct) {
+      const dontClose = dontCloseEntry(r.app.id, acct.id);
+      if (dontClose) entries.push(dontClose);
       entries.push({
         key: "forget-login",
         label: "Forget this login",
@@ -1214,6 +1259,11 @@ export function buildTileMenuEntries(
 export function useTileMenu(deps: {
   actions: TileMenuActions;
   isPinned: (itemId: string) => boolean;
+  /**
+   * v0.9.9: open-window state for the "Don't close this window" entry.
+   * Same ref treatment as actions/isPinned so the host can keep it fresh.
+   */
+  windowPin?: (label: string) => { open: boolean; pinned: boolean } | null;
 }) {
   const [target, setTarget] = useState<{
     r: SearchResult;
@@ -1228,6 +1278,8 @@ export function useTileMenu(deps: {
   actionsRef.current = deps.actions;
   const isPinnedRef = useRef(deps.isPinned);
   isPinnedRef.current = deps.isPinned;
+  const windowPinRef = useRef(deps.windowPin);
+  windowPinRef.current = deps.windowPin;
   const node = target ? (
     <TileMenu
       x={target.x}
@@ -1235,6 +1287,9 @@ export function useTileMenu(deps: {
       entries={buildTileMenuEntries(target.r, {
         isPinned: isPinnedRef.current(target.r.id),
         actions: actionsRef.current,
+        windowPin: windowPinRef.current
+          ? (label) => windowPinRef.current!(label)
+          : undefined,
       })}
       onDismiss={close}
     />

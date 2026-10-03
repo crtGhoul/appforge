@@ -46,13 +46,29 @@ pub enum SessionWindow {
         account_id: String,
         #[serde(default)]
         rect: Option<WindowRect>,
+        /// v0.9.9: per-window "Don't close this window". Old files lack it
+        /// and load as unpinned — no migration needed.
+        #[serde(default)]
+        pinned: bool,
     },
     Search {
         #[serde(default)]
         query: String,
         #[serde(default)]
         rect: Option<WindowRect>,
+        #[serde(default)]
+        pinned: bool,
     },
+}
+
+impl SessionWindow {
+    /// Whether the user switched on "Don't close this window" for this entry.
+    pub fn pinned(&self) -> bool {
+        match self {
+            SessionWindow::Account { pinned, .. } => *pinned,
+            SessionWindow::Search { pinned, .. } => *pinned,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -171,24 +187,36 @@ pub fn merge_rect(
 }
 
 /// Pure session assembly, sorted by open time. The live-window plumbing
-/// stays in `write_session`; this is the unit-testable core.
+/// stays in `write_session`; this is the unit-testable core. `pinned_for`
+/// resolves a window label to its pin state (reads the runtime PinState
+/// map in production); labels are derivable without opening windows.
 pub fn build_session(
     accounts: Vec<(String, String, Option<WindowRect>, u64)>,
     search: Option<(String, Option<WindowRect>, u64)>,
+    pinned_for: &dyn Fn(&str) -> bool,
 ) -> Session {
     let mut entries: Vec<(u64, SessionWindow)> = Vec::new();
     for (app_id, account_id, rect, opened_at) in accounts {
+        let label = crate::windows::account_window_label(&app_id, &account_id);
         entries.push((
             opened_at,
             SessionWindow::Account {
                 app_id,
                 account_id,
                 rect,
+                pinned: pinned_for(&label),
             },
         ));
     }
     if let Some((query, rect, opened_at)) = search {
-        entries.push((opened_at, SessionWindow::Search { query, rect }));
+        entries.push((
+            opened_at,
+            SessionWindow::Search {
+                query,
+                rect,
+                pinned: pinned_for(SEARCH_WINDOW_LABEL),
+            },
+        ));
     }
     entries.sort_by_key(|(ts, _)| *ts);
     Session {
@@ -353,6 +381,7 @@ fn prev_account_rect(session: &Session, app_id: &str, account_id: &str) -> Optio
             app_id: a,
             account_id: ac,
             rect,
+            ..
         } if a == app_id && ac == account_id => rect.clone(),
         _ => None,
     })
@@ -423,6 +452,17 @@ pub fn note_search_closed(app: &AppHandle) {
     }
 }
 
+/// The live search window's current query, if the window is open.
+pub fn search_live_query(app: &AppHandle) -> Option<String> {
+    app.try_state::<SearchLiveState>().and_then(|state| {
+        state
+            .0
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|live| live.query.clone()))
+    })
+}
+
 /// Rewrite session.json from the live window set. Called on every
 /// account-window open/close, search-window open/close/navigate, and
 /// debounced move/resize. Cheap: one tiny atomic JSON write.
@@ -454,7 +494,12 @@ pub fn write_session(app: &AppHandle) {
             );
             (live.query, rect, live.opened_at)
         });
-    save_session(app, &build_session(accounts, search));
+    save_session(
+        app,
+        &build_session(accounts, search, &|label| {
+            crate::pin::is_pinned(app, label)
+        }),
+    );
 }
 
 /// At most one pending debounced write: a move/resize storm collapses into
@@ -509,6 +554,17 @@ fn logical_monitors(app: &AppHandle) -> Vec<LogicalMonitor> {
 /// thundering-herd the caption thread. A panicking or failing open counts
 /// as a miss and the rest still open.
 pub fn restore_session_now(app: &AppHandle) -> usize {
+    restore_filtered(app, &|_| true)
+}
+
+/// Reopen only the pinned windows (v0.9.9): pinned windows always restore
+/// on launch regardless of the "On startup" setting. Same isolation,
+/// stagger, and sentinel machinery as a full restore.
+pub fn restore_pinned_windows(app: &AppHandle) -> usize {
+    restore_filtered(app, &|w| w.pinned())
+}
+
+fn restore_filtered(app: &AppHandle, keep: &dyn Fn(&SessionWindow) -> bool) -> usize {
     let session = load_session(app);
     if session.windows.is_empty() {
         return 0;
@@ -527,7 +583,10 @@ pub fn restore_session_now(app: &AppHandle) -> usize {
             .unwrap_or(false)
     };
     let monitors = logical_monitors(app);
-    let restorable = partition_restorable(&session, &account_exists);
+    let restorable: Vec<&SessionWindow> = partition_restorable(&session, &account_exists)
+        .into_iter()
+        .filter(|w| keep(w))
+        .collect();
     // TEST-ONLY fault injection (v0.9.7, debug builds only):
     // APPMAKA_TEST_PANIC_ON_OPEN=N makes the Nth restore window open
     // panic, simulating the Windows caption-strip crash so the
@@ -553,13 +612,14 @@ pub fn restore_session_now(app: &AppHandle) -> usize {
                 app_id,
                 account_id,
                 rect,
+                ..
             } => {
                 let placement = placement_for_rect(rect.as_ref(), &monitors);
                 windows::open_account_placed(
                     app, &store, &adblock, &winstate, app_id, account_id, placement,
                 )
             }
-            SessionWindow::Search { query, rect } => {
+            SessionWindow::Search { query, rect, .. } => {
                 let placement = placement_for_rect(rect.as_ref(), &monitors);
                 crate::websearch::open_search_window_placed(app, &adblock, query, placement)
             }
@@ -622,6 +682,11 @@ pub fn restore_session_manual(app: &AppHandle) -> usize {
 /// into the same crash twice. The per-window isolation in
 /// restore_session_now keeps one bad window from stopping the rest, and
 /// the launcher is independent: it always reaches a usable state.
+///
+/// Pinned windows (v0.9.9) always restore on launch regardless of the "On
+/// startup" setting — the pin is the user's explicit "keep this open".
+/// The stale-sentinel guard outranks the pin: after a crash, pinned
+/// windows go through ask-mode like everything else.
 pub fn maybe_restore_on_launch(app: &AppHandle) {
     let forced = app
         .try_state::<SessionRestoreForced>()
@@ -634,12 +699,18 @@ pub fn maybe_restore_on_launch(app: &AppHandle) {
         .try_state::<Mutex<LauncherSettings>>()
         .and_then(|s| s.lock().ok().map(|s| s.startup_mode == StartupMode::Restore))
         .unwrap_or(false);
-    if !restore {
-        return;
-    }
-    let n = restore_session_now(app);
-    if n > 0 {
-        eprintln!("[appmaka] restored {n} window(s) from last session");
+    if restore {
+        let n = restore_session_now(app);
+        if n > 0 {
+            eprintln!("[appmaka] restored {n} window(s) from last session");
+        }
+    } else if crate::pin::pinned_restore_applies(forced, restore) {
+        // Not in restore mode, but pinned windows come back anyway — unless
+        // the crash-loop sentinel forced ask-mode (it outranks the pin).
+        let n = restore_pinned_windows(app);
+        if n > 0 {
+            eprintln!("[appmaka] restored {n} pinned window(s)");
+        }
     }
     spawn_sentinel_grace(app);
 }
@@ -664,6 +735,18 @@ pub struct SessionRestoreOffer {
     pub stale_restore: bool,
 }
 
+/// Which saved windows the Ask-mode offer covers. Pinned windows restore
+/// directly without asking, so the offer excludes them — no double-count,
+/// no asking about them. When a stale sentinel forced ask-mode, pinned
+/// windows did NOT auto-restore (the guard outranks the pin), so they
+/// stay in the offer. Pure so the rule is unit-testable.
+pub fn offer_entries(windows: &[SessionWindow], forced: bool) -> Vec<&SessionWindow> {
+    windows
+        .iter()
+        .filter(|w| forced || !w.pinned())
+        .collect()
+}
+
 pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
     let consumed = app.try_state::<SessionAskConsumed>()?;
     if consumed.0.swap(true, Ordering::SeqCst) {
@@ -686,10 +769,19 @@ pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
     if session.windows.is_empty() {
         return None;
     }
+    // Pinned windows (v0.9.9) restore directly without asking, so the
+    // offer excludes them — no double-count, no asking about them. But
+    // when a stale sentinel forced ask-mode, pinned windows did NOT
+    // auto-restore (the guard outranks the pin), so they stay in the offer
+    // and the user can still bring them back with one click.
+    let offered: Vec<&SessionWindow> = offer_entries(&session.windows, forced);
+    if offered.is_empty() {
+        return None;
+    }
     let store = app.try_state::<AppStore>();
     let mut names = Vec::new();
     let mut has_search = false;
-    for w in &session.windows {
+    for w in &offered {
         if names.len() >= 5 {
             break;
         }
@@ -715,7 +807,7 @@ pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
         }
     }
     Some(SessionRestoreOffer {
-        window_count: session.windows.len(),
+        window_count: offered.len(),
         names,
         has_search,
         stale_restore: forced,
@@ -743,6 +835,7 @@ mod tests {
                 ("app2".into(), "acc2".into(), None, 50),
             ],
             Some(("hello".into(), rect(0, 0, 1200, 800), 75)),
+            &|_| false,
         );
         // Sorted by open time regardless of input order.
         assert_eq!(session.windows.len(), 3);
@@ -859,6 +952,7 @@ mod tests {
                 ("app1".into(), "here".into(), None, 2),
             ],
             Some(("q".into(), None, 3)),
+            &|_| false,
         );
         let exists = |app_id: &str, account_id: &str| app_id == "app1" && account_id == "here";
         let kept = partition_restorable(&session, &exists);
@@ -909,6 +1003,7 @@ mod tests {
                 ("a".into(), "3".into(), None, 2),
             ],
             None,
+            &|_| false,
         );
         let exists = |_: &str, _: &str| true;
         let entries = partition_restorable(&session, &exists);
@@ -942,5 +1037,60 @@ mod tests {
         let n2 = restore_entries(&entries, &mut open_flaky, &mut || {});
         assert_eq!(n2, 2);
         assert_eq!(seen2.len(), 3);
+    }
+
+    #[test]
+    fn pinned_flag_round_trips_and_defaults_false() {
+        // New writes carry the flag.
+        let session = build_session(
+            vec![("app1".into(), "acc1".into(), None, 1)],
+            Some(("q".into(), None, 2)),
+            &|label| label == "acct-app1-acc1",
+        );
+        assert!(session.windows[0].pinned());
+        assert!(!session.windows[1].pinned());
+        let raw = serde_json::to_string(&session).unwrap();
+        assert!(raw.contains("\"pinned\":true"));
+        let back = parse_session(&raw);
+        assert_eq!(back, session);
+        // Old files without the flag load as unpinned — no migration.
+        let old = r#"{"windows":[
+            {"kind":"account","appId":"a","accountId":"b"},
+            {"kind":"search","query":"q"}
+        ]}"#;
+        let s = parse_session(old);
+        assert_eq!(s.windows.len(), 2);
+        assert!(s.windows.iter().all(|w| !w.pinned()));
+        // A non-bool pinned value fails that entry's parse; the entry is
+        // skipped like any other corrupt entry.
+        let bad = r#"{"windows":[
+            {"kind":"account","appId":"a","accountId":"b","pinned":"yes"},
+            {"kind":"search","query":"ok"}
+        ]}"#;
+        let s = parse_session(bad);
+        assert_eq!(s.windows.len(), 1);
+    }
+
+    #[test]
+    fn offer_entries_excludes_pinned_unless_forced() {
+        let session = build_session(
+            vec![
+                ("app1".into(), "keep".into(), None, 1),
+                ("app1".into(), "askme".into(), None, 2),
+            ],
+            None,
+            &|label| label == "acct-app1-keep",
+        );
+        // Normal ask-mode: pinned entries restore directly, offer skips them.
+        let offered = offer_entries(&session.windows, false);
+        assert_eq!(offered.len(), 1);
+        assert!(matches!(
+            offered[0],
+            SessionWindow::Account { account_id, .. } if account_id == "askme"
+        ));
+        // Stale sentinel forced ask-mode: the pin didn't auto-restore, so
+        // the offer keeps the pinned entry.
+        let offered = offer_entries(&session.windows, true);
+        assert_eq!(offered.len(), 2);
     }
 }

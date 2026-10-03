@@ -14,6 +14,7 @@ mod launcher_settings;
 mod links;
 mod msi_update;
 mod page_title;
+mod pin;
 mod preview;
 mod routines;
 mod session;
@@ -671,6 +672,9 @@ fn build_tray(app: &mut tauri::App) -> Result<(), String> {
                     .ok();
             }
             "tray-quit" => {
+                // Pins never block Quit (v0.9.9): raise the flag before
+                // anything else so no CloseRequested branch can divert.
+                pin::set_shutting_down();
                 // Persist the session explicitly at exit (v0.9.5). Every
                 // open/close already writes it, so this is usually a no-op —
                 // but Quit is the one path where nothing else runs after.
@@ -776,6 +780,13 @@ fn main() {
             app.manage(session::SearchLiveState::default());
             app.manage(session::SessionAskConsumed::default());
             app.manage(session::SessionRestoreForced::default());
+            // "Don't close this window" (v0.9.9): runtime pin map plus the
+            // one-shot/dedupe sets for the confirm flow, seeded from the
+            // saved session before any restore runs.
+            app.manage(pin::PinState::default());
+            app.manage(pin::ConfirmedCloses::default());
+            app.manage(pin::PendingConfirms::default());
+            pin::seed_from_session(app.handle());
             // Crash-loop sentinel (v0.9.7): a stale restore.inprogress
             // from a previous run forces ask-mode instead of
             // auto-restoring into the same crash; otherwise arm the
@@ -863,6 +874,13 @@ fn main() {
             }
 
             windows::start_suspend_watcher(app.handle().clone());
+            // v0.9.9 (Linux): one-shot reap of the launcher's spare ~55 MB
+            // network process at startup. Fires after the grace period and
+            // only when no account window (restored or otherwise) is open;
+            // the process has zero webview-side consumers and WebKitGTK
+            // respawns it on demand.
+            #[cfg(target_os = "linux")]
+            windows::schedule_network_process_reap(app.handle().clone());
             // Link dispatcher (v0.7.0): incoming https URLs go to the account
             // chosen by the user's domain rules, or a picker when no rule
             // matches. Best-effort registration so links reach the app even
@@ -915,6 +933,25 @@ fn main() {
                 // already removed their entries, so those paths no-op here.
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
                     preview::window_closed(window.app_handle(), window.label());
+                }
+            } else if !pin::is_shutting_down() {
+                // Page windows (v0.9.9): Alt+F4 / the X button / a taskbar
+                // close on a pinned window ("Don't close this window")
+                // diverts to one confirm instead of closing. Unpinned
+                // windows fall through untouched, so this branch is a
+                // no-op for every window that was never pinned.
+                //
+                // LOGIC-ONLY on Linux: tao delivering CloseRequested for
+                // Alt+F4 on a frameless Windows window was assumed from the
+                // strip's contract, never click-tested with a handler
+                // attached. Exact PC test steps are in the v0.9.9 report.
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let app = window.app_handle();
+                    let label = window.label();
+                    if pin::is_pinned(app, label) && !pin::take_confirmed(app, label) {
+                        api.prevent_close();
+                        pin::ask_then_close(app, label);
+                    }
                 }
             }
         })
@@ -969,6 +1006,9 @@ fn main() {
             windows::list_open_account_windows,
             windows::memory_snapshot,
             windows::forget_login,
+            // v0.9.9: "Don't close this window" pin commands
+            pin::set_window_pinned,
+            pin::window_pinned,
             // v0.7.0: back/forward navigation command (the visible floating
             // toolbar was removed in v0.8.4; Alt+Left/Right drive history
             // in-page, and this command stays registered for compatibility)
