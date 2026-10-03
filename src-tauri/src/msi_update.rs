@@ -121,11 +121,13 @@ fn run_msi_update<R: Runtime>(
 
     launch_msiexec(&msi_path)?;
 
-    // Let the UI show "Installer launched — follow its steps." before the
-    // app goes away into the MSI wizard. exit() never returns; the Ok is
-    // only there to satisfy the return type.
+    // The installer is now running detached. Exit immediately — staying
+    // alive even briefly lets Restart Manager see a process that refuses
+    // close requests (the main window hides to the tray), which wedges
+    // the app ("Not Responding"). The `msi-update-launched` emit is
+    // best-effort; the frontend also flips to "Installer launched" when
+    // the download byte count completes (see App.tsx).
     let _ = app.emit("msi-update-launched", ());
-    std::thread::sleep(Duration::from_millis(1500));
     app.exit(0);
     #[allow(unreachable_code)]
     Ok(())
@@ -275,17 +277,26 @@ fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Launch the Windows installer on the downloaded MSI. Absolute System32
-/// path so PATH games can't redirect it; `/passive` shows progress without
-/// asking questions.
+/// Launch the Windows installer on the downloaded MSI, fully detached from
+/// this process.
+///
+/// Detached + immediate caller exit is load-bearing: msiexec's Restart
+/// Manager must never see a live app that refuses close requests (the
+/// main window hides to the tray instead of closing), or the app wedges.
+/// Absolute System32 path so PATH games can't redirect it; `/passive`
+/// shows progress without asking questions.
 #[cfg(windows)]
 fn launch_msiexec(msi_path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    /// DETACHED_PROCESS: the installer outlives us and is never our child.
+    const DETACHED_PROCESS: u32 = 0x00000008;
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let msiexec = format!(r"{system_root}\System32\msiexec.exe");
     std::process::Command::new(&msiexec)
         .arg("/i")
         .arg(msi_path)
         .arg("/passive")
+        .creation_flags(DETACHED_PROCESS)
         .spawn()
         .map_err(|_| "couldn't start the Windows installer.".to_string())?;
     Ok(())

@@ -1679,9 +1679,18 @@ function UpdaterSection({
         const progress = total
           ? Math.min(99, Math.round((event.payload.downloaded / total) * 100))
           : null;
-        setStatus((prev) =>
-          prev.kind === "downloading" ? { ...prev, progress } : prev
-        );
+        // v0.8.3: the backend exits into the installer the moment the
+        // download is complete and verified, so once the bytes add up the
+        // installer is effectively launched — say so instead of sticking
+        // at 99%. (The msi-update-launched event below is a backup; it may
+        // not arrive before the app exits.)
+        if (total !== null && event.payload.downloaded >= total) {
+          setStatus({ kind: "launched", version: update.version });
+        } else {
+          setStatus((prev) =>
+            prev.kind === "downloading" ? { ...prev, progress } : prev
+          );
+        }
       }
     );
     const unlistenLaunched = await listen("msi-update-launched", () => {

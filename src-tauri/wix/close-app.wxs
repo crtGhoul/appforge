@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppMaka: close a running copy before the MSI replaces files.
+
+  Why this exists: the main window hides to the system tray on close
+  requests (Quit is tray-menu-only), so a plain WM_CLOSE never kills the
+  process. Left alone, Windows Installer's Restart Manager fights the
+  still-running app and wedges it ("AppMaka (Not Responding)").
+
+  util:CloseApplication schedules WixCloseApplications after
+  InstallValidate, which tries, in order:
+    1. WM_CLOSE (CloseMessage) — polite; the app just hides, harmless.
+    2. WM_QUERYENDSESSION + WM_ENDSESSION (EndSessionMessage) — the
+       app's windowing layer (tao) exits the process on WM_ENDSESSION,
+       so this is the graceful kill.
+    3. TerminateProcess after Timeout seconds — backstop for a wedged
+       message pump that never processes the messages above.
+  RebootPrompt must be "no" whenever TerminateProcess is set.
+
+  The WiX Util extension (WixUtilExtension.dll) is linked automatically
+  for fragments by tauri-bundler; the xmlns:util namespace below is what
+  pulls it in. This file is referenced from tauri.conf.json
+  (bundle > windows > wix > fragmentPaths). Fragment paths resolve
+  relative to src-tauri (the CLI sets the working directory there
+  before bundling).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Fragment>
+    <util:CloseApplication Id="CloseAppMaka"
+                           Target="appmaka.exe"
+                           CloseMessage="yes"
+                           EndSessionMessage="yes"
+                           Timeout="5"
+                           TerminateProcess="1"
+                           RebootPrompt="no"
+                           Description="AppMaka is being updated. Waiting for the running copy to close." />
+  </Fragment>
+</Wix>
