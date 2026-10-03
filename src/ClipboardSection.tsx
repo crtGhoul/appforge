@@ -4,13 +4,15 @@ import { HotkeyCapture } from "./HotkeyCapture";
 import type { ClipboardSettings } from "./types";
 
 /**
- * Clipboard history settings (v0.9.1, text + images).
+ * Clipboard history settings (v0.9.2, text + images, Win-key tap opt-in).
  *
  * Backend contract (src-tauri/src/clipboard.rs): `get_clipboard_settings`,
  * `set_clipboard_hotkey` (goes through the shared hotkey registry, so
- * conflicts come back as plain-language errors), `set_clipboard_cap`
- * (text entries; images keep a fixed cap of 25), `clear_clipboard`
- * (wipes text + images), `clipboard_hotkey_status`.
+ * conflicts come back as plain-language errors), `set_clipboard_win_tap`
+ * (opt-in bare-Windows-key summon, Windows only — the capture field can't
+ * capture a bare Win press, so this is a deliberate choice, not a capture),
+ * `set_clipboard_cap` (text entries; images keep a fixed cap of 25),
+ * `clear_clipboard` (wipes text + images), `clipboard_hotkey_status`.
  */
 
 function errMsg(err: unknown): string {
@@ -34,6 +36,9 @@ export function ClipboardSection() {
   const [clearing, setClearing] = useState(false);
   const [cleared, setCleared] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [winTap, setWinTap] = useState(false);
+  const [winTapSupported, setWinTapSupported] = useState(false);
+  const [winTapBusy, setWinTapBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -45,6 +50,8 @@ export function ClipboardSection() {
       setHotkey(s.hotkey);
       setCapInput(String(s.cap));
       setStatus(st);
+      setWinTap(s.winTap);
+      setWinTapSupported(s.winTapSupported);
       setLoadError(null);
     } catch (err) {
       setLoadError(errMsg(err));
@@ -68,6 +75,23 @@ export function ClipboardSection() {
       setStatus(st);
     } catch (err) {
       setHotkeyError(errMsg(err));
+    }
+  }
+
+  async function setWinTapMode(enabled: boolean) {
+    setWinTapBusy(true);
+    setHotkeyError(null);
+    try {
+      const on = await invoke<boolean>("set_clipboard_win_tap", { enabled });
+      setWinTap(on);
+      // The combo binding is retired while the Win key summons; refresh
+      // its status line so it doesn't claim to be live.
+      const st = await invoke<HotkeyStatus>("clipboard_hotkey_status");
+      setStatus(st);
+    } catch (err) {
+      setHotkeyError(errMsg(err));
+    } finally {
+      setWinTapBusy(false);
     }
   }
 
@@ -109,24 +133,64 @@ export function ClipboardSection() {
 
   return (
     <div>
-      <label style={{ display: "block", fontSize: 14, marginBottom: 8 }}>
-        <span className="field-label">Popup hotkey</span>
-        <div style={{ marginTop: 4 }}>
-          <HotkeyCapture
-            value={hotkey}
-            onChange={(v) => void saveHotkey(v)}
-            ariaLabel="Clipboard history hotkey"
-            placeholder="Click to set…"
-            allowClear
+      <span className="field-label" style={{ display: "block", marginBottom: 8 }}>
+        How to open it
+      </span>
+      <div role="radiogroup" aria-label="Clipboard summon method">
+        <label style={{ display: "block", marginBottom: 6, cursor: "pointer" }}>
+          <input
+            type="radio"
+            name="clipboard-summon"
+            checked={!winTap}
+            disabled={winTapBusy}
+            onChange={() => {
+              if (winTap) void setWinTapMode(false);
+            }}
+            style={{ marginRight: 8 }}
           />
-        </div>
-      </label>
+          Custom combo
+        </label>
+        {winTapSupported && (
+          <label style={{ display: "block", marginBottom: 6, cursor: "pointer" }}>
+            <input
+              type="radio"
+              name="clipboard-summon"
+              checked={winTap}
+              disabled={winTapBusy}
+              onChange={() => {
+                if (!winTap) void setWinTapMode(true);
+              }}
+              style={{ marginRight: 8 }}
+            />
+            Windows key (single tap)
+          </label>
+        )}
+      </div>
+      {!winTap ? (
+        <label style={{ display: "block", fontSize: 14, marginBottom: 8 }}>
+          <span className="field-label">Popup hotkey</span>
+          <div style={{ marginTop: 4 }}>
+            <HotkeyCapture
+              value={hotkey}
+              onChange={(v) => void saveHotkey(v)}
+              ariaLabel="Clipboard history hotkey"
+              placeholder="Click to set…"
+              allowClear
+            />
+          </div>
+        </label>
+      ) : (
+        <p className="muted small" style={{ margin: "4px 0 12px" }}>
+          Single press opens the clipboard. Press twice for the Start menu
+          (Ctrl+Esc works too). Win+letter shortcuts keep working.
+        </p>
+      )}
       {hotkeyError && (
         <p className="modal-error" role="alert">
           {hotkeyError}
         </p>
       )}
-      {status && !status.registered && !hotkeyError && (
+      {!winTap && status && !status.registered && !hotkeyError && (
         <p className="muted small" role="status">
           {status.error
             ? `Couldn't register "${status.hotkey}": ${status.error}`
@@ -181,7 +245,8 @@ export function ClipboardSection() {
 
       <p className="muted small" style={{ marginTop: 12 }}>
         Clipboard history stays on this PC — text and screenshots are never
-        sent anywhere.
+        sent anywhere. Win+V is Windows' own clipboard (off by default, can
+        sync to your Microsoft account); this one is separate and stays here.
       </p>
     </div>
   );

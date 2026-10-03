@@ -252,4 +252,8 @@ export interface ClipboardListEntry {
 export interface ClipboardSettings {
   cap: number;
   hotkey: string;
+  /** v0.9.2: summon by tapping the bare Windows key instead of a combo. */
+  winTap: boolean;
+  /** The Win-key tap needs a low-level keyboard hook: Windows only. */
+  winTapSupported: boolean;
 }

@@ -19,6 +19,17 @@ mod routines;
 mod store;
 mod syscmd;
 mod windows;
+/// Bare-Windows-key tap summon for the clipboard popup (v0.9.2).
+/// The tap classifier is pure logic and compiles everywhere (unit-tested
+/// on all platforms); only the WH_KEYBOARD_LL machinery inside is
+/// cfg(windows). Nothing references the pure items on a non-test Linux
+/// build, so dead_code is allowed there — and only there, so a genuinely
+/// dead item still warns on Windows and in tests.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+mod winkey;
+/// Clipboard image reading beyond the plugin's format list (v0.9.2):
+/// direct DIB reads on Windows, image/bmp fallback on Linux.
+mod clipboard_img;
 
 use adblock::AdblockState;
 use launcher::{LauncherState, NativeProgram};
@@ -761,7 +772,7 @@ fn main() {
             // watcher. One 600ms tick = one clipboard read + string
             // compare; ~nothing at idle.
             app.manage(crate::clipboard::load(app.handle()));
-            crate::clipboard::register_saved_hotkey(app.handle());
+            crate::clipboard::ensure_summon_registered(app.handle());
             crate::clipboard::start_watcher(app.handle().clone());
             // First program scan runs in the background; results land in the
             // cache and are picked up by list_programs.
@@ -906,7 +917,7 @@ fn main() {
             routines::save_routine,
             routines::delete_routine,
             routines::run_routine,
-            // v0.9.0: clipboard history (text only, local)
+            // v0.9.0: clipboard history (local; v0.9.1 added images)
             clipboard::list_clipboard,
             clipboard::copy_clipboard_entry,
             clipboard::hide_clipboard_popup,
@@ -915,6 +926,8 @@ fn main() {
             clipboard::set_clipboard_cap,
             clipboard::set_clipboard_hotkey,
             clipboard::clipboard_hotkey_status,
+            // v0.9.2: bare-Windows-key tap summon (opt-in, Windows only)
+            clipboard::set_clipboard_win_tap,
             // v0.8.2: MSI-aware self-update (install-type detection + MSI path)
             msi_update::get_install_type,
             msi_update::install_msi_update,

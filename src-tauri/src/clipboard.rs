@@ -34,6 +34,8 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::hotkeys::{record_binding_failure, set_binding, BindingStatus, HotkeyKind};
+#[cfg(windows)]
+use crate::hotkeys::remove_binding;
 
 /// Registry binding id for the clipboard popup hotkey.
 pub const BINDING_ID: &str = "clipboard:popup";
@@ -138,6 +140,11 @@ pub struct ClipboardListEntry {
 pub struct ClipboardSettings {
     pub cap: usize,
     pub hotkey: String,
+    /// v0.9.2: true when the popup is summoned by tapping the bare Windows
+    /// key instead of a combo hotkey.
+    pub win_tap: bool,
+    /// The Win-key tap needs a low-level keyboard hook: Windows only.
+    pub win_tap_supported: bool,
 }
 
 /// On-disk shape of clipboard.json. Unknown fields are ignored on load so
@@ -151,6 +158,10 @@ struct ClipboardFile {
     cap: usize,
     #[serde(default = "default_hotkey")]
     hotkey: String,
+    /// v0.9.2: summon via bare-Windows-key tap (Windows only) instead of
+    /// the combo hotkey. Defaults off so old files keep combo behavior.
+    #[serde(default)]
+    win_tap: bool,
 }
 
 fn default_cap() -> usize {
@@ -167,6 +178,7 @@ impl Default for ClipboardFile {
             entries: Vec::new(),
             cap: DEFAULT_CAP,
             hotkey: DEFAULT_HOTKEY.to_string(),
+            win_tap: false,
         }
     }
 }
@@ -178,6 +190,7 @@ struct ClipboardData {
     entries: VecDeque<ClipboardEntry>,
     cap: usize,
     hotkey: String,
+    win_tap: bool,
     last_seen: Option<String>,
     last_image_fp: Option<u64>,
 }
@@ -216,6 +229,9 @@ pub fn load(app: &AppHandle) -> ClipboardState {
         .unwrap_or_default();
     let cap = file.cap.clamp(MIN_CAP, MAX_CAP);
     let hotkey = migrate_hotkey(&file.hotkey);
+    // The Win-key tap is Windows-only; a file carried over from a Windows
+    // install must not try to enable it on Linux.
+    let win_tap = file.win_tap && cfg!(windows);
     let mut entries: VecDeque<ClipboardEntry> = file.entries.into();
     // Enforce per-kind caps on load too (a hand-edited or future file
     // could exceed them); evicted image PNGs are deleted.
@@ -232,6 +248,7 @@ pub fn load(app: &AppHandle) -> ClipboardState {
             entries,
             cap,
             hotkey,
+            win_tap,
             last_seen: None,
             last_image_fp: None,
         }),
@@ -255,6 +272,7 @@ fn persist(app: &AppHandle, data: &ClipboardData) -> Result<(), String> {
         entries: data.entries.iter().cloned().collect(),
         cap: data.cap,
         hotkey: data.hotkey.clone(),
+        win_tap: data.win_tap,
     };
     let json =
         serde_json::to_string_pretty(&file).map_err(|e| format!("could not encode: {e}"))?;
@@ -450,6 +468,12 @@ fn observe(app: &AppHandle, text: String) -> bool {
 /// Record one clipboard image observation. Returns true when a new entry
 /// was stored. The PNG encode + file write happen outside the state lock;
 /// the watcher is a single sequential task so nothing races here.
+///
+/// The image fingerprint is committed only together with the push, AFTER
+/// the fallible encode/write steps. Committing it earlier (before knowing
+/// the entry is durable) would permanently swallow the image: a failed
+/// write would leave the fingerprint claiming "already recorded" and the
+/// next tick would skip the retry.
 fn observe_image(app: &AppHandle, img: &tauri::image::Image) -> bool {
     let (w, h) = (img.width(), img.height());
     let rgba = img.rgba();
@@ -457,18 +481,14 @@ fn observe_image(app: &AppHandle, img: &tauri::image::Image) -> bool {
         return false;
     }
     let fp = image_fingerprint(w, h, rgba);
-    let is_new = with_state(app, |data| {
-        if data.last_image_fp == Some(fp) {
+    // Check only for now — the commit happens with the push below.
+    match with_state(app, |data| data.last_image_fp == Some(fp)) {
+        Ok(true) => return false,
+        Err(e) => {
+            eprintln!("clipboard: image observe failed: {e}");
             return false;
         }
-        data.last_image_fp = Some(fp);
-        true
-    });
-    if !matches!(is_new, Ok(true)) {
-        if let Err(e) = is_new {
-            eprintln!("clipboard: image observe failed: {e}");
-        }
-        return false;
+        Ok(false) => {}
     }
     let file_name = format!("img-{}-{}.png", unix_millis(), ENTRY_COUNTER.load(Ordering::Relaxed));
     let png = match encode_png_rgba(w, h, rgba) {
@@ -489,25 +509,78 @@ fn observe_image(app: &AppHandle, img: &tauri::image::Image) -> bool {
         eprintln!("clipboard: could not save the image: {e}");
         return false;
     }
-    let entry = make_image_entry(file_name, w, h, rgba.len() as u64, fp);
+    let entry = make_image_entry(file_name.clone(), w, h, rgba.len() as u64, fp);
     let saved = with_state(app, |data| {
+        if data.last_image_fp == Some(fp) {
+            // Raced with a copy-back that already accounted for this
+            // image; drop the orphaned PNG, keep the existing entry.
+            return (Vec::new(), Some(file_name.clone()));
+        }
+        data.last_image_fp = Some(fp);
         data.entries.push_front(entry);
         let doomed = enforce_caps(&mut data.entries, data.cap);
-        (persist(app, data), doomed)
+        (doomed, None)
     });
-    match saved {
-        Ok((persist_result, doomed)) => {
-            if let Err(e) = persist_result {
-                eprintln!("clipboard: persist failed: {e}");
-            }
-            for f in doomed {
-                let _ = fs::remove_file(dir.join(f));
-            }
-            true
-        }
+    // Evicted entries' PNGs are deleted whether or not the JSON persist
+    // below succeeds — they're already out of the deque either way.
+    let (doomed, orphan) = match saved {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("clipboard: image observe failed: {e}");
-            false
+            // State lock failed after the PNG was written: the fingerprint
+            // was NOT committed, so the next tick retries the image
+            // instead of dropping it. Remove the orphaned file.
+            let _ = fs::remove_file(dir.join(&file_name));
+            return false;
+        }
+    };
+    let persist_result = with_state(app, |data| persist(app, data));
+    match persist_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) | Err(e) => eprintln!("clipboard: persist failed: {e}"),
+    }
+    for f in doomed {
+        let _ = fs::remove_file(dir.join(f));
+    }
+    if let Some(f) = orphan {
+        let _ = fs::remove_file(dir.join(f));
+    }
+    true
+}
+
+/// Read an image from the OS clipboard, beyond what the clipboard plugin
+/// sees (v0.9.2). On Windows the DIB is read directly — CF_DIBV5, then
+/// plain CF_DIB (what Win+Shift+S / the Snipping Tool place), then the
+/// registered "PNG" format — because the plugin's read_image missed a
+/// real screenshot on the user's PC. Everywhere else the plugin reads
+/// image/png first; on Linux image/bmp is tried next (arboard never
+/// requests that target).
+fn read_os_image(app: &AppHandle) -> Result<tauri::image::Image<'_>, String> {
+    #[cfg(windows)]
+    {
+        let _ = app;
+        let img = crate::clipboard_img::read_windows_image()?;
+        Ok(tauri::image::Image::new_owned(
+            img.rgba,
+            img.width,
+            img.height,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        match app.clipboard().read_image() {
+            Ok(img) => Ok(img),
+            #[cfg(target_os = "linux")]
+            Err(_) => {
+                let bmp = crate::clipboard_img::read_linux_image_bmp()?;
+                Ok(tauri::image::Image::new_owned(
+                    bmp.rgba,
+                    bmp.width,
+                    bmp.height,
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            Err(e) => Err(e.to_string()),
         }
     }
 }
@@ -522,7 +595,7 @@ pub fn start_watcher(app: AppHandle) {
             data.last_seen = Some(current);
         });
     }
-    if let Ok(img) = app.clipboard().read_image() {
+    if let Ok(img) = read_os_image(&app) {
         let fp = image_fingerprint(img.width(), img.height(), img.rgba());
         let _ = with_state(&app, |data| {
             data.last_image_fp = Some(fp);
@@ -542,7 +615,7 @@ pub fn start_watcher(app: AppHandle) {
                 }
             }
             // Image probe: fails fast when the clipboard holds no image.
-            if let Ok(img) = app.clipboard().read_image() {
+            if let Ok(img) = read_os_image(&app) {
                 observe_image(&app, &img);
             }
         }
@@ -562,6 +635,22 @@ pub fn register_saved_hotkey(app: &AppHandle) {
         eprintln!("clipboard hotkey: {e}");
         record_binding_failure(app, BINDING_ID, hotkey, e);
     }
+}
+
+/// Startup: summon via the bare-Windows-key tap when the user opted in
+/// (Windows only), otherwise register the saved combo hotkey.
+pub fn ensure_summon_registered(app: &AppHandle) {
+    #[cfg(windows)]
+    {
+        let win_tap = with_state(app, |data| data.win_tap).unwrap_or(false);
+        if win_tap {
+            if let Err(e) = crate::winkey::install(app) {
+                eprintln!("windows-key summon: {e}");
+            }
+            return;
+        }
+    }
+    register_saved_hotkey(app);
 }
 
 // ---------------------------------------------------------------------------
@@ -778,14 +867,52 @@ pub fn clear_clipboard(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Current cap + hotkey for the Settings UI.
+/// Current cap + hotkey + summon mode for the Settings UI.
 /// JS: `invoke("get_clipboard_settings")`.
 #[tauri::command]
 pub fn get_clipboard_settings(app: AppHandle) -> Result<ClipboardSettings, String> {
     with_state(&app, |data| ClipboardSettings {
         cap: data.cap,
         hotkey: data.hotkey.clone(),
+        win_tap: data.win_tap,
+        win_tap_supported: cfg!(windows),
     })
+}
+
+/// Opt into (or out of) summoning the popup by tapping the bare Windows
+/// key (v0.9.2, Windows only). Enabling installs the low-level hook and
+/// retires the combo binding — leaving both live would toggle the popup
+/// twice per press. Disabling uninstalls the hook and re-registers the
+/// saved combo. The hook is installed only while this is on.
+/// JS: `invoke("set_clipboard_win_tap", { enabled })`.
+#[tauri::command]
+pub fn set_clipboard_win_tap(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        if enabled {
+            // Install first; only persist once the hook is actually live.
+            crate::winkey::install(&app)?;
+            let _ = remove_binding(&app, BINDING_ID);
+            with_state(&app, |data| {
+                data.win_tap = true;
+                persist(&app, data)
+            })??;
+        } else {
+            crate::winkey::uninstall();
+            with_state(&app, |data| {
+                data.win_tap = false;
+                persist(&app, data)
+            })??;
+            register_saved_hotkey(&app);
+        }
+        Ok(enabled)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = &app;
+        let _ = enabled;
+        Err("Tapping the Windows key to open the clipboard only works on Windows.".to_string())
+    }
 }
 
 /// Change the text history cap (10–1000). Truncates text entries
@@ -1032,6 +1159,7 @@ mod tests {
         assert_eq!(f.cap, DEFAULT_CAP);
         assert_eq!(f.hotkey, DEFAULT_HOTKEY);
         assert!(f.entries.is_empty());
+        assert!(!f.win_tap);
 
         // A v0.9.0 text entry (no kind field) loads as Text.
         let old: ClipboardEntry =
@@ -1054,6 +1182,7 @@ mod tests {
             }],
             cap: 50,
             hotkey: "Ctrl+Shift+X".to_string(),
+            win_tap: true,
         };
         let encoded = serde_json::to_string(&full).unwrap();
         let decoded: ClipboardFile = serde_json::from_str(&encoded).unwrap();
@@ -1061,5 +1190,6 @@ mod tests {
         assert_eq!(decoded.entries[0].text, "hi");
         assert_eq!(decoded.cap, 50);
         assert_eq!(decoded.hotkey, "Ctrl+Shift+X");
+        assert!(decoded.win_tap);
     }
 }
