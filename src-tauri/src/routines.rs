@@ -57,6 +57,18 @@ pub struct RoutineItem {
     pub program_id: Option<String>,
 }
 
+/// How a routine arranges the windows it opens (v0.9.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineLayout {
+    /// Windows open cascaded (overlapping) — the behavior before v0.9.0.
+    #[default]
+    Cascade,
+    /// Account windows tile as equal side-by-side columns ("pillars")
+    /// across the cursor's monitor, left to right in routine order.
+    SideBySide,
+}
+
 /// A named, hotkey-able set of things to open together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Routine {
@@ -69,6 +81,10 @@ pub struct Routine {
     pub hotkey: Option<String>,
     #[serde(default)]
     pub items: Vec<RoutineItem>,
+    /// Window layout for this routine's account windows. Defaults to
+    /// Cascade so routines saved before v0.9.0 keep their behavior.
+    #[serde(default)]
+    pub layout: RoutineLayout,
 }
 
 fn unix_millis() -> u128 {
@@ -275,6 +291,32 @@ fn summarize(results: &[(String, Result<(), String>)]) -> String {
     }
 }
 
+/// Split a monitor rectangle into N equal vertical columns ("pillars").
+/// Remainder pixels go to the last column so there are no gaps. Returns
+/// (x, y, width, height) in physical pixels per column. Pure math —
+/// unit-tested; the caller converts sizes to logical pixels.
+pub fn tile_columns(
+    mon_x: i32,
+    mon_y: i32,
+    mon_w: u32,
+    mon_h: u32,
+    n: usize,
+) -> Vec<(i32, i32, u32, u32)> {
+    if n == 0 || mon_w == 0 || mon_h == 0 {
+        return Vec::new();
+    }
+    let n64 = n as u64;
+    let w64 = mon_w as u64;
+    (0..n)
+        .map(|i| {
+            let i64 = i as u64;
+            let x0 = mon_x + (w64 * i64 / n64) as i32;
+            let x1 = mon_x + (w64 * (i64 + 1) / n64) as i32;
+            (x0, mon_y, (x1 - x0).max(0) as u32, mon_h)
+        })
+        .collect()
+}
+
 /// Run a routine: open every item in order, staggered ~250ms so windows and
 /// processes don't all pile up at once. Account items reuse
 /// `windows::open_account` (which enforces the LRU window cap); program
@@ -302,7 +344,41 @@ pub async fn run_routine(
         return Err("This routine has no items to open.".to_string());
     }
 
+    // v0.9.0 side-by-side layout: tile the routine's ACCOUNT windows as
+    // equal columns across the cursor's monitor, left to right in routine
+    // order. Program items launch natively and can't be positioned, so
+    // they take no slot. Physical monitor geometry is converted to logical
+    // pixels via the monitor's scale factor (HiDPI stays exact).
+    let placements: Vec<crate::windows::WindowPlacement> =
+        if routine.layout == RoutineLayout::SideBySide {
+            match crate::windows::cursor_monitor(&app) {
+                Some(monitor) => {
+                    let account_count = routine
+                        .items
+                        .iter()
+                        .filter(|i| i.kind == "account")
+                        .count();
+                    let mp = monitor.position();
+                    let ms = monitor.size();
+                    let scale = monitor.scale_factor().max(0.01);
+                    tile_columns(mp.x, mp.y, ms.width, ms.height, account_count)
+                        .into_iter()
+                        .map(|(x, y, w, h)| crate::windows::WindowPlacement {
+                            x: x as f64 / scale,
+                            y: y as f64 / scale,
+                            width: w as f64 / scale,
+                            height: h as f64 / scale,
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
     let mut results: Vec<(String, Result<(), String>)> = Vec::with_capacity(routine.items.len());
+    let mut account_idx = 0usize;
     for (i, item) in routine.items.iter().enumerate() {
         if i > 0 {
             // Stagger opens so N windows/processes don't spawn in one burst.
@@ -313,8 +389,10 @@ pub async fn run_routine(
         let outcome = match item.kind.as_str() {
             "account" => {
                 let account_id = item.account_id.as_deref().unwrap_or("");
-                crate::windows::open_account(
-                    &app, &store, &adblock, &winstate, &item.app_id, account_id,
+                let placement = placements.get(account_idx).copied();
+                account_idx += 1;
+                crate::windows::open_account_placed(
+                    &app, &store, &adblock, &winstate, &item.app_id, account_id, placement,
                 )
             }
             "program" => {
@@ -337,6 +415,7 @@ mod tests {
             id: "routine-1".to_string(),
             name: "Morning".to_string(),
             hotkey: Some("Ctrl+Alt+M".to_string()),
+            layout: RoutineLayout::Cascade,
             items: vec![
                 RoutineItem {
                     kind: "account".to_string(),
@@ -434,5 +513,50 @@ mod tests {
         let all_fail = summarize(&[fail("Muse", "Account not found.")]);
         assert!(all_fail.starts_with("Nothing opened. "));
         assert!(all_fail.contains("Muse failed: Account not found."));
+    }
+
+    #[test]
+    fn tile_columns_geometry() {
+        // 3 pillars across 1920x1080: exact thirds, no gaps, no overlap.
+        let cols = tile_columns(0, 0, 1920, 1080, 3);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0], (0, 0, 640, 1080));
+        assert_eq!(cols[1], (640, 0, 640, 1080));
+        assert_eq!(cols[2], (1280, 0, 640, 1080));
+
+        // Remainder pixels land in the last column (100/3 = 33+33+34).
+        let cols = tile_columns(0, 0, 100, 50, 3);
+        assert_eq!(cols[0].2 + cols[1].2 + cols[2].2, 100);
+        assert_eq!(cols[2].2, 34);
+        // Columns are contiguous.
+        assert_eq!(cols[1].0, cols[0].0 + cols[0].2 as i32);
+        assert_eq!(cols[2].0, cols[1].0 + cols[1].2 as i32);
+
+        // Single window fills the monitor.
+        assert_eq!(tile_columns(0, 0, 1920, 1080, 1), vec![(0, 0, 1920, 1080)]);
+
+        // Negative monitor origin (multi-monitor X11) is preserved.
+        let cols = tile_columns(-1920, 0, 1920, 1080, 2);
+        assert_eq!(cols[0], (-1920, 0, 960, 1080));
+        assert_eq!(cols[1], (-960, 0, 960, 1080));
+
+        // Degenerate inputs yield nothing rather than panicking.
+        assert!(tile_columns(0, 0, 1920, 1080, 0).is_empty());
+        assert!(tile_columns(0, 0, 0, 1080, 3).is_empty());
+    }
+
+    #[test]
+    fn layout_defaults_to_cascade() {
+        // Routines saved before v0.9.0 (no layout key) keep cascade behavior.
+        let r: Routine = serde_json::from_str(r#"{"id":"r1","name":"M"}"#).unwrap();
+        assert_eq!(r.layout, RoutineLayout::Cascade);
+
+        let json = serde_json::to_string(&Routine {
+            layout: RoutineLayout::SideBySide,
+            ..sample_routine()
+        })
+        .unwrap();
+        let decoded: Routine = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.layout, RoutineLayout::SideBySide);
     }
 }

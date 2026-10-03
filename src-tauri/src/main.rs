@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adblock;
+mod clipboard;
 mod custom_programs;
 mod downloads;
 mod favicon;
@@ -642,11 +643,25 @@ fn main() {
                         // Named hotkey bindings (routines / workspaces /
                         // per-command hotkeys) dispatch through the shared
                         // registry. Anything with no binding — the launcher
-                        // summon hotkey — keeps the old behavior.
+                        // summon hotkey — keeps the old behavior. The
+                        // clipboard popup toggles its window directly in
+                        // Rust so it works even when the main window's JS
+                        // is busy.
                         if let Some((binding_id, kind)) =
                             crate::hotkeys::lookup_binding(app, shortcut.id())
                         {
-                            crate::hotkeys::emit_hotkey_fired(app, &binding_id, &kind);
+                            match kind {
+                                crate::hotkeys::HotkeyKind::Clipboard => {
+                                    crate::clipboard::toggle_window(app);
+                                }
+                                _ => {
+                                    crate::hotkeys::emit_hotkey_fired(
+                                        app,
+                                        &binding_id,
+                                        &kind,
+                                    );
+                                }
+                            }
                         } else {
                             toggle_main_window(app);
                         }
@@ -663,6 +678,10 @@ fn main() {
         // repo is private; the frontend degrades gracefully.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Clipboard history v1 (text only): OS read/write for the
+        // background watcher and copy-back. All access is Rust-side;
+        // the frontend never touches the plugin's JS API.
+        .plugin(tauri_plugin_clipboard_manager::init())
         // File picker for the launcher's manual "add program".
         .plugin(tauri_plugin_dialog::init())
         // Deep links (v0.7.0): the link dispatcher can handle https URLs.
@@ -738,6 +757,12 @@ fn main() {
             // startup never crashes on a hotkey.
             crate::hotkeys::init_registry(app.handle());
             crate::hotkeys::register_all_saved(app.handle());
+            // Clipboard history (v0.9.0): local text history, poll-based
+            // watcher. One 600ms tick = one clipboard read + string
+            // compare; ~nothing at idle.
+            app.manage(crate::clipboard::load(app.handle()));
+            crate::clipboard::register_saved_hotkey(app.handle());
+            crate::clipboard::start_watcher(app.handle().clone());
             // First program scan runs in the background; results land in the
             // cache and are picked up by list_programs.
             {
@@ -777,6 +802,14 @@ fn main() {
         // tray menu. The launcher is always one hotkey away.
         .on_window_event(|window, event| {
             if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            } else if window.label() == crate::clipboard::WINDOW_LABEL {
+                // The clipboard popup is reused across summons (rebuilds
+                // cost a beat on the hotkey), so close requests just hide
+                // it. Escape / focus-loss hide it from the frontend too.
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
@@ -873,6 +906,15 @@ fn main() {
             routines::save_routine,
             routines::delete_routine,
             routines::run_routine,
+            // v0.9.0: clipboard history (text only, local)
+            clipboard::list_clipboard,
+            clipboard::copy_clipboard_entry,
+            clipboard::hide_clipboard_popup,
+            clipboard::clear_clipboard,
+            clipboard::get_clipboard_settings,
+            clipboard::set_clipboard_cap,
+            clipboard::set_clipboard_hotkey,
+            clipboard::clipboard_hotkey_status,
             // v0.8.2: MSI-aware self-update (install-type detection + MSI path)
             msi_update::get_install_type,
             msi_update::install_msi_update,

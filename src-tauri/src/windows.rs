@@ -34,6 +34,27 @@ pub fn account_window_label(app_id: &str, account_id: &str) -> String {
     format!("acct-{app_id}-{account_id}")
 }
 
+/// The monitor holding the mouse cursor, falling back to the primary.
+/// Same cursor-monitor logic as the launcher's positioning in main.rs;
+/// shared by routine window tiling and the clipboard popup.
+pub fn cursor_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
+    app.cursor_position()
+        .ok()
+        .and_then(|p| app.monitor_from_point(p.x, p.y).ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten())
+}
+
+/// Placement for a tiled routine window (v0.9.0): logical-pixel top-left
+/// and logical-pixel size. The caller divides the physical monitor
+/// geometry by the monitor's scale factor, so HiDPI comes out right.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowPlacement {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Navigate an open account window back/forward in its history.
 ///
 /// Kept as a public command for compatibility (the visible floating toolbar
@@ -119,6 +140,15 @@ fn enforce_account_window_cap(app: &AppHandle, winstate: &WindowState) {
     close_tracked_window(app, &label);
 }
 
+/// Move/resize an already-open window to a tiled placement (v0.9.0).
+/// Best-effort: if the window manager refuses, the window simply stays
+/// where it was.
+fn apply_placement(window: &WebviewWindow, p: WindowPlacement) {
+    use tauri::{LogicalPosition, LogicalSize, Position, Size};
+    let _ = window.set_position(Position::Logical(LogicalPosition::new(p.x, p.y)));
+    let _ = window.set_size(Size::Logical(LogicalSize::new(p.width, p.height)));
+}
+
 /// Open an account's window, or focus it if it is already open. The window is
 /// lazily created here — nothing exists until the user opens the account.
 pub fn open_account(
@@ -128,6 +158,23 @@ pub fn open_account(
     winstate: &WindowState,
     app_id: &str,
     account_id: &str,
+) -> Result<(), String> {
+    open_account_placed(app, store, adblock, winstate, app_id, account_id, None)
+}
+
+/// `open_account` with an optional tiled placement (v0.9.0): routines using
+/// the "side by side" layout position each window as one column. Placement
+/// applies both to freshly built windows (via the builder, so there is no
+/// visible jump) and to already-open windows (repositioned on focus).
+#[allow(clippy::too_many_arguments)]
+pub fn open_account_placed(
+    app: &AppHandle,
+    store: &AppStore,
+    adblock: &AdblockState,
+    winstate: &WindowState,
+    app_id: &str,
+    account_id: &str,
+    placement: Option<WindowPlacement>,
 ) -> Result<(), String> {
     let web_app = store.get(app_id)?;
     let account = web_app
@@ -144,6 +191,9 @@ pub fn open_account(
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        if let Some(p) = placement {
+            apply_placement(&window, p);
+        }
         return Ok(());
     }
 
@@ -168,9 +218,16 @@ pub fn open_account(
         .unwrap_or_else(|| web_app.settings.popup_policy.clone());
     let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(page_url))
         .data_directory(session_dir.clone())
-        .title(&title)
-        .inner_size(1200.0, 800.0)
-        .center()
+        .title(&title);
+    // v0.9.0: tiled routines place the window at build time (no visible
+    // jump); untiled opens keep the classic centered 1200x800.
+    // WebviewWindowBuilder::position takes logical pixels directly.
+    if let Some(p) = placement {
+        builder = builder.position(p.x, p.y).inner_size(p.width, p.height);
+    } else {
+        builder = builder.inner_size(1200.0, 800.0).center();
+    }
+    let mut builder = builder
         .on_new_window(make_popup_handler(PopupContext {
             app: app.clone(),
             app_id: app_id.to_string(),

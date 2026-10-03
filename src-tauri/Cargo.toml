@@ -19,6 +19,7 @@ tauri = { features = ["tray-icon", "protocol-asset"], version = "2" }
 # "rt" for spawn_blocking in the MSI updater path (msi_update.rs).
 tokio = { version = "1", features = ["time", "rt"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
@@ -69,4 +70,4 @@ authors = ["AppMaka"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
 name = "appmaka"
-version = "0.8.4"
+version = "0.9.0"

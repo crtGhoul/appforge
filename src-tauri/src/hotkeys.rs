@@ -31,6 +31,8 @@ pub enum HotkeyKind {
         app_id: String,
         account_id: Option<String>,
     },
+    /// The clipboard history popup (v0.9.0).
+    Clipboard,
 }
 
 /// Friendly one-line description of a binding, used in conflict errors.
@@ -45,6 +47,7 @@ fn describe_binding(binding_id: &str, kind: &HotkeyKind) -> String {
             Some(a) => format!("the hotkey for account \"{a}\" in app \"{app_id}\""),
             None => format!("the hotkey for app \"{app_id}\""),
         },
+        HotkeyKind::Clipboard => "the clipboard history popup".to_string(),
     }
 }
 
@@ -277,6 +280,26 @@ fn set_status(app: &AppHandle, binding_id: &str, status: BindingStatus) {
     }
 }
 
+/// Record a failed registration from outside this module (e.g. the
+/// clipboard module's startup registration), so the UI can warn about it
+/// the same way it warns about failed routine/workspace bindings.
+pub fn record_binding_failure(
+    app: &AppHandle,
+    binding_id: &str,
+    hotkey: String,
+    error: String,
+) {
+    set_status(
+        app,
+        binding_id,
+        BindingStatus {
+            hotkey,
+            registered: false,
+            error: Some(error),
+        },
+    );
+}
+
 /// Look up the binding behind a pressed shortcut id, for the main.rs
 /// handler dispatch.
 pub fn lookup_binding(app: &AppHandle, shortcut_id: u32) -> Option<(String, HotkeyKind)> {
@@ -350,6 +373,15 @@ pub fn emit_hotkey_fired(app: &AppHandle, binding_id: &str, kind: &HotkeyKind) {
                 workspace_id: None,
                 app_id: Some(app_id.clone()),
                 account_id: account_id.clone(),
+            },
+        ),
+        HotkeyKind::Clipboard => (
+            "clipboard",
+            HotkeyTarget {
+                routine_id: None,
+                workspace_id: None,
+                app_id: None,
+                account_id: None,
             },
         ),
     };

@@ -16,6 +16,7 @@ import type { LinkPickerAccount } from "./LinkPicker";
 import LinkRules from "./LinkRules";
 import { DownloadsList } from "./DownloadsList";
 import { RoutinesSection } from "./RoutinesSection";
+import { ClipboardSection } from "./ClipboardSection";
 import WorkspacesSection from "./WorkspacesSection";
 import { filterAppsByWorkspace } from "./WorkspacesSection";
 import type { WorkspaceList } from "./WorkspacesSection";
@@ -3023,6 +3024,16 @@ export default function App() {
           programs={programs}
           onChanged={(list) => setRoutines(list)}
         />
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Clipboard</h2>
+        </div>
+        <p className="muted small">
+          Keep a searchable history of everything you copy, on this PC only.
+        </p>
+        <ClipboardSection />
       </section>
 
       <section className="panel">

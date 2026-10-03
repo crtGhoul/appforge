@@ -218,5 +218,32 @@ export interface Routine {
   name: string;
   /** Global hotkey like "Ctrl+Alt+M", or null for none. */
   hotkey: string | null;
+  /** How the routine arranges its windows: "cascade" (overlap, default) or
+   * "side_by_side" (tile as equal columns). Missing on old records means
+   * cascade. */
+  layout: RoutineLayout;
   items: RoutineItem[];
+}
+
+/** Routine window layout. Serialized snake_case in routines.json. */
+export type RoutineLayout = "cascade" | "side_by_side";
+
+// ---------------------------------------------------------------------------
+
+/**
+ * One clipboard history entry as returned by `list_clipboard`. `preview`
+ * is the first 500 characters; the full text is copied back by id.
+ */
+export interface ClipboardListEntry {
+  id: string;
+  preview: string;
+  chars: number;
+  truncated: boolean;
+  createdAtMs: number;
+}
+
+/** Clipboard settings payload from `get_clipboard_settings`. */
+export interface ClipboardSettings {
+  cap: number;
+  hotkey: string;
 }

@@ -18,12 +18,14 @@ export default defineConfig(async () => ({
   //    dist/preview-header.html — the backend loads
   //    WebviewUrl::App("preview-header.html"). (A src/ entry would be
   //    mirrored to dist/src/preview-header.html, which the backend would
-  //    not find.)
+  //    not find.) The clipboard history popup (v0.9.0) follows the same
+  //    pattern: clipboard.html -> dist/clipboard.html.
   build: {
     rollupOptions: {
       input: {
         main: "index.html",
         "preview-header": "preview-header.html",
+        clipboard: "clipboard.html",
       },
     },
   },

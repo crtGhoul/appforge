@@ -38,8 +38,14 @@ export interface Routine {
   name: string;
   /** Global hotkey like "Ctrl+Alt+M", or null for none. */
   hotkey: string | null;
+  /** Window layout: "cascade" (overlap) or "side_by_side" (tile as columns).
+   * Missing on old records means cascade. */
+  layout: RoutineLayout;
   items: RoutineItem[];
 }
+
+/** Routine window layout (v0.9.0). Serialized snake_case in routines.json. */
+export type RoutineLayout = "cascade" | "side_by_side";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -158,6 +164,9 @@ function RoutineForm({
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [hotkey, setHotkey] = useState(initial?.hotkey ?? "");
+  const [layout, setLayout] = useState<RoutineLayout>(
+    initial?.layout ?? "cascade"
+  );
   const [items, setItems] = useState<RoutineItem[]>(initial?.items ?? []);
   const [saving, setSaving] = useState(false);
 
@@ -183,6 +192,7 @@ function RoutineForm({
         id: initial?.id ?? "",
         name: name.trim(),
         hotkey: hotkey.trim() ? hotkey.trim() : null,
+        layout,
         items,
       };
       // camelCase invoke arg for the snake_case Rust param `routine`.
@@ -234,6 +244,24 @@ function RoutineForm({
         Pressing it runs the routine from anywhere. If another shortcut
         already uses those keys, saving will tell you so you can pick
         different ones.
+      </p>
+      <label style={{ display: "block", fontSize: 14, marginBottom: 8 }}>
+        <span className="field-label">Window layout</span>
+        <select
+          value={layout}
+          onChange={(e) => setLayout(e.target.value as RoutineLayout)}
+          style={{ width: "100%", marginTop: 4 }}
+          aria-label="Routine window layout"
+        >
+          <option value="cascade">Cascade — windows overlap</option>
+          <option value="side_by_side">
+            Side by side — tile as columns
+          </option>
+        </select>
+      </label>
+      <p className="muted small" style={{ margin: "0 0 4px" }}>
+        Side by side tiles this routine's windows as equal columns across
+        your current monitor, left to right in the order below.
       </p>
       <div style={{ marginTop: 8 }}>
         <span className="field-label" style={{ fontSize: 14 }}>
@@ -439,6 +467,7 @@ export function RoutinesSection({
                   {routine.items.length}{" "}
                   {routine.items.length === 1 ? "item" : "items"}
                   {routine.hotkey ? ` · ${routine.hotkey}` : ""}
+                  {routine.layout === "side_by_side" ? " · side by side" : ""}
                 </div>
               </div>
               <button
