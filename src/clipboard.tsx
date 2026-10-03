@@ -2,17 +2,28 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  CLIPBOARD_TABS,
+  CLIPBOARD_TAB_LABELS,
+  ClipboardTab,
+  emptyTabCopy,
+  filterClipboardEntries,
+  normalizeTab,
+} from "./clipboardFilter";
 
 /**
- * Clipboard history popup (v0.9.3, text + images + multi-select).
+ * Clipboard history popup (v0.9.4, text + images + multi-select + tabs).
  *
  * Summoned by the global hotkey; the backend builds this window on a
- * dedicated thread. Search filters the history, Enter/click copies the
- * entry back to the OS clipboard and closes the popup (it does NOT
- * synthesize Ctrl+V — the user pastes normally). The "Select" footer
- * button enters multi-select mode: check off several text entries and
- * "Copy selected" (or Ctrl+Enter) merges them into one payload, newest
- * first. Esc or focus loss closes.
+ * dedicated thread. The All | Text | Images tabs separate pictures from
+ * text (the tab persists across summons and restarts via
+ * set_clipboard_popup_tab). Search filters within the active tab,
+ * Enter/click copies the entry back to the OS clipboard and closes the
+ * popup (it does NOT synthesize Ctrl+V — the user pastes normally).
+ * The "Select" button sits top-left by the search bar: it enters
+ * multi-select mode (check off several text entries, "Copy selected"
+ * or Ctrl+Enter merges them into one payload, newest first), and
+ * becomes "Done" to leave. Esc or focus loss closes.
  *
  * The list refreshes on mount and then polls every second while open —
  * a push event from the backend proved unreliable for secondary windows,
@@ -52,6 +63,9 @@ function ClipboardPopup() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // v0.9.4: tab separating pictures from text. Defaults to the mixed
+  // list; the saved value loads on mount and every change persists.
+  const [tab, setTab] = useState<ClipboardTab>("all");
   // v0.9.3 multi-select: check off several text entries, copy them as one
   // payload. Images stay out (the OS clipboard holds one image).
   const [selectMode, setSelectMode] = useState(false);
@@ -70,6 +84,7 @@ function ClipboardPopup() {
   };
 
   // Hide the popup and reset the search box so the next summon starts fresh.
+  // The tab is deliberately NOT reset — it persists across summons.
   // Hiding goes through a backend command: the Rust-side hide is the path
   // proven to work for this window.
   const hide = () => {
@@ -93,6 +108,23 @@ function ClipboardPopup() {
     setChecked(new Set());
   };
 
+  // Switching tabs clears checks: copySelected acts on the visible
+  // filtered rows, so a stale check from another tab would make the
+  // "Copy selected (N)" count lie.
+  const changeTab = (t: ClipboardTab) => {
+    setTab(t);
+    setSelected(0);
+    setChecked(new Set());
+    void invoke("set_clipboard_popup_tab", { tab: t }).catch(() => {});
+  };
+
+  const cycleTab = (dir: 1 | -1) => {
+    const i = CLIPBOARD_TABS.indexOf(tab);
+    changeTab(
+      CLIPBOARD_TABS[(i + dir + CLIPBOARD_TABS.length) % CLIPBOARD_TABS.length]
+    );
+  };
+
   useEffect(() => {
     shownAt.current = Date.now();
     setQuery("");
@@ -100,6 +132,10 @@ function ClipboardPopup() {
     setSelectMode(false);
     setChecked(new Set());
     void refresh();
+    // Restore the saved tab; a failure keeps the mixed list.
+    void invoke<{ popupTab?: unknown }>("get_clipboard_settings")
+      .then((s) => setTab(normalizeTab(s.popupTab)))
+      .catch(() => {});
     // Poll while open: a push event from the backend proved unreliable for
     // secondary windows, and one tiny invoke per second is cheap.
     const timer = window.setInterval(() => {
@@ -108,7 +144,7 @@ function ClipboardPopup() {
     // Hide when focus moves elsewhere (with a grace period so the
     // show->focus race can't instantly dismiss the popup). On focus,
     // reset the search box and refresh — copies made while the popup
-    // was hidden show up immediately.
+    // was hidden show up immediately. The tab stays as the user left it.
     const focusPromise = getCurrentWindow().onFocusChanged(({ payload }) => {
       if (payload) {
         shownAt.current = Date.now();
@@ -132,24 +168,14 @@ function ClipboardPopup() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const filtered = useMemo(() => {
-    // Drop image entries whose PNG is gone from disk (deleted outside the
-    // app) — a blank row would be worse than no row.
-    const alive = entries.filter(
-      (e) => e.kind !== "image" || e.imagePath
-    );
-    const q = query.trim().toLowerCase();
-    if (!q) return alive;
-    // Images have no searchable text; they match a bare "image" query and
-    // are hidden by any other query.
-    return alive.filter((e) =>
-      e.kind === "image" ? "image".includes(q) : e.preview.toLowerCase().includes(q)
-    );
-  }, [entries, query]);
+  const filtered = useMemo(
+    () => filterClipboardEntries(entries, tab, query),
+    [entries, tab, query]
+  );
 
   useEffect(() => {
     setSelected(0);
-  }, [query]);
+  }, [query, tab]);
 
   async function choose(entry: ClipboardListEntry | undefined) {
     if (!entry) return;
@@ -163,8 +189,9 @@ function ClipboardPopup() {
   }
 
   // Multi-select: the checked ids, in display order (newest first — the
-  // backend preserves it when joining). Images can never be checked, so
-  // this is text-only by construction.
+  // backend preserves it when joining). `filtered` already reflects the
+  // active tab, so this respects the tab by construction; images can
+  // never be checked, so this is text-only by construction.
   async function copySelected() {
     const ids = filtered
       .filter((e) => e.kind === "text" && checked.has(e.id))
@@ -184,6 +211,11 @@ function ClipboardPopup() {
       // First Esc leaves select mode; the next one closes.
       if (selectMode) exitSelect();
       else hide();
+    } else if (e.key === "Tab" && e.ctrlKey) {
+      // Ctrl+Tab cycles the All | Text | Images tabs; nothing else in
+      // the popup uses it, and a webview has no tab bar to fight.
+      e.preventDefault();
+      cycleTab(e.shiftKey ? -1 : 1);
     } else if (e.key === "Enter" && e.ctrlKey) {
       // Ctrl+Enter copies the checked entries from the search box.
       e.preventDefault();
@@ -200,37 +232,83 @@ function ClipboardPopup() {
     }
   }
 
+  const hasText = filtered.some((e) => e.kind === "text");
+  const emptyCopy =
+    entries.length === 0 ? (
+      <>
+        Nothing copied yet.
+        <br />
+        Copy some text or an image and it will show up here.
+      </>
+    ) : query.trim() ? (
+      <>No matches for "{query}".</>
+    ) : (
+      <>{emptyTabCopy(tab) || "Nothing here yet."}</>
+    );
+
   return (
     <>
-      <div className="clip-search">
-        <input
-          ref={inputRef}
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder="Search clipboard history…"
-          aria-label="Search clipboard history"
-          autoComplete="off"
-          spellCheck={false}
-        />
+      <div className="clip-top">
+        {selectMode ? (
+          <>
+            <button type="button" className="clip-top-btn" onClick={exitSelect}>
+              Done
+            </button>
+            <button
+              type="button"
+              className="clip-top-btn primary"
+              onClick={() => void copySelected()}
+              disabled={checked.size === 0}
+            >
+              Copy selected{checked.size > 0 ? ` (${checked.size})` : ""}
+            </button>
+          </>
+        ) : (
+          hasText && (
+            <button
+              type="button"
+              className="clip-top-btn"
+              onClick={() => setSelectMode(true)}
+            >
+              Select
+            </button>
+          )
+        )}
+        <div className="clip-search">
+          <input
+            ref={inputRef}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Search clipboard history…"
+            aria-label="Search clipboard history"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </div>
+      </div>
+      <div className="clip-tabs" role="tablist" aria-label="Clipboard history type">
+        {CLIPBOARD_TABS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            role="tab"
+            aria-selected={tab === t}
+            className={tab === t ? "active" : ""}
+            onClick={() => changeTab(t)}
+            title="Ctrl+Tab switches tabs"
+          >
+            {CLIPBOARD_TAB_LABELS[t]}
+          </button>
+        ))}
       </div>
       {error ? (
         <div className="clip-error" role="alert">
           {error}
         </div>
       ) : filtered.length === 0 ? (
-        <div className="clip-empty">
-          {entries.length === 0 ? (
-            <>
-              Nothing copied yet.
-              <br />
-              Copy some text or an image and it will show up here.
-            </>
-          ) : (
-            <>No matches for "{query}".</>
-          )}
-        </div>
+        <div className="clip-empty">{emptyCopy}</div>
       ) : (
         <ul className="clip-list" role="listbox" aria-label="Clipboard history">
           {filtered.map((entry, i) => {
@@ -300,19 +378,7 @@ function ClipboardPopup() {
       )}
       <div className="clip-foot">
         {selectMode ? (
-          <>
-            <button
-              type="button"
-              onClick={() => void copySelected()}
-              disabled={checked.size === 0}
-            >
-              Copy selected{checked.size > 0 ? ` (${checked.size})` : ""}
-            </button>
-            <button type="button" onClick={exitSelect}>
-              Cancel
-            </button>
-            <span className="muted">text entries only</span>
-          </>
+          <span className="muted">text entries only</span>
         ) : (
           <>
             <span>
@@ -321,11 +387,6 @@ function ClipboardPopup() {
             <span>
               <b>Esc</b> closes
             </span>
-            {filtered.some((e) => e.kind === "text") && (
-              <button type="button" className="clip-select-btn" onClick={() => setSelectMode(true)}>
-                Select
-              </button>
-            )}
           </>
         )}
       </div>

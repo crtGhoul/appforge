@@ -933,6 +933,8 @@ fn main() {
             clipboard::clipboard_hotkey_status,
             // v0.9.2: bare-Windows-key tap summon (opt-in, Windows only)
             clipboard::set_clipboard_win_tap,
+            // v0.9.4: popup tab (All | Text | Images), persisted
+            clipboard::set_clipboard_popup_tab,
             // v0.8.2: MSI-aware self-update (install-type detection + MSI path)
             msi_update::get_install_type,
             msi_update::install_msi_update,

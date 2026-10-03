@@ -145,6 +145,9 @@ pub struct ClipboardSettings {
     pub win_tap: bool,
     /// The Win-key tap needs a low-level keyboard hook: Windows only.
     pub win_tap_supported: bool,
+    /// v0.9.4: popup tab ("all" | "text" | "image"), persisted across
+    /// summons and restarts.
+    pub popup_tab: String,
 }
 
 /// On-disk shape of clipboard.json. Unknown fields are ignored on load so
@@ -162,6 +165,10 @@ struct ClipboardFile {
     /// the combo hotkey. Defaults off so old files keep combo behavior.
     #[serde(default)]
     win_tap: bool,
+    /// v0.9.4: popup tab ("all" | "text" | "image"). Defaults to the mixed
+    /// list so old files behave exactly as before.
+    #[serde(default = "default_popup_tab")]
+    popup_tab: String,
 }
 
 fn default_cap() -> usize {
@@ -172,6 +179,21 @@ fn default_hotkey() -> String {
     DEFAULT_HOTKEY.to_string()
 }
 
+/// Popup tab when the file predates it (or carries a value from the
+/// future): the mixed list.
+fn default_popup_tab() -> String {
+    "all".to_string()
+}
+
+/// Tabs the popup understands; anything else (a hand-edited file, a
+/// future value) falls back to the mixed list, same as a fresh install.
+fn normalize_popup_tab(tab: &str) -> String {
+    match tab {
+        "text" | "image" => tab.to_string(),
+        _ => "all".to_string(),
+    }
+}
+
 impl Default for ClipboardFile {
     fn default() -> Self {
         Self {
@@ -179,6 +201,7 @@ impl Default for ClipboardFile {
             cap: DEFAULT_CAP,
             hotkey: DEFAULT_HOTKEY.to_string(),
             win_tap: false,
+            popup_tab: default_popup_tab(),
         }
     }
 }
@@ -191,6 +214,8 @@ struct ClipboardData {
     cap: usize,
     hotkey: String,
     win_tap: bool,
+    /// v0.9.4: popup tab, persisted in clipboard.json.
+    popup_tab: String,
     last_seen: Option<String>,
     last_image_fp: Option<u64>,
 }
@@ -232,6 +257,7 @@ pub fn load(app: &AppHandle) -> ClipboardState {
     // The Win-key tap is Windows-only; a file carried over from a Windows
     // install must not try to enable it on Linux.
     let win_tap = file.win_tap && cfg!(windows);
+    let popup_tab = normalize_popup_tab(&file.popup_tab);
     let mut entries: VecDeque<ClipboardEntry> = file.entries.into();
     // Enforce per-kind caps on load too (a hand-edited or future file
     // could exceed them); evicted image PNGs are deleted.
@@ -249,6 +275,7 @@ pub fn load(app: &AppHandle) -> ClipboardState {
             cap,
             hotkey,
             win_tap,
+            popup_tab,
             last_seen: None,
             last_image_fp: None,
         }),
@@ -273,6 +300,7 @@ fn persist(app: &AppHandle, data: &ClipboardData) -> Result<(), String> {
         cap: data.cap,
         hotkey: data.hotkey.clone(),
         win_tap: data.win_tap,
+        popup_tab: data.popup_tab.clone(),
     };
     let json =
         serde_json::to_string_pretty(&file).map_err(|e| format!("could not encode: {e}"))?;
@@ -921,6 +949,7 @@ pub fn get_clipboard_settings(app: AppHandle) -> Result<ClipboardSettings, Strin
         hotkey: data.hotkey.clone(),
         win_tap: data.win_tap,
         win_tap_supported: cfg!(windows),
+        popup_tab: data.popup_tab.clone(),
     })
 }
 
@@ -958,6 +987,19 @@ pub fn set_clipboard_win_tap(app: AppHandle, enabled: bool) -> Result<bool, Stri
         let _ = enabled;
         Err("Tapping the Windows key to open the clipboard only works on Windows.".to_string())
     }
+}
+
+/// Remember the popup's tab ("all" | "text" | "image") across summons and
+/// restarts (v0.9.4). Unknown values normalize to "all" rather than
+/// erroring — the popup only ever sends the three it renders.
+/// JS: `invoke("set_clipboard_popup_tab", { tab })`.
+#[tauri::command]
+pub fn set_clipboard_popup_tab(app: AppHandle, tab: String) -> Result<String, String> {
+    let tab = normalize_popup_tab(&tab);
+    with_state(&app, |data| {
+        data.popup_tab = tab.clone();
+        persist(&app, data).map(|_| tab.clone())
+    })?
 }
 
 /// Change the text history cap (10–1000). Truncates text entries
@@ -1228,6 +1270,7 @@ mod tests {
             cap: 50,
             hotkey: "Ctrl+Shift+X".to_string(),
             win_tap: true,
+            popup_tab: "image".to_string(),
         };
         let encoded = serde_json::to_string(&full).unwrap();
         let decoded: ClipboardFile = serde_json::from_str(&encoded).unwrap();
@@ -1236,6 +1279,32 @@ mod tests {
         assert_eq!(decoded.cap, 50);
         assert_eq!(decoded.hotkey, "Ctrl+Shift+X");
         assert!(decoded.win_tap);
+        assert_eq!(decoded.popup_tab, "image");
+    }
+
+    #[test]
+    fn popup_tab_normalizes_and_defaults_to_all() {
+        assert_eq!(normalize_popup_tab("all"), "all");
+        assert_eq!(normalize_popup_tab("text"), "text");
+        assert_eq!(normalize_popup_tab("image"), "image");
+        // Unknown, empty, or oddly-cased values fall back to the mixed
+        // list rather than breaking the popup.
+        assert_eq!(normalize_popup_tab(""), "all");
+        assert_eq!(normalize_popup_tab("bogus"), "all");
+        assert_eq!(normalize_popup_tab("Text"), "all");
+
+        // Old files without the field deserialize through the default.
+        let f: ClipboardFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(f.popup_tab, "all");
+        // camelCase on the wire, like the rest of the file.
+        let f: ClipboardFile =
+            serde_json::from_str(r#"{"popupTab":"text"}"#).unwrap();
+        assert_eq!(f.popup_tab, "text");
+        // A bad stored value normalizes on load, not just on set.
+        assert_eq!(normalize_popup_tab(&f.popup_tab), "text");
+        let f: ClipboardFile =
+            serde_json::from_str(r#"{"popupTab":"nope"}"#).unwrap();
+        assert_eq!(normalize_popup_tab(&f.popup_tab), "all");
     }
 
     #[test]
