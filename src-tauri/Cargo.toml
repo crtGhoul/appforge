@@ -31,6 +31,9 @@ sysinfo = "0.34"
 # Filter-list downloads. rustls ("tls") only; no native-tls dependency.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 url = "2"
+# v0.9.1: PNG encode/decode for clipboard image history (clipboard.rs).
+# Pure Rust, no system libs — needed on all platforms.
+png = "0.17"
 # v0.8.2: minisign signature verification for the MSI update path
 # (msi_update.rs) — same crate the updater plugin uses internally.
 minisign-verify = "0.2"
@@ -41,8 +44,6 @@ base64 = "0.21"
 # tree) so the COM bindings are a single crate instance — a mismatch would be
 # two different ICoreWebView2 types and fail to compile.
 [target.'cfg(windows)'.dependencies]
-# PNG encoding for extracted program icons (pure Rust, no system libs).
-png = "0.17"
 webview2-com = "=0.39.1"
 # Win32 APIs for the launcher: IShellLinkW (.lnk resolution), ExtractIconExW +
 # GDI (exe icon extraction), ShellExecuteW (launching programs).
@@ -70,4 +71,4 @@ authors = ["AppMaka"]
 description = "Turn any website into a desktop web app"
 edition = "2021"
 name = "appmaka"
-version = "0.9.0"
+version = "0.9.1"

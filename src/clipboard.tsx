@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /**
- * Clipboard history popup (v0.9.0, text only).
+ * Clipboard history popup (v0.9.1, text + images).
  *
  * Summoned by the global hotkey; the backend builds this window on a
  * dedicated thread. Search filters the history, Enter/click copies the
- * entry back to the OS clipboard and closes the popup (v1 does NOT
+ * entry back to the OS clipboard and closes the popup (v2 does NOT
  * synthesize Ctrl+V — the user pastes normally). Esc or focus loss closes.
  *
  * The list refreshes on mount and then polls every second while open —
@@ -23,10 +23,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface ClipboardListEntry {
   id: string;
+  kind: "text" | "image";
   preview: string;
   chars: number;
   truncated: boolean;
   createdAtMs: number;
+  imagePath: string | null;
+  width: number | null;
+  height: number | null;
 }
 
 function timeAgo(ms: number): string {
@@ -102,9 +106,18 @@ function ClipboardPopup() {
   }, []);
 
   const filtered = useMemo(() => {
+    // Drop image entries whose PNG is gone from disk (deleted outside the
+    // app) — a blank row would be worse than no row.
+    const alive = entries.filter(
+      (e) => e.kind !== "image" || e.imagePath
+    );
     const q = query.trim().toLowerCase();
-    if (!q) return entries;
-    return entries.filter((e) => e.preview.toLowerCase().includes(q));
+    if (!q) return alive;
+    // Images have no searchable text; they match a bare "image" query and
+    // are hidden by any other query.
+    return alive.filter((e) =>
+      e.kind === "image" ? "image".includes(q) : e.preview.toLowerCase().includes(q)
+    );
   }, [entries, query]);
 
   useEffect(() => {
@@ -163,7 +176,7 @@ function ClipboardPopup() {
             <>
               Nothing copied yet.
               <br />
-              Copy some text and it will show up here.
+              Copy some text or an image and it will show up here.
             </>
           ) : (
             <>No matches for "{query}".</>
@@ -183,12 +196,31 @@ function ClipboardPopup() {
                 onClick={() => void choose(entry)}
                 onMouseEnter={() => setSelected(i)}
               >
-                <span className="text">{entry.preview}</span>
-                <span className="meta">
-                  {timeAgo(entry.createdAtMs)} ·{" "}
-                  {entry.chars === 1 ? "1 char" : `${entry.chars} chars`}
-                  {entry.truncated ? " · preview" : ""}
-                </span>
+                {entry.kind === "image" && entry.imagePath ? (
+                  <>
+                    <img
+                      className="thumb"
+                      src={convertFileSrc(entry.imagePath)}
+                      alt={`Copied image${entry.width && entry.height ? `, ${entry.width} by ${entry.height}` : ""}`}
+                    />
+                    <span className="meta">
+                      Image
+                      {entry.width && entry.height
+                        ? ` · ${entry.width}×${entry.height}`
+                        : ""}{" "}
+                      · {timeAgo(entry.createdAtMs)}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text">{entry.preview}</span>
+                    <span className="meta">
+                      {timeAgo(entry.createdAtMs)} ·{" "}
+                      {entry.chars === 1 ? "1 char" : `${entry.chars} chars`}
+                      {entry.truncated ? " · preview" : ""}
+                    </span>
+                  </>
+                )}
               </button>
             </li>
           ))}

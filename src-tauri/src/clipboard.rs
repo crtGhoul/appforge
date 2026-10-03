@@ -1,18 +1,22 @@
-//! Clipboard history v1 (text only).
+//! Clipboard history v2 (text + images).
 //!
-//! A poll-based clipboard watcher records text copies into a local,
-//! newest-first history stored in `<app-data>/clipboard.json`. Nothing is
-//! ever transmitted anywhere — there is no network code in this module.
+//! A poll-based clipboard watcher records text and image copies into a
+//! local, newest-first history stored in `<app-data>/clipboard.json`.
+//! Image bytes live as PNG files under `<app-data>/clipboard_images/`;
+//! the JSON keeps only metadata. Nothing is ever transmitted anywhere —
+//! there is no network code in this module.
 //!
 //! Design notes:
 //! - The watcher is a single tokio task ticking every 600ms. Each tick is
-//!   one OS clipboard read plus a string compare — ~nothing when the
-//!   clipboard hasn't changed. No new processes, no background services.
-//! - v1 is TEXT ONLY. Empty/whitespace-only copies are ignored, and texts
-//!   over 1 MiB are skipped (pasting megabytes through a history list is
-//!   never what the user wants).
+//!   one text read + compare and one image probe (cheap when the clipboard
+//!   holds no image; when it does, a sampled fingerprint avoids hashing
+//!   tens of megabytes every tick). No new processes, no background
+//!   services.
+//! - v2 records TEXT and IMAGES (screenshots, copied pictures). Empty/
+//!   whitespace-only texts are ignored, texts over 1 MiB are skipped, and
+//!   images over 40 MiB raw are skipped (a 4K screenshot is ~33 MiB RGBA).
 //! - Selecting an entry copies it back to the OS clipboard and closes the
-//!   popup. v1 does NOT synthesize Ctrl+V into other apps — the user
+//!   popup. v2 does NOT synthesize Ctrl+V into other apps — the user
 //!   pastes normally after picking.
 //! - The popup window is built on a dedicated thread, never inside a
 //!   synchronous command and never on the main thread (same Windows
@@ -35,18 +39,32 @@ use crate::hotkeys::{record_binding_failure, set_binding, BindingStatus, HotkeyK
 pub const BINDING_ID: &str = "clipboard:popup";
 /// Window label for the clipboard popup.
 pub const WINDOW_LABEL: &str = "clipboard";
-/// Default global hotkey for the popup. Chosen to avoid PowerToys Run's
-/// Alt+Space and Windows' own Win+V.
-pub const DEFAULT_HOTKEY: &str = "Ctrl+Shift+V";
-/// Default history cap (entries).
+/// Default global hotkey for the popup. The user asked for the Windows key.
+/// Win+Shift+V was verified reserved (the shell cycles notifications with
+/// it, and PowerToys' Advanced Paste also claims it), so the default is
+/// Win+Alt+V — free of any documented Windows or PowerToys reservation.
+pub const DEFAULT_HOTKEY: &str = "Super+Alt+V";
+/// v0.9.0's default. Users still on it are migrated to the new default on
+/// load (they asked for the Windows key; stranding them on Ctrl+Shift+V
+/// would ignore that).
+const OLD_DEFAULT_HOTKEY: &str = "Ctrl+Shift+V";
+/// Default history cap (text entries). The text cap stays user-configurable.
 pub const DEFAULT_CAP: usize = 100;
-/// Minimum/maximum configurable cap.
+/// Image history cap (fixed; images are heavy, so this isn't a setting).
+pub const IMAGE_CAP: usize = 25;
+/// Minimum/maximum configurable text cap.
 pub const MIN_CAP: usize = 10;
 pub const MAX_CAP: usize = 1000;
 /// Texts larger than this are never recorded.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
-/// How much of an entry the list shows; the full text stays on disk and is
-/// what gets copied back.
+/// Images larger than this (raw RGBA) are never recorded. A 4K screenshot
+/// is ~33 MiB, so 40 MiB admits real screenshots without letting a
+/// gigapixel copy blow up the disk.
+pub const MAX_IMAGE_BYTES: usize = 40 * 1024 * 1024;
+/// Directory (under the app data dir) holding recorded image PNGs.
+const IMAGES_DIR: &str = "clipboard_images";
+/// How much of a text entry the list shows; the full text stays on disk
+/// and is what gets copied back.
 pub const PREVIEW_CHARS: usize = 500;
 /// Watcher poll interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(600);
@@ -60,27 +78,58 @@ fn unix_millis() -> u64 {
 
 static ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// One recorded copy. `text` is the full text; the list command truncates
-/// to a preview.
+/// What kind of copy an entry holds. Defaults to Text so v0.9.0's
+/// text-only history files load unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    #[default]
+    Text,
+    Image,
+}
+
+/// One recorded copy. Text entries carry `text`; image entries carry a PNG
+/// file name (under `clipboard_images/`) plus dimensions. New fields all
+/// default so old history files deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardEntry {
     pub id: String,
+    #[serde(default)]
+    pub kind: EntryKind,
+    #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub image_file: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Raw RGBA byte size at record time (for the meta line).
+    #[serde(default)]
+    pub bytes: Option<u64>,
+    /// Sampled fingerprint of the image, used to suppress re-recording.
+    #[serde(default)]
+    pub img_hash: Option<u64>,
     pub created_at_ms: u64,
 }
 
-/// What `list_clipboard` returns: newest first, text truncated to a
-/// preview. Copying uses the id, so the full text never has to travel to
-/// the UI.
+/// What `list_clipboard` returns: newest first. Texts are truncated to a
+/// preview; images expose an absolute file path (the UI turns it into a
+/// webview-loadable URL with convertFileSrc) plus dimensions. Copying uses
+/// the id, so full contents never have to travel to the UI.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardListEntry {
     pub id: String,
+    pub kind: String,
     pub preview: String,
     pub chars: usize,
     pub truncated: bool,
     pub created_at_ms: u64,
+    pub image_path: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Settings payload for the UI.
@@ -123,12 +172,14 @@ impl Default for ClipboardFile {
 }
 
 /// In-memory state. `last_seen` is the last clipboard text observed (or
-/// written by us) — never persisted; it only suppresses re-recording.
+/// written by us), `last_image_fp` the fingerprint of the last image —
+/// neither is persisted; they only suppress re-recording.
 struct ClipboardData {
     entries: VecDeque<ClipboardEntry>,
     cap: usize,
     hotkey: String,
     last_seen: Option<String>,
+    last_image_fp: Option<u64>,
 }
 
 pub struct ClipboardState {
@@ -143,8 +194,20 @@ fn clipboard_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("clipboard.json"))
 }
 
+/// One-time migration: users still on v0.9.0's default hotkey are carried
+/// to the new Windows-key default (they asked for the Windows key).
+/// Anything the user chose deliberately is left alone.
+fn migrate_hotkey(saved: &str) -> String {
+    if saved == OLD_DEFAULT_HOTKEY {
+        DEFAULT_HOTKEY.to_string()
+    } else {
+        saved.to_string()
+    }
+}
+
 /// Load persisted history, or start empty. A missing/corrupt file is just
-/// "no history yet" — the watcher keeps working.
+/// "no history yet" — the watcher keeps working. Users still on v0.9.0's
+/// default hotkey are carried to the new Windows-key default once.
 pub fn load(app: &AppHandle) -> ClipboardState {
     let file: ClipboardFile = clipboard_path(app)
         .ok()
@@ -152,16 +215,35 @@ pub fn load(app: &AppHandle) -> ClipboardState {
         .and_then(|c| serde_json::from_str(&c).ok())
         .unwrap_or_default();
     let cap = file.cap.clamp(MIN_CAP, MAX_CAP);
+    let hotkey = migrate_hotkey(&file.hotkey);
     let mut entries: VecDeque<ClipboardEntry> = file.entries.into();
-    entries.truncate(cap);
+    // Enforce per-kind caps on load too (a hand-edited or future file
+    // could exceed them); evicted image PNGs are deleted.
+    let doomed = enforce_caps(&mut entries, cap);
+    if !doomed.is_empty() {
+        if let Ok(dir) = images_dir(app) {
+            for f in doomed {
+                let _ = fs::remove_file(dir.join(f));
+            }
+        }
+    }
     ClipboardState {
         inner: Mutex::new(ClipboardData {
             entries,
             cap,
-            hotkey: file.hotkey,
+            hotkey,
             last_seen: None,
+            last_image_fp: None,
         }),
     }
+}
+
+fn images_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?
+        .join(IMAGES_DIR))
 }
 
 fn persist(app: &AppHandle, data: &ClipboardData) -> Result<(), String> {
@@ -218,11 +300,117 @@ fn insert_entry(entries: &mut VecDeque<ClipboardEntry>, entry: ClipboardEntry, c
     entries.truncate(cap.max(1));
 }
 
+/// Enforce the text cap and the (fixed) image cap independently on a
+/// newest-first deque, keeping the newest entries of each kind. Returns the
+/// image file names that were evicted so the caller can delete the PNGs.
+/// Pure for testing.
+fn enforce_caps(entries: &mut VecDeque<ClipboardEntry>, text_cap: usize) -> Vec<String> {
+    let text_cap = text_cap.max(1);
+    let mut texts = 0usize;
+    let mut images = 0usize;
+    let mut doomed = Vec::new();
+    entries.retain(|e| {
+        let keep = match e.kind {
+            EntryKind::Text => {
+                texts += 1;
+                texts <= text_cap
+            }
+            EntryKind::Image => {
+                images += 1;
+                images <= IMAGE_CAP
+            }
+        };
+        if !keep {
+            if let Some(f) = &e.image_file {
+                doomed.push(f.clone());
+            }
+        }
+        keep
+    });
+    doomed
+}
+
+/// Sampled fingerprint of clipboard image bytes. Hashing a full 33 MiB
+/// screenshot every 600 ms tick would burn CPU for nothing — dedupe only
+/// needs to notice *change*, and dimensions + length + head/tail samples
+/// do that.
+fn image_fingerprint(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    width.hash(&mut h);
+    height.hash(&mut h);
+    rgba.len().hash(&mut h);
+    let n = rgba.len().min(8192);
+    rgba[..n].hash(&mut h);
+    if rgba.len() > n {
+        rgba[rgba.len() - n..].hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Encode raw RGBA8 pixels as a PNG (same pattern as the icon extractor in
+/// launcher.rs).
+fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc
+            .write_header()
+            .map_err(|e| format!("could not save the image: {e}"))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| format!("could not save the image: {e}"))?;
+    }
+    Ok(buf)
+}
+
+/// Decode one of our recorded PNGs back to raw RGBA8. Refuses anything that
+/// isn't 8-bit RGBA rather than guessing at a conversion.
+fn decode_png_rgba(path: &PathBuf) -> Result<(u32, u32, Vec<u8>), String> {
+    let bad = || "That image is in a format I can't paste back.".to_string();
+    let file = std::fs::File::open(path).map_err(|_| bad())?;
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().map_err(|_| bad())?;
+    let info = reader.info();
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(bad());
+    }
+    let (w, h) = (info.width, info.height);
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    reader.next_frame(&mut buf).map_err(|_| bad())?;
+    buf.truncate((w as usize) * (h as usize) * 4);
+    Ok((w, h, buf))
+}
+
 fn make_entry(text: String) -> ClipboardEntry {
     let n = ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed);
     ClipboardEntry {
         id: format!("clip-{}-{n}", unix_millis()),
+        kind: EntryKind::Text,
         text,
+        image_file: None,
+        width: None,
+        height: None,
+        bytes: None,
+        img_hash: None,
+        created_at_ms: unix_millis(),
+    }
+}
+
+fn make_image_entry(image_file: String, width: u32, height: u32, bytes: u64, fp: u64) -> ClipboardEntry {
+    let n = ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    ClipboardEntry {
+        id: format!("img-{}-{n}", unix_millis()),
+        kind: EntryKind::Image,
+        text: String::new(),
+        image_file: Some(image_file),
+        width: Some(width),
+        height: Some(height),
+        bytes: Some(bytes),
+        img_hash: Some(fp),
         created_at_ms: unix_millis(),
     }
 }
@@ -259,14 +447,85 @@ fn observe(app: &AppHandle, text: String) -> bool {
     }
 }
 
-/// Background watcher: one OS clipboard read per tick plus a string
-/// compare. Started once from main.rs setup.
+/// Record one clipboard image observation. Returns true when a new entry
+/// was stored. The PNG encode + file write happen outside the state lock;
+/// the watcher is a single sequential task so nothing races here.
+fn observe_image(app: &AppHandle, img: &tauri::image::Image) -> bool {
+    let (w, h) = (img.width(), img.height());
+    let rgba = img.rgba();
+    if w == 0 || h == 0 || rgba.is_empty() || rgba.len() > MAX_IMAGE_BYTES {
+        return false;
+    }
+    let fp = image_fingerprint(w, h, rgba);
+    let is_new = with_state(app, |data| {
+        if data.last_image_fp == Some(fp) {
+            return false;
+        }
+        data.last_image_fp = Some(fp);
+        true
+    });
+    if !matches!(is_new, Ok(true)) {
+        if let Err(e) = is_new {
+            eprintln!("clipboard: image observe failed: {e}");
+        }
+        return false;
+    }
+    let file_name = format!("img-{}-{}.png", unix_millis(), ENTRY_COUNTER.load(Ordering::Relaxed));
+    let png = match encode_png_rgba(w, h, rgba) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("clipboard: {e}");
+            return false;
+        }
+    };
+    let dir = match images_dir(app) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("clipboard: {e}");
+            return false;
+        }
+    };
+    if let Err(e) = fs::create_dir_all(&dir).and_then(|_| fs::write(dir.join(&file_name), &png)) {
+        eprintln!("clipboard: could not save the image: {e}");
+        return false;
+    }
+    let entry = make_image_entry(file_name, w, h, rgba.len() as u64, fp);
+    let saved = with_state(app, |data| {
+        data.entries.push_front(entry);
+        let doomed = enforce_caps(&mut data.entries, data.cap);
+        (persist(app, data), doomed)
+    });
+    match saved {
+        Ok((persist_result, doomed)) => {
+            if let Err(e) = persist_result {
+                eprintln!("clipboard: persist failed: {e}");
+            }
+            for f in doomed {
+                let _ = fs::remove_file(dir.join(f));
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("clipboard: image observe failed: {e}");
+            false
+        }
+    }
+}
+
+/// Background watcher: one text read + compare and one image probe per
+/// tick. Started once from main.rs setup.
 pub fn start_watcher(app: AppHandle) {
-    // Seed last_seen from whatever is already on the clipboard so
-    // pre-existing content isn't recorded as new history.
+    // Seed both dedupe memories from whatever is already on the clipboard
+    // so pre-existing content isn't recorded as new history.
     if let Ok(current) = app.clipboard().read_text() {
         let _ = with_state(&app, |data| {
             data.last_seen = Some(current);
+        });
+    }
+    if let Ok(img) = app.clipboard().read_image() {
+        let fp = image_fingerprint(img.width(), img.height(), img.rgba());
+        let _ = with_state(&app, |data| {
+            data.last_image_fp = Some(fp);
         });
     }
     tauri::async_runtime::spawn(async move {
@@ -281,6 +540,10 @@ pub fn start_watcher(app: AppHandle) {
                     // Clipboard unavailable right now (locked by another
                     // app, no text format, X11 owner gone). Next tick.
                 }
+            }
+            // Image probe: fails fast when the clipboard holds no image.
+            if let Ok(img) = app.clipboard().read_image() {
+                observe_image(&app, &img);
             }
         }
     });
@@ -410,65 +673,109 @@ pub fn hide_clipboard_popup(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Newest-first history, texts truncated to previews.
+/// Newest-first history. Texts are truncated to previews; images expose
+/// an absolute PNG path for the UI thumbnail.
 /// JS: `invoke("list_clipboard")`.
 #[tauri::command]
 pub fn list_clipboard(app: AppHandle) -> Result<Vec<ClipboardListEntry>, String> {
+    let dir = images_dir(&app).ok();
     with_state(&app, |data| {
         data.entries
             .iter()
             .map(|e| {
-                let chars = e.text.chars().count();
-                let truncated = chars > PREVIEW_CHARS;
-                let preview: String = if truncated {
-                    e.text.chars().take(PREVIEW_CHARS).collect()
-                } else {
-                    e.text.clone()
+                let (preview, chars, truncated) = match e.kind {
+                    EntryKind::Text => {
+                        let chars = e.text.chars().count();
+                        let truncated = chars > PREVIEW_CHARS;
+                        let preview: String = if truncated {
+                            e.text.chars().take(PREVIEW_CHARS).collect()
+                        } else {
+                            e.text.clone()
+                        };
+                        (preview, chars, truncated)
+                    }
+                    EntryKind::Image => (String::new(), 0, false),
+                };
+                let image_path = match (&e.kind, &e.image_file, &dir) {
+                    (EntryKind::Image, Some(f), Some(d)) => {
+                        Some(d.join(f).to_string_lossy().into_owned())
+                    }
+                    _ => None,
                 };
                 ClipboardListEntry {
                     id: e.id.clone(),
+                    kind: match e.kind {
+                        EntryKind::Text => "text".to_string(),
+                        EntryKind::Image => "image".to_string(),
+                    },
                     preview,
                     chars,
                     truncated,
                     created_at_ms: e.created_at_ms,
+                    image_path,
+                    width: e.width,
+                    height: e.height,
                 }
             })
             .collect()
     })
 }
 
-/// Copy an entry back to the OS clipboard (v1 contract: the user pastes
+/// Copy an entry back to the OS clipboard (v2 contract: the user pastes
 /// from there; we don't synthesize keystrokes into other apps).
 /// JS: `invoke("copy_clipboard_entry", { entryId })`.
 #[tauri::command]
 pub fn copy_clipboard_entry(app: AppHandle, entry_id: String) -> Result<(), String> {
-    let text = with_state(&app, |data| {
-        data.entries
-            .iter()
-            .find(|e| e.id == entry_id)
-            .map(|e| e.text.clone())
+    let entry = with_state(&app, |data| {
+        data.entries.iter().find(|e| e.id == entry_id).cloned()
     })?
     .ok_or_else(|| "That clipboard entry is gone.".to_string())?;
-    app.clipboard()
-        .write_text(text.clone())
-        .map_err(|e| format!("Couldn't write to the clipboard: {e}"))?;
-    // Remember what we just wrote so the watcher doesn't re-record it as
-    // a new copy.
-    let _ = with_state(&app, |data| {
-        data.last_seen = Some(text);
-    });
+    match entry.kind {
+        EntryKind::Text => {
+            app.clipboard()
+                .write_text(entry.text.clone())
+                .map_err(|e| format!("Couldn't write to the clipboard: {e}"))?;
+            // Remember what we just wrote so the watcher doesn't
+            // re-record it as a new copy.
+            let _ = with_state(&app, |data| {
+                data.last_seen = Some(entry.text);
+            });
+        }
+        EntryKind::Image => {
+            let file = entry
+                .image_file
+                .clone()
+                .ok_or_else(|| "That image is gone.".to_string())?;
+            let (w, h, rgba) = decode_png_rgba(&images_dir(&app)?.join(file))?;
+            let img = tauri::image::Image::new_owned(rgba, w, h);
+            app.clipboard()
+                .write_image(&img)
+                .map_err(|e| format!("Couldn't write to the clipboard: {e}"))?;
+            let _ = with_state(&app, |data| {
+                data.last_image_fp = entry.img_hash;
+            });
+        }
+    }
     Ok(())
 }
 
-/// Empty the history (the OS clipboard is untouched).
+/// Empty the history (text + images, including the saved PNGs). The OS
+/// clipboard is untouched.
 /// JS: `invoke("clear_clipboard")`.
 #[tauri::command]
 pub fn clear_clipboard(app: AppHandle) -> Result<(), String> {
+    let dir = images_dir(&app).ok();
     with_state(&app, |data| {
         data.entries.clear();
         data.last_seen = None;
+        data.last_image_fp = None;
         persist(&app, data)
-    })?
+    })??;
+    if let Some(d) = dir {
+        // Best-effort: a failed wipe must not fail the clear.
+        let _ = fs::remove_dir_all(d);
+    }
+    Ok(())
 }
 
 /// Current cap + hotkey for the Settings UI.
@@ -481,18 +788,26 @@ pub fn get_clipboard_settings(app: AppHandle) -> Result<ClipboardSettings, Strin
     })
 }
 
-/// Change the history cap (10–1000). Truncates immediately.
+/// Change the text history cap (10–1000). Truncates text entries
+/// immediately; image entries keep their own fixed cap of 25.
 /// JS: `invoke("set_clipboard_cap", { cap })`.
 #[tauri::command]
 pub fn set_clipboard_cap(app: AppHandle, cap: usize) -> Result<usize, String> {
     if !(MIN_CAP..=MAX_CAP).contains(&cap) {
         return Err(format!("Keep the history size between {MIN_CAP} and {MAX_CAP}."));
     }
-    with_state(&app, |data| {
+    let dir = images_dir(&app).ok();
+    let doomed = with_state(&app, |data| {
         data.cap = cap;
-        data.entries.truncate(cap);
-        persist(&app, data).map(|_| cap)
-    })?
+        let doomed = enforce_caps(&mut data.entries, cap);
+        persist(&app, data).map(|_| doomed)
+    })??;
+    if let Some(d) = dir {
+        for f in doomed {
+            let _ = fs::remove_file(d.join(f));
+        }
+    }
+    Ok(cap)
 }
 
 /// Change the popup hotkey. Goes through the shared registry so conflicts
@@ -549,7 +864,13 @@ mod tests {
                 &mut entries,
                 ClipboardEntry {
                     id: format!("clip-{i}"),
+                    kind: EntryKind::Text,
                     text: format!("text {i}"),
+                    image_file: None,
+                    width: None,
+                    height: None,
+                    bytes: None,
+                    img_hash: None,
                     created_at_ms: i,
                 },
                 3,
@@ -559,6 +880,119 @@ mod tests {
         // Newest first.
         assert_eq!(entries[0].id, "clip-4");
         assert_eq!(entries[2].id, "clip-2");
+    }
+
+    fn text_entry(id: &str) -> ClipboardEntry {
+        ClipboardEntry {
+            id: id.to_string(),
+            kind: EntryKind::Text,
+            text: "t".to_string(),
+            image_file: None,
+            width: None,
+            height: None,
+            bytes: None,
+            img_hash: None,
+            created_at_ms: 0,
+        }
+    }
+
+    fn image_entry(id: &str) -> ClipboardEntry {
+        ClipboardEntry {
+            id: id.to_string(),
+            kind: EntryKind::Image,
+            text: String::new(),
+            image_file: Some(format!("{id}.png")),
+            width: Some(100),
+            height: Some(100),
+            bytes: Some(40000),
+            img_hash: Some(1),
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn enforce_caps_keeps_newest_of_each_kind() {
+        let mut entries = VecDeque::new();
+        for i in 0..5 {
+            entries.push_front(text_entry(&format!("t{i}")));
+        }
+        for i in 0..30 {
+            entries.push_front(image_entry(&format!("i{i}")));
+        }
+        // Mixed order, newest first: interleave to prove per-kind counting.
+        let mut mixed = VecDeque::new();
+        for i in 0..5 {
+            mixed.push_front(text_entry(&format!("t{i}")));
+            mixed.push_front(image_entry(&format!("i{i}")));
+        }
+        let doomed = enforce_caps(&mut mixed, 3);
+        // 3 newest texts kept (t4, t3, t2); all 5 images fit in the 25 cap.
+        let texts: Vec<_> = mixed
+            .iter()
+            .filter(|e| e.kind == EntryKind::Text)
+            .collect();
+        assert_eq!(texts.len(), 3);
+        assert_eq!(texts[0].id, "t4");
+        assert_eq!(texts[2].id, "t2");
+        assert_eq!(
+            mixed.iter().filter(|e| e.kind == EntryKind::Image).count(),
+            5
+        );
+        // Evicted texts had no PNG files, so nothing to delete.
+        assert!(doomed.is_empty());
+
+        // Image cap: 30 images, only 25 survive, evicted PNGs reported.
+        let doomed = enforce_caps(&mut entries, 100);
+        let images: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Image)
+            .collect();
+        assert_eq!(images.len(), IMAGE_CAP);
+        assert_eq!(images[0].id, "i29");
+        assert_eq!(doomed.len(), 5);
+        assert!(doomed.contains(&"i0.png".to_string()));
+        assert!(doomed.contains(&"i4.png".to_string()));
+        assert!(!doomed.contains(&"i5.png".to_string()));
+        // All 5 texts survive a text cap of 100.
+        assert_eq!(
+            entries.iter().filter(|e| e.kind == EntryKind::Text).count(),
+            5
+        );
+    }
+
+    #[test]
+    fn image_fingerprint_notices_change() {
+        let a = vec![1u8; 100_000];
+        let b = vec![1u8; 100_000];
+        let mut c = vec![1u8; 100_000];
+        c[99_999] = 2; // tail sample differs
+        let mut d = vec![1u8; 100_000];
+        d[0] = 2; // head sample differs
+        assert_eq!(image_fingerprint(100, 250, &a), image_fingerprint(100, 250, &b));
+        assert_ne!(image_fingerprint(100, 250, &a), image_fingerprint(100, 250, &c));
+        assert_ne!(image_fingerprint(100, 250, &a), image_fingerprint(100, 250, &d));
+        // Dimensions and length are part of the fingerprint.
+        assert_ne!(image_fingerprint(100, 250, &a), image_fingerprint(200, 125, &a));
+        assert_ne!(
+            image_fingerprint(100, 250, &a),
+            image_fingerprint(100, 250, &a[..50_000])
+        );
+    }
+
+    #[test]
+    fn new_default_hotkey_uses_windows_key() {
+        // Win+Shift+V is reserved (shell notification cycling); the default
+        // must stay on the Windows key without colliding with it.
+        assert_eq!(DEFAULT_HOTKEY, "Super+Alt+V");
+        assert!(crate::hotkeys::validate_hotkey_syntax(DEFAULT_HOTKEY).is_ok());
+    }
+
+    #[test]
+    fn hotkey_migration_carries_old_default() {
+        assert_eq!(migrate_hotkey("Ctrl+Shift+V"), "Super+Alt+V");
+        // Deliberate user choices are untouched.
+        assert_eq!(migrate_hotkey("Ctrl+Alt+X"), "Ctrl+Alt+X");
+        assert_eq!(migrate_hotkey(""), "");
     }
 
     #[test]
@@ -599,10 +1033,23 @@ mod tests {
         assert_eq!(f.hotkey, DEFAULT_HOTKEY);
         assert!(f.entries.is_empty());
 
+        // A v0.9.0 text entry (no kind field) loads as Text.
+        let old: ClipboardEntry =
+            serde_json::from_str(r#"{"id":"clip-9","text":"hi","createdAtMs":42}"#).unwrap();
+        assert_eq!(old.kind, EntryKind::Text);
+        assert_eq!(old.text, "hi");
+        assert_eq!(old.image_file, None);
+
         let full = ClipboardFile {
             entries: vec![ClipboardEntry {
                 id: "clip-1".to_string(),
+                kind: EntryKind::Text,
                 text: "hi".to_string(),
+                image_file: None,
+                width: None,
+                height: None,
+                bytes: None,
+                img_hash: None,
                 created_at_ms: 42,
             }],
             cap: 50,

@@ -231,15 +231,21 @@ export type RoutineLayout = "cascade" | "side_by_side";
 // ---------------------------------------------------------------------------
 
 /**
- * One clipboard history entry as returned by `list_clipboard`. `preview`
- * is the first 500 characters; the full text is copied back by id.
+ * One clipboard history entry as returned by `list_clipboard`. Text entries
+ * carry a 500-char `preview`; image entries carry `imagePath` (absolute PNG
+ * path — the UI turns it into a loadable URL with convertFileSrc) and
+ * dimensions. The full content is copied back by id.
  */
 export interface ClipboardListEntry {
   id: string;
+  kind: "text" | "image";
   preview: string;
   chars: number;
   truncated: boolean;
   createdAtMs: number;
+  imagePath: string | null;
+  width: number | null;
+  height: number | null;
 }
 
 /** Clipboard settings payload from `get_clipboard_settings`. */

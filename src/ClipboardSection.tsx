@@ -4,12 +4,13 @@ import { HotkeyCapture } from "./HotkeyCapture";
 import type { ClipboardSettings } from "./types";
 
 /**
- * Clipboard history settings (v0.9.0, text only).
+ * Clipboard history settings (v0.9.1, text + images).
  *
  * Backend contract (src-tauri/src/clipboard.rs): `get_clipboard_settings`,
  * `set_clipboard_hotkey` (goes through the shared hotkey registry, so
- * conflicts come back as plain-language errors), `set_clipboard_cap`,
- * `clear_clipboard`, `clipboard_hotkey_status`.
+ * conflicts come back as plain-language errors), `set_clipboard_cap`
+ * (text entries; images keep a fixed cap of 25), `clear_clipboard`
+ * (wipes text + images), `clipboard_hotkey_status`.
  */
 
 function errMsg(err: unknown): string {
@@ -134,11 +135,12 @@ export function ClipboardSection() {
       )}
       <p className="muted small" style={{ margin: "0 0 12px" }}>
         Press it anywhere to search everything you've copied. Click an entry
-        (or press Enter) to copy it back, then paste as usual.
+        (or press Enter) to copy it back, then paste as usual. Screenshots
+        and copied images are kept too — the last 25.
       </p>
 
       <label style={{ display: "block", fontSize: 14, marginBottom: 8 }}>
-        <span className="field-label">Keep this many entries</span>
+        <span className="field-label">Keep this many text entries</span>
         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
           <input
             type="number"
@@ -178,8 +180,8 @@ export function ClipboardSection() {
       </div>
 
       <p className="muted small" style={{ marginTop: 12 }}>
-        Clipboard history stays on this PC — it's never sent anywhere. Text
-        only in this version.
+        Clipboard history stays on this PC — text and screenshots are never
+        sent anywhere.
       </p>
     </div>
   );

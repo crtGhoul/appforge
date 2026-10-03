@@ -4,9 +4,9 @@
 <meta charset="utf-8" />
 <title>Clipboard history</title>
 <style>
-  /* Clipboard history popup (v0.9.0). Quiet, launcher-like: one accent,
-     plain labels, everything else gray. Self-contained CSS — this page is
-     bundled separately from the main app (see vite.config.ts). */
+  /* Clipboard history popup (v0.9.1, text + images). Quiet, launcher-like:
+     one accent, plain labels, everything else gray. Self-contained CSS —
+     this page is bundled separately from the main app (see vite.config.ts). */
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
   body {
@@ -66,6 +66,16 @@
     white-space: pre-wrap;
     word-break: break-word;
     line-height: 1.35;
+  }
+  .clip-item img.thumb {
+    display: block;
+    max-width: 200px;
+    max-height: 160px;
+    width: auto;
+    height: auto;
+    border-radius: 6px;
+    border: 1px solid #e0e2e8;
+    background: #f7f8fa;
   }
   .clip-item .meta {
     margin-top: 3px;
