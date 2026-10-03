@@ -16,6 +16,7 @@ mod msi_update;
 mod page_title;
 mod preview;
 mod routines;
+mod session;
 mod store;
 mod syscmd;
 mod websearch;
@@ -508,6 +509,48 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     launcher_settings::set_autostart(&app, &mut settings, enabled)
 }
 
+/// Change what AppMaka does with the previous session at startup (v0.9.5).
+/// JS: `invoke("set_startup_mode", { mode })` — mode is
+/// "restore" | "ask" | "fresh". Returns the updated settings.
+#[tauri::command]
+fn set_startup_mode(app: AppHandle, mode: String) -> Result<LauncherSettings, String> {
+    let mode = match mode.trim().to_lowercase().as_str() {
+        "restore" => launcher_settings::StartupMode::Restore,
+        "ask" => launcher_settings::StartupMode::Ask,
+        "fresh" => launcher_settings::StartupMode::Fresh,
+        _ => return Err("Unknown startup option.".to_string()),
+    };
+    let state = app.state::<Mutex<LauncherSettings>>();
+    let mut settings = state
+        .lock()
+        .map_err(|e| format!("settings state poisoned: {e}"))?;
+    settings.startup_mode = mode;
+    launcher_settings::save(&app, &settings)?;
+    Ok(settings.clone())
+}
+
+/// One-time-per-launch session-restore offer for "Ask me" mode.
+/// Returns the offer once, then None for the rest of the process.
+#[tauri::command]
+fn get_pending_session_restore(app: AppHandle) -> Option<session::SessionRestoreOffer> {
+    session::take_restore_offer(&app)
+}
+
+/// Reopen the saved session now: the launcher "Restore session" button
+/// and the Ask-mode banner. Async on purpose — window creation never runs
+/// on an IPC thread (wry#583), same rule as the open_account command.
+#[tauri::command]
+async fn restore_session(app: AppHandle) -> Result<usize, String> {
+    Ok(session::restore_session_now(&app))
+}
+
+/// Dismiss the Ask-mode offer: forget the saved session.
+#[tauri::command]
+fn dismiss_session_restore(app: AppHandle) -> Result<(), String> {
+    session::clear_session(&app);
+    Ok(())
+}
+
 /// Change the launcher panel translucency. The backend clamps to
 /// 0.3..=1.0; returns the updated settings so the UI paints immediately.
 #[tauri::command]
@@ -622,7 +665,13 @@ fn build_tray(app: &mut tauri::App) -> Result<(), String> {
                     })
                     .ok();
             }
-            "tray-quit" => app.exit(0),
+            "tray-quit" => {
+                // Persist the session explicitly at exit (v0.9.5). Every
+                // open/close already writes it, so this is usually a no-op —
+                // but Quit is the one path where nothing else runs after.
+                session::write_session(app);
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -713,6 +762,10 @@ fn main() {
             app.manage(store);
             app.manage(WindowState::default());
             app.manage(PreviewState::default());
+            // Session restore (v0.9.5): live search-window info for the
+            // session file, plus the one-time "Ask me" offer flag.
+            app.manage(session::SearchLiveState::default());
+            app.manage(session::SessionAskConsumed::default());
             // In-app download manager (v0.7.0): account-window downloads are
             // intercepted natively so the webview session is preserved.
             app.manage(crate::downloads::DownloadState::load(app.handle()).map_err(std::io::Error::other)?);
@@ -808,6 +861,20 @@ fn main() {
                 }
             }
             links::register_link_handler(app.handle());
+            // Session restore (v0.9.5): reopen last run's windows when the
+            // user chose "Restore last session". Delayed so startup finishes
+            // first; window creation happens on this dedicated thread, never
+            // the main or IPC threads (wry#583).
+            {
+                let handle = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("appmaka-session-restore".to_string())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        session::maybe_restore_on_launch(&handle);
+                    })
+                    .map_err(std::io::Error::other)?;
+            }
             Ok(())
         })
         // Closing the main window hides it to the tray; Quit is via the
@@ -868,6 +935,10 @@ fn main() {
             set_hotkey,
             validate_hotkey,
             set_autostart,
+            set_startup_mode,
+            get_pending_session_restore,
+            restore_session,
+            dismiss_session_restore,
             set_panel_opacity,
             launcher_ext::toggle_pin,
             launcher_ext::set_program_hidden,

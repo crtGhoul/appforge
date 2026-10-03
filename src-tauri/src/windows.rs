@@ -28,6 +28,15 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Millisecond clock for `opened_at`: session ordering needs finer grain
+/// than seconds, since a restore can open several windows in one second.
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Window label for an account's main window. The suspend watcher and the
 /// remove commands find windows by this prefix.
 pub fn account_window_label(app_id: &str, account_id: &str) -> String {
@@ -92,6 +101,9 @@ struct TrackedWindow {
     #[allow(dead_code)]
     account_id: String,
     last_active: u64,
+    /// Unix seconds when the window was opened. Session restore (v0.9.5)
+    /// reopens windows in this order; unlike last_active it never moves.
+    opened_at: u64,
     /// Flipped live by update_app_settings so open windows follow the toggle
     /// without a rebuild.
     adblock_enabled: Arc<AtomicBool>,
@@ -142,8 +154,9 @@ fn enforce_account_window_cap(app: &AppHandle, winstate: &WindowState) {
 
 /// Move/resize an already-open window to a tiled placement (v0.9.0).
 /// Best-effort: if the window manager refuses, the window simply stays
-/// where it was.
-fn apply_placement(window: &WebviewWindow, p: WindowPlacement) {
+/// where it was. Also used by session restore (v0.9.5) to re-place a
+/// reused window at its saved geometry.
+pub(crate) fn apply_placement(window: &WebviewWindow, p: WindowPlacement) {
     use tauri::{LogicalPosition, LogicalSize, Position, Size};
     let _ = window.set_position(Position::Logical(LogicalPosition::new(p.x, p.y)));
     let _ = window.set_size(Size::Logical(LogicalSize::new(p.width, p.height)));
@@ -194,6 +207,8 @@ pub fn open_account_placed(
         if let Some(p) = placement {
             apply_placement(&window, p);
         }
+        // Already open: nothing changed, but keep the session file fresh.
+        crate::session::write_session(app);
         return Ok(());
     }
 
@@ -275,6 +290,7 @@ pub fn open_account_placed(
                 app_id: app_id.to_string(),
                 account_id: account_id.to_string(),
                 last_active: unix_secs(),
+                opened_at: unix_millis(),
                 adblock_enabled: adblock_flag.clone(),
                 #[cfg(windows)]
                 base_title: title,
@@ -288,8 +304,28 @@ pub fn open_account_placed(
     let track_app = app.clone();
     let track_label = label.clone();
     window.on_window_event(move |event| {
-        if let WindowEvent::Focused(focused) = event {
-            touch_window(&track_app, &track_label, *focused);
+        match event {
+            WindowEvent::Focused(focused) => {
+                touch_window(&track_app, &track_label, *focused);
+            }
+            WindowEvent::Destroyed => {
+                // Closed via the X button (not through close_tracked_window):
+                // drop the tracked entry so it can't go stale — the watchers
+                // tolerate staleness, but the session must not resurrect a
+                // window the user closed — and persist the session.
+                if let Some(winstate) = track_app.try_state::<WindowState>() {
+                    if let Ok(mut tracked) = winstate.inner.lock() {
+                        tracked.remove(&track_label);
+                    }
+                }
+                crate::session::write_session(&track_app);
+            }
+            // Geometry changes feed the session (v0.9.5), debounced so a
+            // drag doesn't hammer the disk.
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                crate::session::schedule_session_write(&track_app);
+            }
+            _ => {}
         }
     });
 
@@ -297,6 +333,8 @@ pub fn open_account_placed(
     crate::adblock::attach_network_blocking(&window, adblock, adblock_flag);
 
     store.touch_account(app_id, account_id);
+    // A window opened (or re-focused above): persist the session.
+    crate::session::write_session(app);
     Ok(())
 }
 
@@ -804,6 +842,9 @@ fn close_tracked_window(app: &AppHandle, label: &str) {
             tracked.remove(label);
         }
     }
+    // The open set changed: persist the session. (The window's own
+    // Destroyed handler will fire later and rewrite it again — harmless.)
+    crate::session::write_session(app);
     // Windows needs no reaper here: WebView2 tears down a webview's renderer
     // processes when its controller is destroyed, and closing the window
     // destroys the controller (it owns the CoreWebView2), so the OS reclaims
@@ -817,6 +858,32 @@ fn close_tracked_window(app: &AppHandle, label: &str) {
     {
         schedule_network_process_reap(app.clone());
     }
+}
+
+/// Snapshot of tracked account windows that still have a live window, for
+/// session persistence (v0.9.5): (label, app_id, account_id, opened_at).
+/// Cross-checked against live windows so a stale tracked entry (window
+/// closed before its Destroyed handler ran) can never resurrect.
+pub(crate) fn live_tracked_accounts(app: &AppHandle) -> Vec<(String, String, String, u64)> {
+    let Some(winstate) = app.try_state::<WindowState>() else {
+        return Vec::new();
+    };
+    let Ok(tracked) = winstate.inner.lock() else {
+        return Vec::new();
+    };
+    tracked
+        .iter()
+        .filter(|(label, _)| label.starts_with("acct-"))
+        .filter(|(label, _)| app.get_webview_window(label).is_some())
+        .map(|(label, t)| {
+            (
+                label.clone(),
+                t.app_id.clone(),
+                t.account_id.clone(),
+                t.opened_at,
+            )
+        })
+        .collect()
 }
 
 /// Grace period before checking for orphaned network processes: WebKitGTK

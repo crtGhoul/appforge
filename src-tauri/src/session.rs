@@ -1,0 +1,694 @@
+//! Session restore (v0.9.5): persist the open-window set — account windows
+//! and the search window, each with its geometry — so the user's tabs come
+//! back on the next launch.
+//!
+//! `session.json` lives in the app-data dir and is rewritten on every
+//! window open/close, on debounced move/resize, and at app exit. Geometry
+//! is stored in logical pixels (physical ÷ scale factor) and is never
+//! saved while a window is minimized — minimized windows report junk
+//! coordinates, so the last good position is kept instead. A corrupt or
+//! missing file simply means "nothing to restore".
+
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+
+use crate::adblock::AdblockState;
+use crate::launcher_settings::{LauncherSettings, StartupMode};
+use crate::store::AppStore;
+use crate::websearch::SEARCH_WINDOW_LABEL;
+use crate::windows::{self, WindowPlacement, WindowState};
+
+/// Logical-pixel rect of one saved window. None on an entry means "no
+/// known position" (e.g. the window was minimized at every save) and
+/// restores with the default centered placement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One saved window, in open order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SessionWindow {
+    Account {
+        #[serde(rename = "appId", default)]
+        app_id: String,
+        #[serde(rename = "accountId", default)]
+        account_id: String,
+        #[serde(default)]
+        rect: Option<WindowRect>,
+    },
+    Search {
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        rect: Option<WindowRect>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    #[serde(default)]
+    pub windows: Vec<SessionWindow>,
+}
+
+/// Logical-pixel rect of a monitor, for off-screen validation at restore.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogicalMonitor {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Millisecond clock for open-order timestamps (see windows.rs).
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Parse session JSON tolerantly: a corrupt file — or a single corrupt
+/// entry — never takes down the whole restore; bad entries are skipped
+/// and empty ids/queries are dropped.
+pub fn parse_session(raw: &str) -> Session {
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        windows: Vec<serde_json::Value>,
+    }
+    let raw: Raw =
+        serde_json::from_str(raw).unwrap_or(Raw { windows: Vec::new() });
+    let windows = raw
+        .windows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<SessionWindow>(v).ok())
+        .filter(|w| match w {
+            SessionWindow::Account {
+                app_id,
+                account_id,
+                ..
+            } => !app_id.is_empty() && !account_id.is_empty(),
+            SessionWindow::Search { query, .. } => !query.trim().is_empty(),
+        })
+        .collect();
+    Session { windows }
+}
+
+/// Physical pixels → logical rect. None on a bogus scale factor.
+pub fn physical_to_logical_rect(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale: f64,
+) -> Option<WindowRect> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    Some(WindowRect {
+        x: (x as f64 / scale).round() as i32,
+        y: (y as f64 / scale).round() as i32,
+        width: (width as f64 / scale).round().max(1.0) as u32,
+        height: (height as f64 / scale).round().max(1.0) as u32,
+    })
+}
+
+/// True when any part of the rect is visible on any monitor. An empty
+/// monitor list can't validate — trust the rect (fail open; the window
+/// manager places it sanely).
+pub fn rect_visible_on_any(rect: &WindowRect, monitors: &[LogicalMonitor]) -> bool {
+    if monitors.is_empty() {
+        return true;
+    }
+    monitors.iter().any(|m| {
+        let rx2 = rect.x as i64 + rect.width as i64;
+        let ry2 = rect.y as i64 + rect.height as i64;
+        let mx2 = m.x as i64 + m.width as i64;
+        let my2 = m.y as i64 + m.height as i64;
+        (rect.x as i64) < mx2
+            && rx2 > m.x as i64
+            && (rect.y as i64) < my2
+            && ry2 > m.y as i64
+    })
+}
+
+/// Placement for restore: the saved rect when it lands on a live monitor,
+/// otherwise None — the window opens centered instead of off-screen.
+pub fn placement_for_rect(
+    rect: Option<&WindowRect>,
+    monitors: &[LogicalMonitor],
+) -> Option<WindowPlacement> {
+    let r = rect?;
+    if !rect_visible_on_any(r, monitors) {
+        return None;
+    }
+    Some(WindowPlacement {
+        x: r.x as f64,
+        y: r.y as f64,
+        width: r.width as f64,
+        height: r.height as f64,
+    })
+}
+
+/// Merge live geometry with the last saved position: a minimized (or
+/// otherwise unreadable) window keeps its last good rect instead of junk.
+pub fn merge_rect(
+    live: Option<WindowRect>,
+    prev: Option<WindowRect>,
+) -> Option<WindowRect> {
+    live.or(prev)
+}
+
+/// Pure session assembly, sorted by open time. The live-window plumbing
+/// stays in `write_session`; this is the unit-testable core.
+pub fn build_session(
+    accounts: Vec<(String, String, Option<WindowRect>, u64)>,
+    search: Option<(String, Option<WindowRect>, u64)>,
+) -> Session {
+    let mut entries: Vec<(u64, SessionWindow)> = Vec::new();
+    for (app_id, account_id, rect, opened_at) in accounts {
+        entries.push((
+            opened_at,
+            SessionWindow::Account {
+                app_id,
+                account_id,
+                rect,
+            },
+        ));
+    }
+    if let Some((query, rect, opened_at)) = search {
+        entries.push((opened_at, SessionWindow::Search { query, rect }));
+    }
+    entries.sort_by_key(|(ts, _)| *ts);
+    Session {
+        windows: entries.into_iter().map(|(_, w)| w).collect(),
+    }
+}
+
+/// Keep only restorable entries: unknown accounts are skipped silently.
+/// Pure over a caller-supplied predicate so the store lookup stays at the
+/// edge and the rule is unit-testable.
+pub fn partition_restorable<'a>(
+    session: &'a Session,
+    account_exists: &dyn Fn(&str, &str) -> bool,
+) -> Vec<&'a SessionWindow> {
+    session
+        .windows
+        .iter()
+        .filter(|w| match w {
+            SessionWindow::Account {
+                app_id,
+                account_id,
+                ..
+            } => account_exists(app_id, account_id),
+            SessionWindow::Search { .. } => true,
+        })
+        .collect()
+}
+
+fn session_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?
+        .join("session.json"))
+}
+
+/// Load the saved session. Missing or corrupt → empty (nothing to restore).
+pub fn load_session(app: &AppHandle) -> Session {
+    let Ok(path) = session_path(app) else {
+        return Session::default();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Session::default();
+    };
+    parse_session(&raw)
+}
+
+/// Forget the saved session (the Ask-mode "Dismiss" path).
+pub fn clear_session(app: &AppHandle) {
+    if let Ok(path) = session_path(app) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn save_session(app: &AppHandle, session: &Session) {
+    let Ok(path) = session_path(app) else {
+        return;
+    };
+    let Ok(raw) = serde_json::to_string_pretty(session) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    // Atomic like the other JSON stores: crash mid-write can't corrupt it.
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, raw).is_err() {
+        return;
+    }
+    let _ = fs::rename(&tmp, &path);
+}
+
+fn prev_account_rect(session: &Session, app_id: &str, account_id: &str) -> Option<WindowRect> {
+    session.windows.iter().find_map(|w| match w {
+        SessionWindow::Account {
+            app_id: a,
+            account_id: ac,
+            rect,
+        } if a == app_id && ac == account_id => rect.clone(),
+        _ => None,
+    })
+}
+
+fn prev_search_rect(session: &Session) -> Option<WindowRect> {
+    session.windows.iter().find_map(|w| match w {
+        SessionWindow::Search { rect, .. } => rect.clone(),
+        _ => None,
+    })
+}
+
+/// Current logical-pixel rect of a window. None when minimized (minimized
+/// windows report junk coordinates — the caller keeps the last good
+/// position) or when the geometry is unreadable.
+fn live_window_rect(window: &tauri::WebviewWindow) -> Option<WindowRect> {
+    match window.is_minimized() {
+        Ok(false) => {}
+        // Minimized or unknown: fail closed, keep the last good rect.
+        _ => return None,
+    }
+    let scale = window.scale_factor().unwrap_or(0.0);
+    let pos = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    physical_to_logical_rect(pos.x, pos.y, size.width, size.height, scale)
+}
+
+/// Live search-window info for session ordering. Managed as Tauri state;
+/// the window title is the display copy, this is the session copy.
+/// (Public only because it rides in the public `SearchLiveState`; treat
+/// both as session-module internals.)
+#[derive(Debug, Clone)]
+pub struct SearchLive {
+    query: String,
+    opened_at: u64,
+}
+
+/// Managed as Tauri state. Updated on search open/re-navigate, cleared on
+/// close or failed build.
+#[derive(Debug, Default)]
+pub struct SearchLiveState(pub Mutex<Option<SearchLive>>);
+
+/// Record a search-window open (or re-navigation, which keeps the original
+/// open order and only updates the query).
+pub fn note_search_opened(app: &AppHandle, query: &str) {
+    let now = unix_millis();
+    if let Some(state) = app.try_state::<SearchLiveState>() {
+        if let Ok(mut guard) = state.0.lock() {
+            match guard.as_mut() {
+                Some(live) => live.query = query.to_string(),
+                None => {
+                    *guard = Some(SearchLive {
+                        query: query.to_string(),
+                        opened_at: now,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Drop the search-window session entry (close or failed build).
+pub fn note_search_closed(app: &AppHandle) {
+    if let Some(state) = app.try_state::<SearchLiveState>() {
+        if let Ok(mut guard) = state.0.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// Rewrite session.json from the live window set. Called on every
+/// account-window open/close, search-window open/close/navigate, and
+/// debounced move/resize. Cheap: one tiny atomic JSON write.
+pub fn write_session(app: &AppHandle) {
+    let prev = load_session(app);
+    let mut accounts = Vec::new();
+    for (label, app_id, account_id, opened_at) in windows::live_tracked_accounts(app) {
+        let rect = merge_rect(
+            app.get_webview_window(&label)
+                .as_ref()
+                .and_then(live_window_rect),
+            prev_account_rect(&prev, &app_id, &account_id),
+        );
+        accounts.push((app_id, account_id, rect, opened_at));
+    }
+    let search = app
+        .try_state::<SearchLiveState>()
+        .and_then(|s| s.0.lock().ok().and_then(|g| g.clone()))
+        .filter(|live| {
+            !live.query.trim().is_empty()
+                && app.get_webview_window(SEARCH_WINDOW_LABEL).is_some()
+        })
+        .map(|live| {
+            let rect = merge_rect(
+                app.get_webview_window(SEARCH_WINDOW_LABEL)
+                    .as_ref()
+                    .and_then(live_window_rect),
+                prev_search_rect(&prev),
+            );
+            (live.query, rect, live.opened_at)
+        });
+    save_session(app, &build_session(accounts, search));
+}
+
+/// At most one pending debounced write: a move/resize storm collapses into
+/// a single write ~500ms after the first event. The write reads live state,
+/// so it always captures the final position.
+static WRITE_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub fn schedule_session_write(app: &AppHandle) {
+    if WRITE_PENDING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        WRITE_PENDING.store(false, Ordering::SeqCst);
+        write_session(&app);
+    });
+}
+
+fn logical_monitors(app: &AppHandle) -> Vec<LogicalMonitor> {
+    app.available_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            let scale = m.scale_factor();
+            if !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            let size = m.size();
+            let pos = m.position();
+            Some(LogicalMonitor {
+                x: (pos.x as f64 / scale).round() as i32,
+                y: (pos.y as f64 / scale).round() as i32,
+                width: (size.width as f64 / scale).round().max(1.0) as u32,
+                height: (size.height as f64 / scale).round().max(1.0) as u32,
+            })
+        })
+        .collect()
+}
+
+/// Reopen every saved window in open order, each at its saved geometry
+/// (validated against the current monitors; off-screen falls back to the
+/// default centered placement). Best-effort: unknown accounts are skipped
+/// silently and one window's failure never stops the rest. Returns how
+/// many windows were (re)opened.
+pub fn restore_session_now(app: &AppHandle) -> usize {
+    let session = load_session(app);
+    if session.windows.is_empty() {
+        return 0;
+    }
+    let (Some(store), Some(adblock), Some(winstate)) = (
+        app.try_state::<AppStore>(),
+        app.try_state::<AdblockState>(),
+        app.try_state::<WindowState>(),
+    ) else {
+        return 0;
+    };
+    let account_exists = |app_id: &str, account_id: &str| {
+        store
+            .get(app_id)
+            .map(|a| a.accounts.iter().any(|ac| ac.id == account_id))
+            .unwrap_or(false)
+    };
+    let monitors = logical_monitors(app);
+    let mut opened = 0;
+    for w in partition_restorable(&session, &account_exists) {
+        let ok = match w {
+            SessionWindow::Account {
+                app_id,
+                account_id,
+                rect,
+            } => {
+                let placement = placement_for_rect(rect.as_ref(), &monitors);
+                windows::open_account_placed(
+                    app, &store, &adblock, &winstate, app_id, account_id, placement,
+                )
+                .is_ok()
+            }
+            SessionWindow::Search { query, rect } => {
+                let placement = placement_for_rect(rect.as_ref(), &monitors);
+                crate::websearch::open_search_window_placed(app, &adblock, query, placement)
+                    .is_ok()
+            }
+        };
+        if ok {
+            opened += 1;
+        }
+    }
+    opened
+}
+
+/// Restore on launch when the user chose "Restore last session".
+/// Best-effort and silent: startup never waits on it and never fails on it.
+pub fn maybe_restore_on_launch(app: &AppHandle) {
+    let restore = app
+        .try_state::<Mutex<LauncherSettings>>()
+        .and_then(|s| s.lock().ok().map(|s| s.startup_mode == StartupMode::Restore))
+        .unwrap_or(false);
+    if restore {
+        let n = restore_session_now(app);
+        if n > 0 {
+            eprintln!("[appmaka] restored {n} window(s) from last session");
+        }
+    }
+}
+
+/// One-time-per-process flag for the "Ask me" offer.
+#[derive(Debug, Default)]
+pub struct SessionAskConsumed(pub AtomicBool);
+
+/// The Ask-mode offer shown on the launcher: how many windows, a few
+/// human-readable names, whether a search is among them. One-time per
+/// process — returns None once consumed, when the mode isn't Ask, or
+/// when the saved session is empty.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRestoreOffer {
+    pub window_count: usize,
+    pub names: Vec<String>,
+    pub has_search: bool,
+}
+
+pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
+    let consumed = app.try_state::<SessionAskConsumed>()?;
+    if consumed.0.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let ask = app
+        .try_state::<Mutex<LauncherSettings>>()
+        .and_then(|s| s.lock().ok().map(|s| s.startup_mode == StartupMode::Ask))
+        .unwrap_or(false);
+    if !ask {
+        return None;
+    }
+    let session = load_session(app);
+    if session.windows.is_empty() {
+        return None;
+    }
+    let store = app.try_state::<AppStore>();
+    let mut names = Vec::new();
+    let mut has_search = false;
+    for w in &session.windows {
+        if names.len() >= 5 {
+            break;
+        }
+        match w {
+            SessionWindow::Account { app_id, account_id, .. } => {
+                let name = store
+                    .as_deref()
+                    .and_then(|s| s.get(app_id).ok())
+                    .and_then(|a| {
+                        a.accounts
+                            .iter()
+                            .find(|ac| ac.id == *account_id)
+                            .map(|ac| format!("{} — {}", a.name, ac.label))
+                    })
+                    .unwrap_or_else(|| "An account".to_string());
+                names.push(name);
+            }
+            SessionWindow::Search { query, .. } => {
+                has_search = true;
+                let short: String = query.chars().take(32).collect();
+                names.push(format!("Search: \"{short}\""));
+            }
+        }
+    }
+    Some(SessionRestoreOffer {
+        window_count: session.windows.len(),
+        names,
+        has_search,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> Option<WindowRect> {
+        Some(WindowRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        })
+    }
+
+    #[test]
+    fn session_round_trips() {
+        let session = build_session(
+            vec![
+                ("app1".into(), "acc1".into(), rect(10, 20, 800, 600), 100),
+                ("app2".into(), "acc2".into(), None, 50),
+            ],
+            Some(("hello".into(), rect(0, 0, 1200, 800), 75)),
+        );
+        // Sorted by open time regardless of input order.
+        assert_eq!(session.windows.len(), 3);
+        let raw = serde_json::to_string(&session).unwrap();
+        // camelCase keys on the wire.
+        assert!(raw.contains("\"appId\""));
+        assert!(raw.contains("\"accountId\""));
+        let back = parse_session(&raw);
+        assert_eq!(back, session);
+    }
+
+    #[test]
+    fn corrupt_file_yields_empty_session() {
+        assert_eq!(parse_session(""), Session::default());
+        assert_eq!(parse_session("{oops"), Session::default());
+        assert_eq!(parse_session("null"), Session::default());
+    }
+
+    #[test]
+    fn bad_entries_are_skipped_not_fatal() {
+        let raw = r#"{"windows":[
+            {"kind":"account","appId":"a","accountId":"b","rect":{"x":1,"y":2,"width":3,"height":4}},
+            {"kind":"bogus","x":1},
+            {"kind":"account","appId":"","accountId":"b"},
+            {"kind":"search","query":"   "},
+            {"kind":"search","query":"ok"}
+        ]}"#;
+        let s = parse_session(raw);
+        assert_eq!(s.windows.len(), 2);
+    }
+
+    #[test]
+    fn physical_to_logical_scale_conversion() {
+        assert_eq!(
+            physical_to_logical_rect(0, 0, 3840, 2160, 2.0),
+            rect(0, 0, 1920, 1080)
+        );
+        assert_eq!(
+            physical_to_logical_rect(100, 100, 1250, 800, 1.25),
+            rect(80, 80, 1000, 640)
+        );
+        assert_eq!(physical_to_logical_rect(0, 0, 100, 100, 0.0), None);
+        assert_eq!(physical_to_logical_rect(0, 0, 100, 100, -1.0), None);
+        assert_eq!(
+            physical_to_logical_rect(0, 0, 100, 100, f64::NAN),
+            None
+        );
+    }
+
+    #[test]
+    fn off_screen_rect_is_not_visible() {
+        let monitors = vec![LogicalMonitor {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        // On-screen.
+        assert!(rect_visible_on_any(
+            &rect(100, 100, 800, 600).unwrap(),
+            &monitors
+        ));
+        // Partially overlapping still counts (a sliver is visible).
+        assert!(rect_visible_on_any(
+            &rect(1800, 900, 800, 600).unwrap(),
+            &monitors
+        ));
+        // Fully off-screen (monitor unplugged since last run).
+        assert!(!rect_visible_on_any(
+            &rect(3000, 100, 800, 600).unwrap(),
+            &monitors
+        ));
+        assert!(!rect_visible_on_any(
+            &rect(-1000, -1000, 800, 600).unwrap(),
+            &monitors
+        ));
+        // Can't validate → trust it.
+        assert!(rect_visible_on_any(
+            &rect(3000, 100, 800, 600).unwrap(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn placement_falls_back_centered_off_screen() {
+        let monitors = vec![LogicalMonitor {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        assert!(placement_for_rect(None, &monitors).is_none());
+        assert!(placement_for_rect(rect(3000, 100, 800, 600).as_ref(), &monitors).is_none());
+        let p = placement_for_rect(rect(100, 100, 800, 600).as_ref(), &monitors).unwrap();
+        assert_eq!((p.x, p.y, p.width, p.height), (100.0, 100.0, 800.0, 600.0));
+    }
+
+    #[test]
+    fn minimized_window_keeps_last_good_rect() {
+        let good = rect(10, 20, 800, 600);
+        // Minimized (live unreadable) → keep the saved position.
+        assert_eq!(merge_rect(None, good.clone()), good);
+        // Fresh live rect wins.
+        assert_eq!(merge_rect(rect(1, 2, 3, 4), good.clone()), rect(1, 2, 3, 4));
+        // Nothing known → default placement.
+        assert_eq!(merge_rect(None, None), None);
+    }
+
+    #[test]
+    fn unknown_accounts_are_skipped_silently() {
+        let session = build_session(
+            vec![
+                ("app1".into(), "gone".into(), None, 1),
+                ("app1".into(), "here".into(), None, 2),
+            ],
+            Some(("q".into(), None, 3)),
+        );
+        let exists = |app_id: &str, account_id: &str| app_id == "app1" && account_id == "here";
+        let kept = partition_restorable(&session, &exists);
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(kept[0], SessionWindow::Account { account_id, .. } if account_id == "here"));
+        assert!(matches!(kept[1], SessionWindow::Search { .. }));
+    }
+}

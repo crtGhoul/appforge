@@ -506,6 +506,9 @@ export function LauncherSettingsPanel({
   const [searchEngine, setSearchEngine] = useState<"duckduckgo" | "google">(
     settings.search_engine ?? "duckduckgo"
   );
+  const [startupMode, setStartupMode] = useState<"restore" | "ask" | "fresh">(
+    settings.startup_mode ?? "restore"
+  );
   const [opacity, setOpacity] = useState(
     Math.round((settings.panel_opacity ?? 0.55) * 100)
   );
@@ -578,6 +581,23 @@ export function LauncherSettingsPanel({
       const msg = errMsg(err);
       setFormError(msg);
       onError(msg);
+    }
+  }
+
+  async function handleStartupMode(mode: "restore" | "ask" | "fresh") {
+    if (mode === startupMode) return;
+    setStartupMode(mode);
+    setFormError(null);
+    try {
+      const updated = await invoke<LauncherSettings>("set_startup_mode", {
+        mode,
+      });
+      onSaved(updated);
+    } catch (err) {
+      const msg = errMsg(err);
+      setFormError(msg);
+      onError(msg);
+      setStartupMode(settings.startup_mode ?? "restore");
     }
   }
 
@@ -679,6 +699,42 @@ export function LauncherSettingsPanel({
         />
         <span>Run AppMaka when I sign in</span>
       </label>
+
+      <fieldset className="radio-group">
+        <legend>On startup</legend>
+        <label className="radio-row">
+          <input
+            type="radio"
+            name="startup-mode"
+            checked={startupMode === "restore"}
+            onChange={() => void handleStartupMode("restore")}
+          />
+          <span>Restore last session</span>
+        </label>
+        <label className="radio-row">
+          <input
+            type="radio"
+            name="startup-mode"
+            checked={startupMode === "ask"}
+            onChange={() => void handleStartupMode("ask")}
+          />
+          <span>Ask me</span>
+        </label>
+        <label className="radio-row">
+          <input
+            type="radio"
+            name="startup-mode"
+            checked={startupMode === "fresh"}
+            onChange={() => void handleStartupMode("fresh")}
+          />
+          <span>Start fresh</span>
+        </label>
+      </fieldset>
+      <span className="help">
+        Restored windows are real windows and use memory like any open
+        window. Your auto-suspend and auto-close settings still apply to
+        them.
+      </span>
 
       <label className="inline-form">
         <span>Web search for launcher commands</span>

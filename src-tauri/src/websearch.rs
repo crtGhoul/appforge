@@ -21,7 +21,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use crate::adblock::AdblockState;
 use crate::launcher_settings::LauncherSettings;
-use crate::windows::{cosmetic_init_script, NAV_KEYS_JS, TARGET_BLANK_SHIM_JS};
+use crate::windows::{apply_placement, cosmetic_init_script, NAV_KEYS_JS, TARGET_BLANK_SHIM_JS, WindowPlacement};
 
 /// Fixed label: one search window at a time; a second search reuses it.
 pub const SEARCH_WINDOW_LABEL: &str = "websearch";
@@ -56,10 +56,22 @@ fn search_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Sync helper: window *creation* always happens on a dedicated spawned
 /// thread (wry#583 — never build on an IPC thread or the main thread);
 /// focusing/navigating an existing window is a quick op and safe inline.
+///
+/// `placement` (v0.9.5) restores saved geometry: a reused window is moved
+/// there, a new one is built there so there is no visible jump.
 pub fn open_search_window(
     app: &AppHandle,
     adblock: &AdblockState,
     query: &str,
+) -> Result<(), String> {
+    open_search_window_placed(app, adblock, query, None)
+}
+
+pub fn open_search_window_placed(
+    app: &AppHandle,
+    adblock: &AdblockState,
+    query: &str,
+    placement: Option<WindowPlacement>,
 ) -> Result<(), String> {
     let query = query.trim();
     if query.is_empty() {
@@ -73,6 +85,9 @@ pub fn open_search_window(
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        if let Some(p) = placement {
+            apply_placement(&window, p);
+        }
         let js = format!(
             "window.location.href={};",
             serde_json::to_string(page_url.as_str()).unwrap_or_default()
@@ -81,6 +96,10 @@ pub fn open_search_window(
             .eval(&js)
             .map_err(|e| format!("Couldn't open the search: {e}"))?;
         let _ = window.set_title(query);
+        // Re-navigation keeps the original open order; only the query text
+        // changes in the session.
+        crate::session::note_search_opened(app, query);
+        crate::session::write_session(app);
         return Ok(());
     }
 
@@ -90,7 +109,9 @@ pub fn open_search_window(
     let data_dir = search_data_dir(app)?;
     let _ = std::thread::Builder::new()
         .name("appmaka-websearch".to_string())
-        .spawn(move || build_search_window(&window_app, &adblock, &page_url, &title, &data_dir));
+        .spawn(move || {
+            build_search_window(&window_app, &adblock, &page_url, &title, &data_dir, placement)
+        });
     Ok(())
 }
 
@@ -118,12 +139,20 @@ fn build_search_window(
     url: &url::Url,
     title: &str,
     data_dir: &Path,
+    placement: Option<WindowPlacement>,
 ) {
     let mut builder = WebviewWindowBuilder::new(app, SEARCH_WINDOW_LABEL, WebviewUrl::External(url.clone()))
         .data_directory(data_dir.to_path_buf())
-        .title(title)
-        .inner_size(1200.0, 800.0)
-        .center()
+        .title(title);
+    // v0.9.5: session restore builds the window at its saved geometry so
+    // there is no visible jump; normal opens keep the classic centered
+    // 1200x800.
+    if let Some(p) = placement {
+        builder = builder.position(p.x, p.y).inner_size(p.width, p.height);
+    } else {
+        builder = builder.inner_size(1200.0, 800.0).center();
+    }
+    let mut builder = builder
         // A search page's popups stay dead: same posture as OAuth modals.
         .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         // Downloads from a search page stay in-app (v0.7.0 manager) instead
@@ -145,27 +174,47 @@ fn build_search_window(
         Ok(window) => {
             #[cfg(windows)]
             crate::adblock::attach_network_blocking(&window, adblock, adblock_flag);
+            // The window truly exists now: record it for the session and
+            // persist (v0.9.5).
+            crate::session::note_search_opened(app, title);
+            crate::session::write_session(app);
             // No saved profile: wipe the search data dir when the window
             // closes. Delayed + guarded — a fast reopen recreates the dir,
             // and the guard skips the wipe while a search window is alive.
             let wipe_app = app.clone();
             let wipe_dir = data_dir.to_path_buf();
             window.on_window_event(move |event| {
-                if matches!(event, WindowEvent::Destroyed) {
-                    // Cloned per event: the handler is Fn, called for every
-                    // window event, so nothing may move out of it.
-                    let wipe_app = wipe_app.clone();
-                    let wipe_dir = wipe_dir.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(5));
-                        if wipe_app.get_webview_window(SEARCH_WINDOW_LABEL).is_none() {
-                            let _ = std::fs::remove_dir_all(&wipe_dir);
-                        }
-                    });
+                match event {
+                    WindowEvent::Destroyed => {
+                        // Session first: the entry must go even though the
+                        // data-dir wipe below is delayed.
+                        crate::session::note_search_closed(&wipe_app);
+                        crate::session::write_session(&wipe_app);
+                        // Cloned per event: the handler is Fn, called for every
+                        // window event, so nothing may move out of it.
+                        let wipe_app = wipe_app.clone();
+                        let wipe_dir = wipe_dir.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(5));
+                            if wipe_app.get_webview_window(SEARCH_WINDOW_LABEL).is_none() {
+                                let _ = std::fs::remove_dir_all(&wipe_dir);
+                            }
+                        });
+                    }
+                    // Geometry changes feed the session, debounced.
+                    WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                        crate::session::schedule_session_write(&wipe_app);
+                    }
+                    _ => {}
                 }
             });
         }
-        Err(e) => eprintln!("[appmaka] websearch window failed: {e}"),
+        Err(e) => {
+            // The session entry was never written (write happens on Ok),
+            // but make sure no stale open-record lingers.
+            crate::session::note_search_closed(app);
+            eprintln!("[appmaka] websearch window failed: {e}");
+        }
     }
 }
 

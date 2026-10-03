@@ -122,6 +122,18 @@ export interface LauncherSettings {
    * list is non-empty.
    */
   hidden_section_collapsed: boolean | null;
+  /**
+   * What to do with the previous session at startup (v0.9.5).
+   * Backend always sends it (serde default): "restore" | "ask" | "fresh".
+   */
+  startup_mode: "restore" | "ask" | "fresh";
+}
+
+/** One-time session-restore offer for "Ask me" mode (v0.9.5). */
+export interface SessionRestoreOffer {
+  windowCount: number;
+  names: string[];
+  hasSearch: boolean;
 }
 
 /**

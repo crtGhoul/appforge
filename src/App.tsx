@@ -55,6 +55,7 @@ import type {
   PreviewAddOutcome,
   PreviewStart,
   Routine,
+  SessionRestoreOffer,
   WebApp,
 } from "./types";
 
@@ -1882,6 +1883,59 @@ export default function App() {
   // (the React tree stays mounted while the window just hides/shows).
   const [summonCount, setSummonCount] = useState(0);
 
+  // v0.9.5: "Ask me" session-restore offer — one-time per launch, enforced
+  // by the backend, so it's safe to ask on mount and on every summon.
+  const [restoreOffer, setRestoreOffer] = useState<SessionRestoreOffer | null>(
+    null
+  );
+  const [restoring, setRestoring] = useState(false);
+
+  async function checkRestoreOffer() {
+    try {
+      const offer = await invoke<SessionRestoreOffer | null>(
+        "get_pending_session_restore"
+      );
+      if (offer) setRestoreOffer(offer);
+    } catch {
+      /* older backend without the command; no banner */
+    }
+  }
+
+  async function handleRestoreSession() {
+    if (restoring) return;
+    setRestoring(true);
+    setRestoreOffer(null);
+    try {
+      const n = await invoke<number>("restore_session");
+      if (n === 0) setNotice("Nothing saved from last time.");
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setRestoring(false);
+    }
+  }
+
+  async function handleDismissRestore() {
+    setRestoreOffer(null);
+    try {
+      await invoke("dismiss_session_restore");
+    } catch {
+      /* already hidden locally */
+    }
+  }
+
+  useEffect(() => {
+    void checkRestoreOffer();
+    let off: (() => void) | undefined;
+    listen("appmaka:show-launcher", () => void checkRestoreOffer())
+      .then((f) => {
+        off = f;
+      })
+      .catch(() => {});
+    return () => off?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Add-app form
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
@@ -2634,6 +2688,40 @@ export default function App() {
             onKeyDown={onSearchKeyDown}
             inputRef={searchRef}
           />
+          {restoreOffer && (
+            <div className="banner banner-info restore-offer" role="status">
+              <span>
+                Restore {restoreOffer.windowCount}{" "}
+                {restoreOffer.windowCount === 1 ? "window" : "windows"} from
+                last time?
+              </span>
+              {restoreOffer.names.length > 0 && (
+                <span className="muted small">
+                  {" "}
+                  {restoreOffer.names.join(", ")}
+                  {restoreOffer.windowCount > restoreOffer.names.length
+                    ? ", …"
+                    : ""}
+                </span>
+              )}
+              <span className="restore-offer-actions">
+                <button
+                  type="button"
+                  onClick={() => void handleRestoreSession()}
+                  disabled={restoring}
+                >
+                  {restoring ? "Restoring…" : "Restore"}
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => void handleDismissRestore()}
+                >
+                  Dismiss
+                </button>
+              </span>
+            </div>
+          )}
           {workspaceList && workspaceList.workspaces.length > 0 && (
             <div
               className="workspace-chips"
@@ -2735,6 +2823,14 @@ export default function App() {
               Manage apps →
             </button>
             <span className="launcher-foot-actions">
+              <button
+                type="button"
+                className="text-button"
+                title="Reopen windows from your last session"
+                onClick={() => void handleRestoreSession()}
+              >
+                Restore session
+              </button>
               <AddProgramButton
                 onAdded={() =>
                   invoke<NativeProgram[]>("list_programs")

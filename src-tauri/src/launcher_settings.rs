@@ -61,6 +61,20 @@ pub enum MonitorMode {
     Primary,
 }
 
+/// What AppMaka does with the previous session at startup (v0.9.5):
+/// the open account windows + search window saved to session.json.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupMode {
+    /// Reopen last session's windows automatically (default).
+    #[default]
+    Restore,
+    /// Ask once on the first launcher summon.
+    Ask,
+    /// Start with no windows.
+    Fresh,
+}
+
 /// Cap on tracked usage entries; the least recently used entries are
 /// evicted first so the map can never grow unbounded.
 pub const MAX_USAGE_ENTRIES: usize = 500;
@@ -114,6 +128,10 @@ pub struct LauncherSettings {
     /// is non-empty. Old files migrate to None.
     #[serde(default)]
     pub hidden_section_collapsed: Option<bool>,
+    /// What to do with the previous session at startup (v0.9.5).
+    /// Old files migrate to Restore.
+    #[serde(default)]
+    pub startup_mode: StartupMode,
 }
 
 fn default_search_engine() -> String {
@@ -134,6 +152,7 @@ impl Default for LauncherSettings {
             auto_update_check: true,
             search_engine: default_search_engine(),
             hidden_section_collapsed: None,
+            startup_mode: StartupMode::default(),
         }
     }
 }
@@ -381,5 +400,33 @@ mod tests {
         s.toggle_pin("app:abc");
         s.toggle_pin("search:x");
         assert_eq!(s.pinned.len(), 2);
+    }
+
+    #[test]
+    fn startup_mode_defaults_to_restore() {
+        // Old files without the field migrate to Restore (the default).
+        let s: LauncherSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.startup_mode, StartupMode::Restore);
+        assert_eq!(LauncherSettings::default().startup_mode, StartupMode::Restore);
+    }
+
+    #[test]
+    fn startup_mode_parses_all_values() {
+        for (raw, expected) in [
+            ("restore", StartupMode::Restore),
+            ("ask", StartupMode::Ask),
+            ("fresh", StartupMode::Fresh),
+        ] {
+            let s: LauncherSettings =
+                serde_json::from_str(&format!(r#"{{"startup_mode":"{raw}"}}"#)).unwrap();
+            assert_eq!(s.startup_mode, expected);
+        }
+        // Serializes back lowercase for the frontend.
+        let s = LauncherSettings {
+            startup_mode: StartupMode::Ask,
+            ..LauncherSettings::default()
+        };
+        let raw = serde_json::to_string(&s).unwrap();
+        assert!(raw.contains("\"startup_mode\":\"ask\""));
     }
 }

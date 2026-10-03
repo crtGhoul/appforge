@@ -60,6 +60,23 @@
   color: #2f3180;
 }
 
+/* v0.9.5: one-time session-restore offer on the launcher. Quiet row:
+   the question, an optional name list, and two small actions. */
+.restore-offer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 16px 0;
+}
+
+.restore-offer-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
 .add-form {
   display: flex;
   gap: 12px;
