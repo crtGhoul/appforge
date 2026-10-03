@@ -838,7 +838,9 @@ fn main() {
             windows::list_open_account_windows,
             windows::memory_snapshot,
             windows::forget_login,
-            // v0.7.0: floating back/forward toolbar for account windows
+            // v0.7.0: back/forward navigation command (the visible floating
+            // toolbar was removed in v0.8.4; Alt+Left/Right drive history
+            // in-page, and this command stays registered for compatibility)
             windows::account_nav,
             // v0.7.0: link dispatcher
             links::get_link_config,

@@ -34,121 +34,13 @@ pub fn account_window_label(app_id: &str, account_id: &str) -> String {
     format!("acct-{app_id}-{account_id}")
 }
 
-/// Window label for an account's floating back/forward toolbar.
-fn nav_toolbar_label(app_id: &str, account_id: &str) -> String {
-    format!("nav-{app_id}-{account_id}")
-}
-
-/// Offset of the toolbar pill from the account window's webview area
-/// (physical px). It floats over the page's top-left corner — clearly
-/// AppMaka chrome, out of the way of most site layouts.
-const NAV_TOOLBAR_OFFSET: (i32, i32) = (12, 12);
-
-/// Open the floating back/forward toolbar for an account window.
-///
-/// Account windows are bare webviews with no browser chrome; this tiny
-/// first-party window is the visible navigation. It is `focusable(false)`
-/// so clicks never steal keyboard focus from the page, `always_on_top` so
-/// it stays with its window, and `skip_taskbar` so it never clutters the
-/// taskbar. Its frontend is the same bundle with `?toolbar=1` (see
-/// `NavToolbar`); it talks to the backend through the normal invoke API,
-/// which is fine because this window is ours — site windows never get IPC.
-fn open_nav_toolbar(
-    app: &AppHandle,
-    app_id: &str,
-    account_id: &str,
-    anchor: &WebviewWindow,
-) {
-    let nav_label = nav_toolbar_label(app_id, account_id);
-    if app.get_webview_window(&nav_label).is_some() {
-        return;
-    }
-    // IDs are backend-generated (`prefix-<millis>-<n>`), so they are
-    // URL-safe without encoding.
-    let url = format!("index.html?toolbar=1&appId={app_id}&accountId={account_id}");
-    let built = WebviewWindowBuilder::new(app, &nav_label, WebviewUrl::App(url.into()))
-        .title("Navigation")
-        .inner_size(112.0, 48.0)
-        // NOTE: no `.resizable(false)` here on purpose. Marking the window
-        // non-resizable makes the toolkit pin min/max size to whatever size
-        // the window happens to have when the hint is processed — which was
-        // the 200x200 fallback, permanently clamping every later set_size.
-        // The pill is undecorated; there is nothing to grab anyway.
-        .maximizable(false)
-        .minimizable(false)
-        .decorations(false)
-        .transparent(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focusable(false)
-        .build();
-    match built {
-        Ok(toolbar) => {
-            // Enforce the pill size explicitly: the inner_size hint alone
-            // is not honored on all platforms (seen: 200x200 on Linux
-            // without a window manager). This must run after the window is
-            // mapped — a synchronous set_size right here is silently
-            // dropped — so it goes on a short-lived thread. 112x48 is a
-            // small always-on-top pill, not a real window.
-            let size_toolbar = toolbar.clone();
-            std::thread::Builder::new()
-                .name("appmaka-nav-size".to_string())
-                .spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-                    let _ = size_toolbar.set_size(tauri::Size::Logical(tauri::LogicalSize {
-                        width: 112.0,
-                        height: 48.0,
-                    }));
-                })
-                .ok();
-            // Anchor to the webview area (not the outer frame): no guessing
-            // at title-bar heights on either platform.
-            if let Ok(pos) = anchor.inner_position() {
-                let _ = toolbar.set_position(tauri::Position::Physical(
-                    tauri::PhysicalPosition {
-                        x: pos.x + NAV_TOOLBAR_OFFSET.0,
-                        y: pos.y + NAV_TOOLBAR_OFFSET.1,
-                    },
-                ));
-            }
-        }
-        Err(e) => {
-            // The toolbar is a convenience; the account window and its
-            // Alt+Left/Right keys work fine without it.
-            eprintln!("[appmaka] nav toolbar: could not open: {e}");
-        }
-    }
-}
-
-/// Re-anchor the toolbar after its account window moved or resized.
-fn reposition_nav_toolbar(app: &AppHandle, app_id: &str, account_id: &str) {
-    let (Some(anchor), Some(toolbar)) = (
-        app.get_webview_window(&account_window_label(app_id, account_id)),
-        app.get_webview_window(&nav_toolbar_label(app_id, account_id)),
-    ) else {
-        return;
-    };
-    if let Ok(pos) = anchor.inner_position() {
-        let _ = toolbar.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-            x: pos.x + NAV_TOOLBAR_OFFSET.0,
-            y: pos.y + NAV_TOOLBAR_OFFSET.1,
-        }));
-    }
-}
-
-/// Close an account's toolbar. Called from every account-window close path.
-fn close_nav_toolbar(app: &AppHandle, app_id: &str, account_id: &str) {
-    if let Some(toolbar) = app.get_webview_window(&nav_toolbar_label(app_id, account_id)) {
-        let _ = toolbar.close();
-    }
-}
-
 /// Navigate an open account window back/forward in its history.
 ///
-/// Called from the floating nav toolbar (a first-party window, so IPC is
-/// fine — site windows never get this). Async on purpose: never block an
-/// IPC thread on webview work (same Windows deadlock rule as window
-/// creation). JS: `invoke("account_nav", { appId, accountId, direction })`
+/// Kept as a public command for compatibility (the visible floating toolbar
+/// was removed in v0.8.4; Alt+Left / Alt+Right drive history directly in the
+/// page). Async on purpose: never block an IPC thread on webview work
+/// (same Windows deadlock rule as window creation).
+/// JS: `invoke("account_nav", { appId, accountId, direction })`
 /// where direction is `"back"` or `"forward"`.
 #[tauri::command]
 pub async fn account_nav(
@@ -252,8 +144,6 @@ pub fn open_account(
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
-        // Self-healing: if the toolbar died without its window, bring it back.
-        open_nav_toolbar(app, app_id, account_id, &window);
         return Ok(());
     }
 
@@ -337,29 +227,14 @@ pub fn open_account(
     }
 
     // Focus in/out feeds the suspend watcher; focus also resumes a suspended
-    // webview on Windows. The floating nav toolbar follows its account
-    // window on move/resize and dies with it.
+    // webview on Windows.
     let track_app = app.clone();
     let track_label = label.clone();
-    let nav_app_id = app_id.to_string();
-    let nav_account_id = account_id.to_string();
-    let follow_app = app.clone();
     window.on_window_event(move |event| {
-        match event {
-            WindowEvent::Focused(focused) => touch_window(&track_app, &track_label, *focused),
-            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
-                reposition_nav_toolbar(&follow_app, &nav_app_id, &nav_account_id);
-            }
-            WindowEvent::CloseRequested { .. } => {
-                close_nav_toolbar(&follow_app, &nav_app_id, &nav_account_id);
-            }
-            _ => {}
+        if let WindowEvent::Focused(focused) = event {
+            touch_window(&track_app, &track_label, *focused);
         }
     });
-
-    // Floating back/forward toolbar (v0.7.0): bare webviews have no browser
-    // chrome. Best-effort — the window and Alt+Left/Right work without it.
-    open_nav_toolbar(app, app_id, account_id, &window);
 
     #[cfg(windows)]
     crate::adblock::attach_network_blocking(&window, adblock, adblock_flag);
@@ -866,13 +741,6 @@ fn try_suspend_webview(window: &WebviewWindow) -> bool {
 fn close_tracked_window(app: &AppHandle, label: &str) {
     if let Some(window) = app.get_webview_window(label) {
         let _ = window.close();
-    }
-    // The floating nav toolbar dies with its account window.
-    if let Some(rest) = label.strip_prefix("acct-") {
-        let nav_label = format!("nav-{rest}");
-        if let Some(toolbar) = app.get_webview_window(&nav_label) {
-            let _ = toolbar.close();
-        }
     }
     if let Some(winstate) = app.try_state::<WindowState>() {
         if let Ok(mut tracked) = winstate.inner.lock() {
