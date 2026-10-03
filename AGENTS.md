@@ -49,6 +49,40 @@ The laziest correct solution wins: write only what the task needs.
    handling, security, accessibility, and tests are never on the chopping
    block. The repo's test bar stands; this filter does not lower it.
 
+## Win32 / FFI rules (v0.9.7 crash-loop post-mortem — binding)
+
+v0.9.6 aborted on the FIRST page-window open, deterministically: a
+`RefCell::borrow_mut()` held across `CreateWindowExW`, which synchronously
+re-enters the window proc (`WM_WINDOWPOSCHANGED`), panicking on the
+re-entrant borrow — and the proc had no `catch_unwind`, so the panic
+unwound across `extern "system"` and killed the process. Session restore
+(default ON) re-armed it every launch: crash loop. 109 unit tests and a
+green Windows-target check never saw it; re-entrancy is a runtime
+property of Win32, invisible in review.
+
+1. **Every `extern "system"` function (window procs AND hook procs) MUST be
+   wrapped in `std::panic::catch_unwind`.** A panic across the FFI boundary
+   aborts the process instantly — no dialog, no log, no recovery. No
+   exceptions, no "it can't panic". This is the cheapest insurance in
+   Win32/Rust and the backstop for everything below.
+2. **Win32 calls are re-entrant: NEVER hold a `RefCell`/`Mutex` borrow
+   across them.** `CreateWindowExW`, `SetWindowPos`, `SendMessageW`,
+   `ShowWindow`, and `DestroyWindow` synchronously deliver messages to
+   your own proc (and moving an owner window echoes through its owned
+   windows). Decide under a SHORT borrow, RELEASE it, then make the call
+   (two-phase); re-acquire after to record results. `try_borrow()` (skip
+   on contention), never `borrow()`, on any path a re-entrant proc can
+   reach. Audit every `with_chrome`-style borrow site for a Win32 call
+   inside it — including owner-window moves, which re-enter through the
+   owned strip.
+3. **Native UI construction is infallible by contract.** Any Win32
+   chrome/hook failure degrades to fewer decorations (plain frameless
+   window), never to a dead process. Startup must always reach a usable
+   launcher no matter what failed before it: per-window `catch_unwind`
+   during restore, staggered opens, failures logged to app-data
+   (`caption-errors.log` — `eprintln!` is invisible on Windows GUI
+   builds), never propagated.
+
 ## Hard constraints (never overridden by this file)
 
 - License is PolyForm Noncommercial 1.0.0: source-available, commercial use

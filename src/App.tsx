@@ -2721,6 +2721,13 @@ export default function App() {
                 {restoreOffer.windowCount === 1 ? "window" : "windows"} from
                 last time?
               </span>
+              {!!restoreOffer.staleRestore && (
+                <span className="muted small">
+                  {" "}
+                  The app closed while reopening windows last time, so it
+                  didn't try again.
+                </span>
+              )}
               {restoreOffer.names.length > 0 && (
                 <span className="muted small">
                   {" "}

@@ -243,6 +243,90 @@ pub fn clear_session(app: &AppHandle) {
     }
 }
 
+// ------------------------------------------------------------------
+// Crash-loop sentinel (v0.9.7).
+//
+// Session restore auto-opens windows at launch; if the process dies in
+// the restore window (the v0.9.6 crash loop), the next launch must NOT
+// blindly restore again. `restore.inprogress` is armed when a restore
+// becomes possible and deleted only after the app has survived startup
+// (a grace period) or quit cleanly. A stale sentinel forces ask-mode
+// for one launch with an honest note instead of looping.
+// ------------------------------------------------------------------
+
+fn sentinel_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?
+        .join("restore.inprogress"))
+}
+
+fn write_sentinel_at(path: &PathBuf) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"restore in progress");
+}
+
+/// true if a stale sentinel existed; consumes it either way.
+fn take_sentinel_at(path: &PathBuf) -> bool {
+    let existed = path.exists();
+    let _ = fs::remove_file(path);
+    existed
+}
+
+fn clear_sentinel_at(path: &PathBuf) {
+    let _ = fs::remove_file(path);
+}
+
+/// One-time-per-process flag: a stale sentinel forced this launch into
+/// ask-mode instead of auto-restoring. Managed as Tauri state in setup.
+#[derive(Debug, Default)]
+pub struct SessionRestoreForced(pub AtomicBool);
+
+/// Call once, early in setup, after SessionRestoreForced is managed: a
+/// stale sentinel (previous run died inside the restore window) forces
+/// ask-mode for this launch; otherwise, when auto-restore is on, arm
+/// the sentinel for this run.
+pub fn check_startup_sentinel(app: &AppHandle) {
+    let stale = sentinel_path(app).map(|p| take_sentinel_at(&p)).unwrap_or(false);
+    if stale {
+        if let Some(s) = app.try_state::<SessionRestoreForced>() {
+            s.0.store(true, Ordering::SeqCst);
+        }
+        return;
+    }
+    let restore =
+        crate::launcher_settings::load(app).startup_mode == StartupMode::Restore;
+    if restore {
+        if let Ok(p) = sentinel_path(app) {
+            write_sentinel_at(&p);
+        }
+    }
+}
+
+/// Delete the sentinel: clean shutdown, or the grace period after a
+/// restore (the app survived startup).
+pub fn clear_restore_sentinel(app: &AppHandle) {
+    if let Ok(p) = sentinel_path(app) {
+        clear_sentinel_at(&p);
+    }
+}
+
+/// The app must SURVIVE startup for the sentinel to clear: a crash any
+/// time before this fires leaves the sentinel for the next launch's
+/// forced ask-mode.
+fn spawn_sentinel_grace(app: &AppHandle) {
+    let app = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("appmaka-sentinel-grace".to_string())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(30));
+            clear_restore_sentinel(&app);
+        });
+}
+
 fn save_session(app: &AppHandle, session: &Session) {
     let Ok(path) = session_path(app) else {
         return;
@@ -419,6 +503,11 @@ fn logical_monitors(app: &AppHandle) -> Vec<LogicalMonitor> {
 /// default centered placement). Best-effort: unknown accounts are skipped
 /// silently and one window's failure never stops the rest. Returns how
 /// many windows were (re)opened.
+///
+/// Fault isolation (v0.9.7): every window open runs under panic
+/// isolation, and opens are staggered ~150ms so a burst of windows can't
+/// thundering-herd the caption thread. A panicking or failing open counts
+/// as a miss and the rest still open.
 pub fn restore_session_now(app: &AppHandle) -> usize {
     let session = load_session(app);
     if session.windows.is_empty() {
@@ -438,9 +527,28 @@ pub fn restore_session_now(app: &AppHandle) -> usize {
             .unwrap_or(false)
     };
     let monitors = logical_monitors(app);
-    let mut opened = 0;
-    for w in partition_restorable(&session, &account_exists) {
-        let ok = match w {
+    let restorable = partition_restorable(&session, &account_exists);
+    // TEST-ONLY fault injection (v0.9.7, debug builds only):
+    // APPMAKA_TEST_PANIC_ON_OPEN=N makes the Nth restore window open
+    // panic, simulating the Windows caption-strip crash so the
+    // containment + sentinel machinery can be verified E2E on Linux.
+    // Release builds never contain this code.
+    #[cfg(debug_assertions)]
+    let mut fault_n = 0usize;
+    let mut open_one = |w: &SessionWindow| -> bool {
+        open_isolated(|| {
+            #[cfg(debug_assertions)]
+            {
+                fault_n += 1;
+                if let Ok(target) = std::env::var("APPMAKA_TEST_PANIC_ON_OPEN") {
+                    if target.parse::<usize>().ok() == Some(fault_n) {
+                        panic!(
+                            "test fault injection: panicking on restore window open #{fault_n}"
+                        );
+                    }
+                }
+            }
+            match w {
             SessionWindow::Account {
                 app_id,
                 account_id,
@@ -450,34 +558,90 @@ pub fn restore_session_now(app: &AppHandle) -> usize {
                 windows::open_account_placed(
                     app, &store, &adblock, &winstate, app_id, account_id, placement,
                 )
-                .is_ok()
             }
             SessionWindow::Search { query, rect } => {
                 let placement = placement_for_rect(rect.as_ref(), &monitors);
                 crate::websearch::open_search_window_placed(app, &adblock, query, placement)
-                    .is_ok()
             }
-        };
-        if ok {
+            }
+        })
+    };
+    restore_entries(&restorable, &mut open_one, &mut || {
+        std::thread::sleep(Duration::from_millis(150))
+    })
+}
+
+/// One window-open under panic isolation: a panicking open counts as a
+/// failure and never propagates. (A panic on the restore thread would
+/// only kill the thread, but isolation keeps the remaining windows
+/// opening and the accounting honest.)
+fn open_isolated(f: impl FnOnce() -> Result<(), String>) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// Open entries in open order with a stagger between them (no thundering
+/// herd on window creation), each via the caller's open callback. Pure
+/// over callbacks so ordering and isolation are unit-testable; the real
+/// stagger is 150ms.
+fn restore_entries(
+    entries: &[&SessionWindow],
+    open_one: &mut dyn FnMut(&SessionWindow) -> bool,
+    stagger: &mut dyn FnMut(),
+) -> usize {
+    let mut opened = 0;
+    for (i, w) in entries.iter().enumerate() {
+        if i > 0 {
+            stagger();
+        }
+        if open_one(w) {
             opened += 1;
         }
     }
     opened
 }
 
+/// Manual restore (launcher "Restore session" button / ask banner): the
+/// same sentinel + grace as auto-restore, so a crash here also forces
+/// ask-mode next launch instead of looping.
+pub fn restore_session_manual(app: &AppHandle) -> usize {
+    if let Ok(p) = sentinel_path(app) {
+        write_sentinel_at(&p);
+    }
+    let n = restore_session_now(app);
+    spawn_sentinel_grace(app);
+    n
+}
+
 /// Restore on launch when the user chose "Restore last session".
 /// Best-effort and silent: startup never waits on it and never fails on it.
+///
+/// Crash-loop guard (v0.9.7): a stale sentinel from a previous run forces
+/// ask-mode for this launch (set at startup) — auto-restore never runs
+/// into the same crash twice. The per-window isolation in
+/// restore_session_now keeps one bad window from stopping the rest, and
+/// the launcher is independent: it always reaches a usable state.
 pub fn maybe_restore_on_launch(app: &AppHandle) {
+    let forced = app
+        .try_state::<SessionRestoreForced>()
+        .map(|s| s.0.load(Ordering::SeqCst))
+        .unwrap_or(false);
+    if forced {
+        return;
+    }
     let restore = app
         .try_state::<Mutex<LauncherSettings>>()
         .and_then(|s| s.lock().ok().map(|s| s.startup_mode == StartupMode::Restore))
         .unwrap_or(false);
-    if restore {
-        let n = restore_session_now(app);
-        if n > 0 {
-            eprintln!("[appmaka] restored {n} window(s) from last session");
-        }
+    if !restore {
+        return;
     }
+    let n = restore_session_now(app);
+    if n > 0 {
+        eprintln!("[appmaka] restored {n} window(s) from last session");
+    }
+    spawn_sentinel_grace(app);
 }
 
 /// One-time-per-process flag for the "Ask me" offer.
@@ -486,14 +650,18 @@ pub struct SessionAskConsumed(pub AtomicBool);
 
 /// The Ask-mode offer shown on the launcher: how many windows, a few
 /// human-readable names, whether a search is among them. One-time per
-/// process — returns None once consumed, when the mode isn't Ask, or
-/// when the saved session is empty.
+/// process — returns None once consumed, when the mode isn't Ask (and no
+/// stale sentinel forced ask-mode), or when the saved session is empty.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRestoreOffer {
     pub window_count: usize,
     pub names: Vec<String>,
     pub has_search: bool,
+    /// True when a stale sentinel forced this launch into ask-mode: the
+    /// previous run died inside the restore window, so the UI explains
+    /// why it didn't auto-restore.
+    pub stale_restore: bool,
 }
 
 pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
@@ -505,7 +673,13 @@ pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
         .try_state::<Mutex<LauncherSettings>>()
         .and_then(|s| s.lock().ok().map(|s| s.startup_mode == StartupMode::Ask))
         .unwrap_or(false);
-    if !ask {
+    // A stale sentinel forces ask behavior for one launch even when the
+    // setting is "Restore last session": better to ask than to loop.
+    let forced = app
+        .try_state::<SessionRestoreForced>()
+        .map(|s| s.0.load(Ordering::SeqCst))
+        .unwrap_or(false);
+    if !ask && !forced {
         return None;
     }
     let session = load_session(app);
@@ -544,6 +718,7 @@ pub fn take_restore_offer(app: &AppHandle) -> Option<SessionRestoreOffer> {
         window_count: session.windows.len(),
         names,
         has_search,
+        stale_restore: forced,
     })
 }
 
@@ -690,5 +865,82 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert!(matches!(kept[0], SessionWindow::Account { account_id, .. } if account_id == "here"));
         assert!(matches!(kept[1], SessionWindow::Search { .. }));
+    }
+
+    fn sentinel_test_path() -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("appmaka-sentinel-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir.join("restore.inprogress")
+    }
+
+    #[test]
+    fn sentinel_state_machine() {
+        let path = sentinel_test_path();
+        let _ = fs::remove_file(&path);
+        // Fresh start: nothing there.
+        assert!(!take_sentinel_at(&path));
+        // Crash mid-restore: sentinel armed, never cleared.
+        write_sentinel_at(&path);
+        assert!(path.exists());
+        // Next launch: stale → true, and consumed either way.
+        assert!(take_sentinel_at(&path));
+        assert!(!path.exists());
+        // Clean exit: armed then cleared → next launch sees nothing.
+        write_sentinel_at(&path);
+        clear_sentinel_at(&path);
+        assert!(!take_sentinel_at(&path));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn panicking_window_open_is_contained() {
+        assert!(!open_isolated(|| -> Result<(), String> { panic!("boom") }));
+        assert!(open_isolated(|| Ok(())));
+        assert!(!open_isolated(|| Err("nope".to_string())));
+    }
+
+    #[test]
+    fn restore_entries_preserves_order_and_staggers() {
+        let session = build_session(
+            vec![
+                ("a".into(), "1".into(), None, 3),
+                ("a".into(), "2".into(), None, 1),
+                ("a".into(), "3".into(), None, 2),
+            ],
+            None,
+        );
+        let exists = |_: &str, _: &str| true;
+        let entries = partition_restorable(&session, &exists);
+        let mut seen = Vec::new();
+        let mut pauses = 0;
+        let mut open_one = |w: &SessionWindow| -> bool {
+            if let SessionWindow::Account { account_id, .. } = w {
+                seen.push(account_id.clone());
+            }
+            true
+        };
+        let n = restore_entries(&entries, &mut open_one, &mut || pauses += 1);
+        assert_eq!(n, 3);
+        // Open order follows the session's open order, not input order.
+        assert_eq!(seen, vec!["2".to_string(), "3".to_string(), "1".to_string()]);
+        // Stagger runs between windows only: n-1 pauses for n entries.
+        assert_eq!(pauses, 2);
+        // A panicking entry doesn't stop the rest.
+        let mut seen2 = Vec::new();
+        let mut open_flaky = |w: &SessionWindow| -> bool {
+            if let SessionWindow::Account { account_id, .. } = w {
+                seen2.push(account_id.clone());
+            }
+            open_isolated(|| -> Result<(), String> {
+                if seen2.len() == 2 {
+                    panic!("mid-restore boom");
+                }
+                Ok(())
+            })
+        };
+        let n2 = restore_entries(&entries, &mut open_flaky, &mut || {});
+        assert_eq!(n2, 2);
+        assert_eq!(seen2.len(), 3);
     }
 }

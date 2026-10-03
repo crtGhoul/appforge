@@ -72,6 +72,31 @@ mod imp {
         COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
     }
 
+    /// Best-effort file log for caption-strip failures. eprintln is
+    /// invisible on the Windows GUI build, so strip errors go to
+    /// <app_data>/caption-errors.log (rotated past ~256 KiB) instead of
+    /// relying on stderr.
+    fn caption_log(app: &AppHandle, msg: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(dir) = app.path().app_data_dir() {
+            let path = dir.join("caption-errors.log");
+            if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 262_144 {
+                let _ = std::fs::remove_file(&path);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                use std::io::Write as _;
+                let _ = writeln!(f, "[{ts}] {msg}");
+            }
+        }
+    }
+
     enum ChromeCmd {
         AddCaption {
             owner: isize,
@@ -217,22 +242,31 @@ mod imp {
 
     unsafe fn on_lbutton_down(hwnd: HWND, lparam: LPARAM) {
         let (x, y) = mouse_xy(lparam);
-        with_chrome(|ch| {
+        // Decide under the borrow; the HTCAPTION drag starts a modal loop
+        // that re-enters caption_proc, so SendMessageW must run AFTER the
+        // RefCell borrow is released — never inside it.
+        let drag = with_chrome(|ch| {
             let label = ch.by_hwnd.get(&(hwnd.0 as isize))?.clone();
             let cp = ch.captions.get_mut(&label)?;
-            let over_button = button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
+            let over_button =
+                button_rect(hwnd, cp.scale).is_some_and(|b| pt_in_rect(x, y, &b));
             if over_button {
                 cp.pressed_min = true;
                 SetCapture(hwnd);
-            } else {
-                // Native drag of the caption strip; the owner follows via
-                // WM_WINDOWPOSCHANGED below.
-                let _ = ReleaseCapture();
-                let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, Some(WPARAM(HTCAPTION as usize)), Some(LPARAM(0)));
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
-            Some(())
-        });
+            Some(!over_button)
+        })
+        .unwrap_or(false);
+        if drag {
+            let _ = ReleaseCapture();
+            let _ = SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                Some(LPARAM(0)),
+            );
+        }
     }
 
     unsafe fn on_lbutton_up(hwnd: HWND, lparam: LPARAM) {
@@ -301,48 +335,156 @@ mod imp {
     /// The caption moved (user drag): move the owner by the same delta,
     /// keeping the strip pinned on-screen (it is the window's only drag
     /// handle and its only minimize button).
+    ///
+    /// Two phases: SetWindowPos on our OWN window delivers
+    /// WM_WINDOWPOSCHANGED synchronously (re-entrant caption_proc), so no
+    /// window call may run while the RefCell is borrowed. Phase 1 decides
+    /// under a short read-only borrow; phase 2 acts with it released.
     unsafe fn on_pos_changed(hwnd: HWND) {
-        with_chrome(|ch| {
+        enum Act {
+            Skip,
+            /// Nudge the strip itself to y=0, then shift the owner by the
+            /// residual delta (matches the old single-pass behavior).
+            Nudge { x: i32 },
+            /// Shift the owner by the drag delta.
+            Shift { dx: i32, dy: i32 },
+        }
+        struct Plan {
+            label: String,
+            act: Act,
+            /// Caption rect read in phase 1; becomes last_x/last_y.
+            last: (i32, i32),
+        }
+        let plan = with_chrome(|ch| {
             let label = ch.by_hwnd.get(&(hwnd.0 as isize))?.clone();
-            let cp = ch.captions.get_mut(&label)?;
+            let cp = ch.captions.get(&label)?;
             if cp.syncing {
-                return Some(());
+                return Some(Plan {
+                    label,
+                    act: Act::Skip,
+                    last: (0, 0),
+                });
             }
             let mut rc = RECT::default();
             GetWindowRect(hwnd, &mut rc).ok()?;
-            if rc.top < 0 {
-                cp.syncing = true;
+            let act = if rc.top < 0 {
+                Act::Nudge { x: rc.left }
+            } else {
+                let (dx, dy) = (rc.left - cp.last_x, rc.top - cp.last_y);
+                if dx != 0 || dy != 0 {
+                    Act::Shift { dx, dy }
+                } else {
+                    Act::Skip
+                }
+            };
+            Some(Plan {
+                label,
+                act,
+                last: (rc.left, rc.top),
+            })
+        });
+        let plan = match plan {
+            Some(p) => p,
+            None => return,
+        };
+        match plan.act {
+            Act::Skip => {}
+            Act::Nudge { x } => {
+                // Flag syncing across the synchronous echo from our own
+                // SetWindowPos so the re-entrant call ignores it.
+                with_chrome(|ch| {
+                    if let Some(cp) = ch.captions.get_mut(&plan.label) {
+                        cp.syncing = true;
+                    }
+                    Some(())
+                });
                 let _ = SetWindowPos(
                     hwnd,
                     None,
-                    rc.left,
+                    x,
                     0,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                cp.syncing = false;
-                GetWindowRect(hwnd, &mut rc).ok()?;
-            }
-            let (dx, dy) = (rc.left - cp.last_x, rc.top - cp.last_y);
-            if dx != 0 || dy != 0 {
-                cp.last_x = rc.left;
-                cp.last_y = rc.top;
-                let mut orc = RECT::default();
-                if GetWindowRect(cp.owner, &mut orc).is_ok() {
+                // Decide the owner follow-up under a short borrow. Moving
+                // the owner moves the owned strip with it, which echoes a
+                // synchronous WM_WINDOWPOSCHANGED back into caption_proc —
+                // so the SetWindowPos runs after the borrow is released,
+                // guarded by syncing like the strip nudge above. (Before
+                // the structural fix this echo hit borrow_mut on the held
+                // borrow; the panic was contained but the echo was lost.
+                // The flag preserves the behavior without the panic.)
+                let follow: Option<(HWND, i32, i32)> = with_chrome(|ch| {
+                    let cp = ch.captions.get_mut(&plan.label)?;
+                    let mut rc = RECT::default();
+                    GetWindowRect(hwnd, &mut rc).ok()?;
+                    let (dx, dy) = (rc.left - cp.last_x, rc.top - cp.last_y);
+                    cp.last_x = rc.left;
+                    cp.last_y = rc.top;
+                    let mut orc = RECT::default();
+                    if (dx != 0 || dy != 0) && GetWindowRect(cp.owner, &mut orc).is_ok() {
+                        cp.syncing = true;
+                        Some(Some((cp.owner, orc.left + dx, orc.top + dy)))
+                    } else {
+                        cp.syncing = false;
+                        Some(None)
+                    }
+                })
+                .flatten();
+                if let Some((owner, ox, oy)) = follow {
                     let _ = SetWindowPos(
-                        cp.owner,
+                        owner,
                         None,
-                        orc.left + dx,
-                        orc.top + dy,
+                        ox,
+                        oy,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                     );
+                    with_chrome(|ch| {
+                        if let Some(cp) = ch.captions.get_mut(&plan.label) {
+                            cp.syncing = false;
+                        }
+                        Some(())
+                    });
                 }
             }
-            Some(())
-        });
+            Act::Shift { dx, dy } => {
+                let follow: Option<(HWND, i32, i32)> = with_chrome(|ch| {
+                    let cp = ch.captions.get_mut(&plan.label)?;
+                    cp.last_x = plan.last.0;
+                    cp.last_y = plan.last.1;
+                    let mut orc = RECT::default();
+                    if GetWindowRect(cp.owner, &mut orc).is_ok() {
+                        // Guard the synchronous echo (owned strip follows
+                        // its owner) with syncing; cleared after the move.
+                        cp.syncing = true;
+                        Some(Some((cp.owner, orc.left + dx, orc.top + dy)))
+                    } else {
+                        Some(None)
+                    }
+                })
+                .flatten();
+                if let Some((owner, ox, oy)) = follow {
+                    let _ = SetWindowPos(
+                        owner,
+                        None,
+                        ox,
+                        oy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    with_chrome(|ch| {
+                        if let Some(cp) = ch.captions.get_mut(&plan.label) {
+                            cp.syncing = false;
+                        }
+                        Some(())
+                    });
+                }
+            }
+        }
     }
 
     unsafe fn on_dpi_changed(hwnd: HWND, wparam: WPARAM) {
@@ -350,18 +492,40 @@ mod imp {
         if dpi == 0 {
             return;
         }
-        with_chrome(|ch| {
+        // Update the scale under a short borrow, then reposition with no
+        // borrow held: reposition_caption's SetWindowPos calls re-enter
+        // caption_proc synchronously (the v0.9.6 P1 abort).
+        let label = with_chrome(|ch| {
             let label = ch.by_hwnd.get(&(hwnd.0 as isize))?.clone();
-            {
-                let cp = ch.captions.get_mut(&label)?;
-                cp.scale = dpi as f64 / 96.0;
-            }
-            reposition_caption(ch, &label);
-            Some(())
+            let cp = ch.captions.get_mut(&label)?;
+            cp.scale = dpi as f64 / 96.0;
+            Some(label)
         });
+        if let Some(label) = label {
+            reposition_caption(&label);
+        }
     }
 
     unsafe extern "system" fn caption_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        // Never unwind across the FFI boundary: a panic in a window proc
+        // aborts the process. On panic, fall through to DefWindowProcW.
+        // (This also contains the two known re-entrant paths — the modal
+        // HTCAPTION drag loop and the self-nudge SetWindowPos — which are
+        // additionally restructured below to not need it.)
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            caption_proc_inner(hwnd, msg, wparam, lparam)
+        })) {
+            Ok(lr) => lr,
+            Err(_) => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe fn caption_proc_inner(
         hwnd: HWND,
         msg: u32,
         wparam: WPARAM,
@@ -472,71 +636,136 @@ mod imp {
 
     /// Place the strip directly above its owner. A maximized owner gets no
     /// strip (it would sit off-screen); it reappears on restore.
-    unsafe fn reposition_caption(ch: &mut Chrome, label: &str) {
-        let cp = match ch.captions.get_mut(label) {
-            Some(c) => c,
+    ///
+    /// Two-phase throughout: ShowWindow/SetWindowPos deliver messages
+    /// synchronously and re-enter caption_proc, so no borrow is held
+    /// across them. Phase 1 snapshots under a short borrow (IsWindow /
+    /// IsZoomed / GetWindowRect are pure queries — they deliver no
+    /// messages); phase 2 acts with the borrow released; phase 3 records
+    /// the result under a short borrow.
+    unsafe fn reposition_caption(label: &str) {
+        struct Snap {
+            hwnd: HWND,
+            owner: HWND,
+        }
+        enum Plan {
+            Skip,
+            Hide(HWND),
+            Place {
+                snap: Snap,
+                tx: i32,
+                ty: i32,
+                w: i32,
+                h: i32,
+            },
+        }
+        let plan = with_chrome(|ch| {
+            let cp = ch.captions.get(label)?;
+            if !IsWindow(Some(cp.owner)).as_bool() {
+                return Some(Plan::Skip);
+            }
+            if IsZoomed(cp.owner).as_bool() {
+                return Some(Plan::Hide(cp.hwnd));
+            }
+            let mut orc = RECT::default();
+            if GetWindowRect(cp.owner, &mut orc).is_err() {
+                return Some(Plan::Skip);
+            }
+            let h = (BAR_H_LOGICAL * cp.scale).round() as i32;
+            let w = orc.right - orc.left;
+            Some(Plan::Place {
+                snap: Snap {
+                    hwnd: cp.hwnd,
+                    owner: cp.owner,
+                },
+                tx: orc.left,
+                ty: orc.top - h,
+                w,
+                h,
+            })
+        });
+        let plan = match plan {
+            Some(p) => p,
             None => return,
         };
-        if !IsWindow(Some(cp.owner)).as_bool() {
-            return;
-        }
-        if IsZoomed(cp.owner).as_bool() {
-            let _ = ShowWindow(cp.hwnd, SW_HIDE);
-            return;
-        }
-        let _ = ShowWindow(cp.hwnd, SW_SHOWNOACTIVATE);
-        let mut orc = RECT::default();
-        if GetWindowRect(cp.owner, &mut orc).is_err() {
-            return;
-        }
-        let h = (BAR_H_LOGICAL * cp.scale).round() as i32;
-        let w = orc.right - orc.left;
-        let (tx, ty) = (orc.left, orc.top - h);
-        // Never strand the strip off the top of the screen: nudge the
-        // owner down so the strip fits. The owner's Moved event re-enters
-        // here and then stabilizes (ty becomes 0).
-        let (tx, ty) = if ty < 0 {
-            let _ = SetWindowPos(
-                cp.owner,
-                None,
-                orc.left,
-                h,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            let mut orc2 = RECT::default();
-            if GetWindowRect(cp.owner, &mut orc2).is_err() {
-                return;
+        match plan {
+            Plan::Skip => {}
+            Plan::Hide(hwnd) => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
             }
-            (orc2.left, orc2.top - h)
-        } else {
-            (tx, ty)
-        };
-        let mut crc = RECT::default();
-        let same = GetWindowRect(cp.hwnd, &mut crc).is_ok()
-            && crc.left == tx
-            && crc.top == ty
-            && crc.right - crc.left == w
-            && crc.bottom - crc.top == h;
-        if same {
-            cp.last_x = tx;
-            cp.last_y = ty;
-            return;
+            Plan::Place { snap, tx, ty, w, h } => {
+                let _ = ShowWindow(snap.hwnd, SW_SHOWNOACTIVATE);
+                // Never strand the strip off the top of the screen: nudge
+                // the owner down so the strip fits, then re-read.
+                let (tx, ty) = if ty < 0 {
+                    let _ = SetWindowPos(
+                        snap.owner,
+                        None,
+                        tx,
+                        h,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    let mut orc2 = RECT::default();
+                    if GetWindowRect(snap.owner, &mut orc2).is_err() {
+                        return;
+                    }
+                    (orc2.left, orc2.top - h)
+                } else {
+                    (tx, ty)
+                };
+                let mut crc = RECT::default();
+                let same = GetWindowRect(snap.hwnd, &mut crc).is_ok()
+                    && crc.left == tx
+                    && crc.top == ty
+                    && crc.right - crc.left == w
+                    && crc.bottom - crc.top == h;
+                if !same {
+                    // Flag syncing across our own SetWindowPos so the
+                    // re-entrant on_pos_changed ignores the echo.
+                    with_chrome(|ch| {
+                        if let Some(cp) = ch.captions.get_mut(label) {
+                            cp.syncing = true;
+                        }
+                        Some(())
+                    });
+                    let _ = SetWindowPos(
+                        snap.hwnd,
+                        None,
+                        tx,
+                        ty,
+                        w,
+                        h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                with_chrome(|ch| {
+                    let cp = ch.captions.get_mut(label)?;
+                    cp.syncing = false;
+                    cp.last_x = tx;
+                    cp.last_y = ty;
+                    Some(())
+                });
+            }
         }
-        cp.syncing = true;
-        let _ = SetWindowPos(cp.hwnd, None, tx, ty, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        cp.syncing = false;
-        cp.last_x = tx;
-        cp.last_y = ty;
     }
 
-    unsafe fn create_caption(ch: &mut Chrome, owner: HWND, label: &str, scale: f64) {
-        if ch.captions.contains_key(label) {
-            reposition_caption(ch, label);
+    /// Create the strip for a page window. Three phases: the
+    /// CreateWindowExW call runs with NO borrow held — it synchronously
+    /// delivers WM_NCCREATE / WM_CREATE / WM_SIZE / WM_WINDOWPOSCHANGED to
+    /// caption_proc, and holding the RefCell across it was the v0.9.6
+    /// crash (re-entrant borrow_mut → panic → unwind across extern
+    /// "system" → instant process abort).
+    unsafe fn create_caption(owner: HWND, label: &str, scale: f64) {
+        // Phase 1: duplicate check under a short borrow.
+        let exists = with_chrome(|ch| Some(ch.captions.contains_key(label))).unwrap_or(false);
+        if exists {
+            reposition_caption(label);
             return;
         }
         let h = (BAR_H_LOGICAL * scale).round() as i32;
+        // Phase 2: NO borrow held across this call.
         // WS_POPUP with an owner HWND: an *owned* window — always above its
         // owner in z-order, hidden with it on minimize, no taskbar button.
         // WS_EX_NOACTIVATE keeps page focus when the strip is clicked.
@@ -556,50 +785,84 @@ mod imp {
         ) {
             Ok(hwnd) => hwnd,
             Err(e) => {
-                eprintln!("[appmaka] caption: couldn't create strip: {e}");
+                if let Some(app) = with_chrome(|ch| Some(ch.app.clone())) {
+                    caption_log(&app, &format!("couldn't create strip for '{label}': {e}"));
+                }
                 return;
             }
         };
         create_tooltip(hwnd);
-        ch.by_hwnd.insert(hwnd.0 as isize, label.to_string());
-        ch.captions.insert(
-            label.to_string(),
-            Caption {
-                hwnd,
-                owner,
-                scale,
-                hover_min: false,
-                pressed_min: false,
-                mouse_in: false,
-                syncing: false,
-                last_x: 0,
-                last_y: 0,
-            },
-        );
-        reposition_caption(ch, label);
-        ensure_esc_hook(ch);
+        // Phase 3: register under a short borrow.
+        with_chrome(|ch| {
+            ch.by_hwnd.insert(hwnd.0 as isize, label.to_string());
+            ch.captions.insert(
+                label.to_string(),
+                Caption {
+                    hwnd,
+                    owner,
+                    scale,
+                    hover_min: false,
+                    pressed_min: false,
+                    mouse_in: false,
+                    syncing: false,
+                    last_x: 0,
+                    last_y: 0,
+                },
+            );
+            Some(())
+        });
+        // Position and hook with no borrow held (both manage their own
+        // short borrows internally).
+        reposition_caption(label);
+        ensure_esc_hook();
     }
 
-    unsafe fn remove_caption(ch: &mut Chrome, label: &str) {
-        if let Some(cp) = ch.captions.remove(label) {
+    /// Drop the strip's bookkeeping, then destroy the window with no
+    /// borrow held: DestroyWindow synchronously delivers WM_DESTROY /
+    /// WM_NCDESTROY to caption_proc, whose handler takes the borrow.
+    unsafe fn remove_caption(label: &str) {
+        let hwnd = with_chrome(|ch| {
+            let cp = ch.captions.remove(label)?;
             ch.by_hwnd.remove(&(cp.hwnd.0 as isize));
-            if IsWindow(Some(cp.hwnd)).as_bool() {
-                let _ = DestroyWindow(cp.hwnd);
+            maybe_uninstall_esc_hook(ch);
+            Some(cp.hwnd)
+        });
+        if let Some(hwnd) = hwnd {
+            if IsWindow(Some(hwnd)).as_bool() {
+                let _ = DestroyWindow(hwnd);
             }
         }
-        maybe_uninstall_esc_hook(ch);
     }
 
     // ------------------------------------------------------------------
     // Esc+LMB close gesture: WH_KEYBOARD_LL on the chrome thread
     // ------------------------------------------------------------------
 
-    unsafe fn ensure_esc_hook(ch: &mut Chrome) {
-        if ch.hook.is_invalid() {
-            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(esc_proc), None, 0) {
-                Ok(hook) => ch.hook = hook,
-                Err(e) => eprintln!("[appmaka] caption: Esc-gesture hook failed: {e}"),
+    /// Install the Esc-gesture hook if none is installed. Manages its own
+    /// short borrows: installing the hook can deliver callbacks on this
+    /// thread, so no borrow is held across SetWindowsHookExW.
+    unsafe fn ensure_esc_hook() {
+        let app = with_chrome(|ch| {
+            if ch.hook.is_invalid() {
+                Some(ch.app.clone())
+            } else {
+                None
             }
+        });
+        let Some(app) = app else { return };
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(esc_proc), None, 0) {
+            Ok(hook) => {
+                with_chrome(|ch| {
+                    if ch.hook.is_invalid() {
+                        ch.hook = hook;
+                    } else {
+                        // A re-entrant path installed one first; drop ours.
+                        let _ = UnhookWindowsHookEx(hook);
+                    }
+                    Some(())
+                });
+            }
+            Err(e) => caption_log(&app, &format!("Esc-gesture hook failed: {e}")),
         }
     }
 
@@ -611,10 +874,12 @@ mod imp {
     }
 
     /// Foreground HWND -> page label, if it is one of ours: a caption strip
-    /// resolves to its page, a page window to itself.
+    /// resolves to its page, a page window to itself. Uses try_borrow:
+    /// the hook proc runs on the chrome thread and must never panic on a
+    /// contended borrow — on contention the gesture just passes through.
     fn resolve_page_label(fg: HWND) -> Option<String> {
         CHROME.with(|c| {
-            let ch = c.borrow();
+            let ch = c.try_borrow().ok()?;
             let ch = ch.as_ref()?;
             if let Some(label) = ch.by_hwnd.get(&(fg.0 as isize)) {
                 return Some(label.clone());
@@ -626,7 +891,22 @@ mod imp {
         })
     }
 
-    unsafe extern "system" fn esc_proc(n_code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn esc_proc(
+        n_code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        // Never unwind across the FFI boundary: a panic in a hook proc
+        // aborts the process. Fail open — pass the key through.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            esc_proc_inner(n_code, wparam, lparam)
+        })) {
+            Ok(lr) => lr,
+            Err(_) => CallNextHookEx(None, n_code, wparam, lparam),
+        }
+    }
+
+    unsafe fn esc_proc_inner(n_code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if n_code >= 0 {
             let w = wparam.0 as u32;
             if w == WM_KEYDOWN || w == WM_SYSKEYDOWN {
@@ -661,6 +941,39 @@ mod imp {
     // Chrome thread
     // ------------------------------------------------------------------
 
+    /// One chrome-thread command. Runs under catch_unwind at the call
+    /// site: a panicking command must never kill the chrome thread (that
+    /// would orphan every strip and the gesture hook).
+    unsafe fn handle_chrome_cmd(cmd: ChromeCmd) {
+        match cmd {
+            ChromeCmd::AddCaption { owner, label, scale } => {
+                // create_caption manages its own short borrows: the
+                // CreateWindowExW call must run with no borrow held.
+                create_caption(HWND(owner as *mut _), &label, scale);
+            }
+            ChromeCmd::RemoveCaption { label } => {
+                remove_caption(&label);
+            }
+            ChromeCmd::Reposition { label } => {
+                reposition_caption(&label);
+            }
+            ChromeCmd::ClosePage { label } => {
+                // Borrow only to fetch the window: close() can
+                // synchronously destroy the owned caption (WM_DESTROY
+                // runs on this thread), which must not happen under our
+                // borrow.
+                let win = CHROME.with(|c| {
+                    c.borrow()
+                        .as_ref()
+                        .and_then(|ch| ch.app.get_webview_window(&label))
+                });
+                if let Some(w) = win {
+                    let _ = w.close();
+                }
+            }
+        }
+    }
+
     fn chrome_thread_main(
         app: AppHandle,
         tx: mpsc::Sender<ChromeCmd>,
@@ -668,6 +981,7 @@ mod imp {
         wake: HANDLE,
     ) {
         unsafe { register_class() };
+        let app_log = app.clone();
         CHROME.with(|c| {
             *c.borrow_mut() = Some(Chrome {
                 app,
@@ -690,39 +1004,15 @@ mod imp {
                 )
             };
             if waited == WAIT_FAILED {
-                eprintln!("[appmaka] caption: message wait failed; chrome thread exiting");
+                caption_log(&app_log, "message wait failed; chrome thread exiting");
                 break;
             }
             while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    ChromeCmd::AddCaption { owner, label, scale } => unsafe {
-                        with_chrome(|ch| {
-                            create_caption(ch, HWND(owner as *mut _), &label, scale);
-                            Some(())
-                        });
-                    },
-                    ChromeCmd::RemoveCaption { label } => unsafe {
-                        with_chrome(|ch| {
-                            remove_caption(ch, &label);
-                            Some(())
-                        });
-                    },
-                    ChromeCmd::Reposition { label } => unsafe {
-                        with_chrome(|ch| {
-                            reposition_caption(ch, &label);
-                            Some(())
-                        });
-                    },
-                    ChromeCmd::ClosePage { label } => {
-                        let closed = CHROME.with(|c| {
-                            c.borrow()
-                                .as_ref()
-                                .and_then(|ch| ch.app.get_webview_window(&label))
-                                .map(|w| w.close().is_ok())
-                                .unwrap_or(false)
-                        });
-                        let _ = closed;
-                    }
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    unsafe { handle_chrome_cmd(cmd) }
+                }));
+                if r.is_err() {
+                    caption_log(&app_log, "chrome command panicked; thread continues");
                 }
             }
             // Pump messages: caption paint/mouse traffic and the hook proc
@@ -766,7 +1056,25 @@ mod imp {
 
     /// A page window (account or search) was created: give it a caption
     /// strip. Idempotent per label. Safe to call from any thread.
+    ///
+    /// Infallible by contract (v0.9.7): any failure — including a panic —
+    /// leaves a plain frameless window (minimizable from the taskbar,
+    /// closable via Alt+F4). A dead strip never kills the process.
     pub fn page_window_opened(app: &AppHandle, label: &str, window: &WebviewWindow) {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            page_window_opened_inner(app, label, window)
+        }));
+        if r.is_err() {
+            caption_log(
+                app,
+                &format!(
+                    "page_window_opened panicked for '{label}'; window continues without a strip"
+                ),
+            );
+        }
+    }
+
+    fn page_window_opened_inner(app: &AppHandle, label: &str, window: &WebviewWindow) {
         let Ok(hwnd) = window.hwnd() else { return };
         let scale = window.scale_factor().unwrap_or(1.0);
         let Some((tx, wake)) = ensure_chrome(app) else {

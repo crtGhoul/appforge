@@ -67,3 +67,16 @@ single-decodes to `untrusted comment: ...`.
 
 Release URL + what was tested vs logic-only, under
 `~/workspace/appforge-smoke/vXYZ/`.
+
+## 8. Permanent rules (v0.9.7 crash-loop post-mortem)
+
+- **Crash-loop breaker:** anything that runs automatically at startup
+  (session restore, hooks, migrations) MUST have a sentinel written
+  before and cleared after, so a second consecutive dirty start degrades
+  instead of retrying. v0.9.7's `restore.inprogress` (stale = force
+  Ask-mode with an honest note) is the minimal version.
+- **Written re-entrancy analysis:** new unsafe Win32 code ships with a
+  written analysis — for every Win32 call, list the messages/callbacks
+  it delivers synchronously and prove no lock/borrow is held across any
+  of them. A green `x86_64-pc-windows-msvc` check is compilation, not
+  testing; unit tests can't see re-entrancy either.

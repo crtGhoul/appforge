@@ -542,9 +542,11 @@ fn get_pending_session_restore(app: AppHandle) -> Option<session::SessionRestore
 /// Reopen the saved session now: the launcher "Restore session" button
 /// and the Ask-mode banner. Async on purpose — window creation never runs
 /// on an IPC thread (wry#583), same rule as the open_account command.
+/// Sentinel-guarded like auto-restore (v0.9.7): a crash here forces
+/// ask-mode next launch instead of looping.
 #[tauri::command]
 async fn restore_session(app: AppHandle) -> Result<usize, String> {
-    Ok(session::restore_session_now(&app))
+    Ok(session::restore_session_manual(&app))
 }
 
 /// Dismiss the Ask-mode offer: forget the saved session.
@@ -673,6 +675,10 @@ fn build_tray(app: &mut tauri::App) -> Result<(), String> {
                 // open/close already writes it, so this is usually a no-op —
                 // but Quit is the one path where nothing else runs after.
                 session::write_session(app);
+                // Clean shutdown: the restore sentinel must not survive a
+                // deliberate quit, or the next launch would wrongly think
+                // the previous run crashed mid-restore (v0.9.7).
+                session::clear_restore_sentinel(app);
                 app.exit(0);
             }
             _ => {}
@@ -769,6 +775,12 @@ fn main() {
             // session file, plus the one-time "Ask me" offer flag.
             app.manage(session::SearchLiveState::default());
             app.manage(session::SessionAskConsumed::default());
+            app.manage(session::SessionRestoreForced::default());
+            // Crash-loop sentinel (v0.9.7): a stale restore.inprogress
+            // from a previous run forces ask-mode instead of
+            // auto-restoring into the same crash; otherwise arm the
+            // sentinel while auto-restore is on.
+            session::check_startup_sentinel(app.handle());
             // In-app download manager (v0.7.0): account-window downloads are
             // intercepted natively so the webview session is preserved.
             app.manage(crate::downloads::DownloadState::load(app.handle()).map_err(std::io::Error::other)?);

@@ -134,6 +134,10 @@ export interface SessionRestoreOffer {
   windowCount: number;
   names: string[];
   hasSearch: boolean;
+  /** True when a stale restore sentinel forced ask-mode: the previous run
+   *  died inside the restore window, so the UI explains why it didn't
+   *  auto-restore (v0.9.7). */
+  staleRestore: boolean;
 }
 
 /**
