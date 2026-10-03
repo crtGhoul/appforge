@@ -1527,7 +1527,9 @@ type UpdateStatus =
   | { kind: "none" }
   | { kind: "available"; version: string }
   | { kind: "downloading"; version: string; progress: number | null }
-  | { kind: "ready"; version: string };
+  | { kind: "ready"; version: string }
+  | { kind: "launched"; version: string }
+  | { kind: "failed"; message: string };
 
 /**
  * "AppMaka vX.Y.Z", read from the running binary at runtime — never
@@ -1549,16 +1551,29 @@ function VersionLine() {
 
 /**
  * Self-update UI. Manual "Check for updates" → download with progress →
- * "Restart to finish" (never force-restarted). A failed check says
+ * installer handoff (never force-restarted). A failed check says
  * "Couldn't reach the update server." — never a silent "no updates" and
- * never an error popup.
+ * never an error popup. Download/install failures stay visible as a
+ * plain-language message — never a silent return to the button.
+ *
+ * v0.8.2: on Windows the install type is detected at runtime. MSI installs
+ * (Program Files) download the matching MSI, verify its signature, and hand
+ * it to the Windows installer; everything else keeps the NSIS
+ * downloadAndInstall flow. On Windows the post-download copy is
+ * "Installer launched — follow its steps." (the restart button is Linux-only).
  *
  * The automatic check also lives here: once on mount when `autoCheck` is
  * on, then every 24h (skipped while the window is hidden). A found update
  * lands in the same "available" state as a manual check — nothing is
  * silently swallowed. Auto-check failures show nothing at all.
  */
-function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
+function UpdaterSection({
+  autoCheck,
+  isWindows,
+}: {
+  autoCheck: boolean;
+  isWindows: boolean;
+}) {
   const [status, setStatus] = useState<UpdateStatus>({ kind: "idle" });
   const pending = useRef<Update | null>(null);
   const downloadedBytes = useRef(0);
@@ -1614,24 +1629,88 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
     totalBytes.current = null;
     setStatus({ kind: "downloading", version: update.version, progress: null });
     try {
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          totalBytes.current = event.data.contentLength ?? null;
-        } else if (event.event === "Progress") {
-          downloadedBytes.current += event.data.chunkLength;
-          const total = totalBytes.current;
-          const progress = total
-            ? Math.min(99, Math.round((downloadedBytes.current / total) * 100))
-            : null;
-          setStatus((prev) =>
-            prev.kind === "downloading" ? { ...prev, progress } : prev
-          );
-        }
-      });
+      // v0.8.2: MSI-installed copies must get the MSI, not the NSIS setup.exe
+      // that latest.json points at — otherwise the update never takes.
+      const installType = await invoke<string>("get_install_type");
+      if (installType === "msi" && isWindows) {
+        await handleMsiDownload(update);
+      } else {
+        await update.downloadAndInstall((event) => {
+          if (event.event === "Started") {
+            totalBytes.current = event.data.contentLength ?? null;
+          } else if (event.event === "Progress") {
+            downloadedBytes.current += event.data.chunkLength;
+            const total = totalBytes.current;
+            const progress = total
+              ? Math.min(99, Math.round((downloadedBytes.current / total) * 100))
+              : null;
+            setStatus((prev) =>
+              prev.kind === "downloading" ? { ...prev, progress } : prev
+            );
+          }
+        });
+      }
       setStatus({ kind: "ready", version: update.version });
-    } catch {
-      setStatus({ kind: "none" });
+    } catch (e) {
+      // Plain-language, and it stays visible — never a silent return to the
+      // "Download & install" button.
+      setStatus({ kind: "failed", message: plainUpdateError(e) });
     }
+  }
+
+  /**
+   * v0.8.2 MSI path: download the matching MSI (derived from the NSIS URL in
+   * latest.json), verify its signature, and hand it to the Windows installer.
+   * The backend emits progress events and exits into the installer wizard.
+   */
+  async function handleMsiDownload(update: Update) {
+    const platforms = (update.rawJson as { platforms?: Record<string, { url?: string }> })
+      .platforms;
+    const nsisUrl = platforms?.["windows-x86_64"]?.url;
+    if (!nsisUrl) {
+      throw new Error("Couldn't find the update download link.");
+    }
+    const unlistenProgress = await listen<{ downloaded: number; total: number | null }>(
+      "msi-update-progress",
+      (event) => {
+        downloadedBytes.current = event.payload.downloaded;
+        totalBytes.current = event.payload.total;
+        const total = event.payload.total;
+        const progress = total
+          ? Math.min(99, Math.round((event.payload.downloaded / total) * 100))
+          : null;
+        setStatus((prev) =>
+          prev.kind === "downloading" ? { ...prev, progress } : prev
+        );
+      }
+    );
+    const unlistenLaunched = await listen("msi-update-launched", () => {
+      setStatus({ kind: "launched", version: update.version });
+    });
+    try {
+      // The backend exits the app after launching the installer, so this
+      // only returns when something went wrong (thrown as a plain message).
+      await invoke("install_msi_update", { nsisUrl, version: update.version });
+      setStatus({ kind: "launched", version: update.version });
+    } finally {
+      unlistenProgress();
+      unlistenLaunched();
+    }
+  }
+
+  /** Whatever the updater threw, turn it into one plain sentence. */
+  function plainUpdateError(e: unknown): string {
+    if (typeof e === "string" && e.trim()) return e;
+    if (
+      e !== null &&
+      typeof e === "object" &&
+      "message" in e &&
+      typeof (e as { message: unknown }).message === "string" &&
+      ((e as { message: string }).message.trim())
+    ) {
+      return (e as { message: string }).message;
+    }
+    return "The update couldn't be downloaded or installed.";
   }
 
   async function handleRestart() {
@@ -1662,7 +1741,11 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
               ? `Downloading ${status.version}…`
               : `Downloading ${status.version}… ${status.progress}%`)}
           {status.kind === "ready" &&
-            `${status.version} installed — restart to finish.`}
+            (isWindows
+              ? "Installer launched — follow its steps."
+              : `${status.version} installed — restart to finish.`)}
+          {status.kind === "launched" && "Installer launched — follow its steps."}
+          {status.kind === "failed" && status.message}
         </span>
       </div>
       {status.kind === "available" && (
@@ -1687,7 +1770,7 @@ function UpdaterSection({ autoCheck }: { autoCheck: boolean }) {
           />
         </div>
       )}
-      {status.kind === "ready" && (
+      {status.kind === "ready" && !isWindows && (
         <div>
           <button onClick={() => void handleRestart()}>
             Restart to finish
@@ -2938,7 +3021,10 @@ export default function App() {
           <h2>Updates</h2>
         </div>
         <VersionLine />
-        <UpdaterSection autoCheck={launcherSettings?.auto_update_check ?? false} />
+        <UpdaterSection
+          autoCheck={launcherSettings?.auto_update_check ?? false}
+          isWindows={platform?.os === "windows"}
+        />
       </section>
 
       <footer className="footer muted">

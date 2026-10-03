@@ -11,6 +11,7 @@ mod hotkeys;
 mod workspaces;
 mod launcher_settings;
 mod links;
+mod msi_update;
 mod page_title;
 mod preview;
 mod routines;
@@ -870,6 +871,9 @@ fn main() {
             routines::save_routine,
             routines::delete_routine,
             routines::run_routine,
+            // v0.8.2: MSI-aware self-update (install-type detection + MSI path)
+            msi_update::get_install_type,
+            msi_update::install_msi_update,
             // v0.8.0: workspaces
             workspaces::list_workspaces,
             workspaces::save_workspace,
